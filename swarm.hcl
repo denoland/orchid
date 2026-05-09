@@ -8,7 +8,7 @@ orchestrator {
   state_file    = "/home/exedev/orch/state.json"
   branch_prefix = "orch/issue-"
   workdir_root  = "/home/exedev/orch-work"
-  http_addr     = ":8080"
+  http_addr     = ":8000"
   bot_login     = "divybot"
 }
 
