@@ -58,3 +58,27 @@ vm "tiger-fusion" {
   user = "exedev"
   key  = "~/.ssh/id_ed25519"
 }
+
+vm "divybot1" {
+  host = "divybot1.exe.xyz"
+  user = "exedev"
+  key  = "~/.ssh/id_ed25519"
+}
+
+vm "divybot2" {
+  host = "divybot2.exe.xyz"
+  user = "exedev"
+  key  = "~/.ssh/id_ed25519"
+}
+
+vm "divybot3" {
+  host = "divybot3.exe.xyz"
+  user = "exedev"
+  key  = "~/.ssh/id_ed25519"
+}
+
+vm "divybot4" {
+  host = "divybot4.exe.xyz"
+  user = "exedev"
+  key  = "~/.ssh/id_ed25519"
+}
