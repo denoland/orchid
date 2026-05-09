@@ -22,6 +22,11 @@ target "orchid" {
   repo  = "denoland/orchid"
 }
 
+target "clawpatrol" {
+  label = "clawpatrol"
+  repo  = "denoland/clawpatrol"
+}
+
 # Placeholders use {{...}} (not ${...}) to avoid HCL interpolation.
 bootstrap_prompt = <<EOT
 You are shepherding GitHub issue #{{issue.number}} from the inbox repo
