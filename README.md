@@ -103,6 +103,8 @@ orchestrator {
   state_file    = "/home/exedev/orch/state.json"
   branch_prefix = "orch/issue-"
   workdir_root  = "/home/exedev/orch-work"   # per-VM root for clones
+  http_addr     = ":8080"                    # optional; serves the UI table
+  bot_login     = "divybot"                  # shown in the UI bot column
 }
 
 # One target per work repo. The label scopes which inbox issues route here.
@@ -155,6 +157,8 @@ Placeholders in `bootstrap_prompt` use `{{...}}` (not `${...}`) to avoid HCL int
 ---
 
 ## Inspecting & debugging
+
+If `http_addr` is set, open http://localhost:8080/ for a live table of every VM in the pool: status (busy/free), the issue and target repo it's working on, the bot account, the tmux session name, the linked PR, and a one-click "open" link to the exe.dev web terminal for that VM (auto-attaches to the right tmux session via `?cmd=tmux+attach+-t+...`). The page auto-refreshes every 5s.
 
 ```sh
 # orchid daemon

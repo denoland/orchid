@@ -7,12 +7,15 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html/template"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,6 +46,8 @@ type OrchBlock struct {
 	StateFile    string `hcl:"state_file"`
 	BranchPrefix string `hcl:"branch_prefix"`
 	WorkdirRoot  string `hcl:"workdir_root"`
+	HTTPAddr     string `hcl:"http_addr,optional"`
+	BotLogin     string `hcl:"bot_login,optional"` // shown in the UI bot column
 }
 
 type VMBlock struct {
@@ -67,6 +72,7 @@ type Job struct {
 }
 
 type State struct {
+	mu   sync.Mutex
 	Jobs map[int]*Job `json:"jobs"`
 }
 
@@ -630,6 +636,8 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 }
 
 func tick(cfg *Config, st *State) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	// Map issue number -> (Issue, Target). First target whose label matches wins.
 	type routed struct {
 		is     Issue
@@ -754,6 +762,139 @@ func tick(cfg *Config, st *State) {
 	}
 }
 
+// --- HTTP UI ---
+
+const indexTmpl = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>orchid</title>
+<meta http-equiv="refresh" content="5">
+<style>
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 24px; color: #222; }
+  h1 { font-size: 16px; margin: 0 0 4px 0; }
+  .meta { color: #666; font-size: 12px; margin-bottom: 18px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 8px 12px; border-bottom: 1px solid #e5e5e5; text-align: left; vertical-align: top; }
+  th { background: #f6f6f6; font-weight: 600; }
+  tr.busy td { background: #fafffa; }
+  tr.free td { color: #999; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 8px; font-size: 11px; }
+  .pill.busy { background: #d4edda; color: #155724; }
+  .pill.free { background: #eee; color: #666; }
+  a { color: #0366d6; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .term { font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>orchid swarm</h1>
+<div class="meta">
+  inbox: <a href="https://github.com/{{.Inbox}}/issues">{{.Inbox}}</a> ·
+  targets: {{range $i, $t := .Targets}}{{if $i}}, {{end}}<code>{{$t.Label}}</code>→<a href="https://github.com/{{$t.Repo}}">{{$t.Repo}}</a>{{end}} ·
+  refresh 5s · updated {{.Updated}}
+</div>
+<table>
+<thead><tr>
+  <th>VM</th><th>Status</th><th>Issue</th><th>Repo</th><th>Bot</th><th>Session</th><th>PR</th><th>Terminal</th>
+</tr></thead>
+<tbody>
+{{range .Rows}}
+<tr class="{{if .Busy}}busy{{else}}free{{end}}">
+  <td>{{.VM}}</td>
+  <td>{{if .Busy}}<span class="pill busy">busy</span>{{else}}<span class="pill free">free</span>{{end}}</td>
+  <td>{{if .Issue}}<a href="https://github.com/{{$.Inbox}}/issues/{{.Issue}}">#{{.Issue}}</a>{{end}}</td>
+  <td>{{if .Repo}}<a href="https://github.com/{{.Repo}}">{{.Repo}}</a>{{end}}</td>
+  <td>{{.Bot}}</td>
+  <td><code>{{.Session}}</code></td>
+  <td>{{if .PR}}<a href="https://github.com/{{.Repo}}/pull/{{.PR}}">#{{.PR}}</a>{{end}}</td>
+  <td><a class="term" target="_blank" href="{{.TermURL}}">open ↗</a></td>
+</tr>
+{{end}}
+</tbody>
+</table>
+</body>
+</html>`
+
+type uiRow struct {
+	VM      string
+	Busy    bool
+	Issue   int
+	Repo    string
+	Bot     string
+	Session string
+	PR      int
+	TermURL string
+}
+
+type uiData struct {
+	Inbox   string
+	Targets []TargetBlock
+	Rows    []uiRow
+	Updated string
+}
+
+// xtermURL builds the exe.dev xterm URL for a VM host. With a session name
+// we add ?cmd=tmux+attach+-t+SESSION so the xterm auto-attaches if exe.dev
+// honors the param; falls back to a plain shell if not.
+func xtermURL(host, session string) string {
+	parts := strings.SplitN(host, ".", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	u := fmt.Sprintf("https://%s.xterm.%s/", parts[0], parts[1])
+	if session != "" {
+		u += "?cmd=" + strings.ReplaceAll("tmux attach -t "+session, " ", "+")
+	}
+	return u
+}
+
+func httpHandler(cfg *Config, st *State) http.Handler {
+	t := template.Must(template.New("ix").Parse(indexTmpl))
+	bot := cfg.Orch.BotLogin
+	if bot == "" {
+		bot = "divybot"
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		st.mu.Lock()
+		used := map[string]int{}
+		jobs := map[int]Job{}
+		for n, j := range st.Jobs {
+			used[j.VM] = n
+			jobs[n] = *j
+		}
+		st.mu.Unlock()
+
+		rows := make([]uiRow, 0, len(cfg.VMs))
+		for _, vm := range cfg.VMs {
+			r := uiRow{VM: vm.Name, Bot: bot}
+			if n, ok := used[vm.Name]; ok {
+				j := jobs[n]
+				r.Busy = true
+				r.Issue = n
+				r.Repo = j.TargetRepo
+				r.Session = j.Tmux
+				r.PR = j.PR
+			}
+			r.TermURL = xtermURL(vm.Host, r.Session)
+			rows = append(rows, r)
+		}
+		sort.Slice(rows, func(i, j int) bool { return rows[i].VM < rows[j].VM })
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = t.Execute(w, uiData{
+			Inbox:   cfg.GitHub.InboxRepo,
+			Targets: cfg.Targets,
+			Rows:    rows,
+			Updated: time.Now().UTC().Format("15:04:05Z"),
+		})
+	})
+}
+
 func main() {
 	cfgPath := flag.String("config", "swarm.hcl", "path to HCL config")
 	flag.Parse()
@@ -776,6 +917,15 @@ func main() {
 	}
 	log.Printf("orch up: inbox=%s targets=[%s] vms=%d interval=%s tracked=%d",
 		cfg.GitHub.InboxRepo, strings.Join(tnames, ","), len(cfg.VMs), interval, len(st.Jobs))
+
+	if cfg.Orch.HTTPAddr != "" {
+		go func() {
+			log.Printf("http ui on http://%s/", cfg.Orch.HTTPAddr)
+			if err := http.ListenAndServe(cfg.Orch.HTTPAddr, httpHandler(&cfg, st)); err != nil {
+				log.Printf("http server: %v", err)
+			}
+		}()
+	}
 
 	for i := range cfg.VMs {
 		if err := bootstrapVM(cfg.VMs[i]); err != nil {
