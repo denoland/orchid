@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,22 +20,29 @@ import (
 )
 
 type Config struct {
-	GitHub          GitHubBlock `hcl:"github,block"`
-	Orch            OrchBlock   `hcl:"orchestrator,block"`
-	BootstrapPrompt string      `hcl:"bootstrap_prompt"`
-	VMs             []VMBlock   `hcl:"vm,block"`
+	GitHub          GitHubBlock   `hcl:"github,block"`
+	Orch            OrchBlock     `hcl:"orchestrator,block"`
+	BootstrapPrompt string        `hcl:"bootstrap_prompt"`
+	Targets         []TargetBlock `hcl:"target,block"`
+	VMs             []VMBlock     `hcl:"vm,block"`
 }
 
 type GitHubBlock struct {
-	Repo     string `hcl:"repo"`
-	Label    string `hcl:"label"`
-	TokenEnv string `hcl:"token_env,optional"`
+	InboxRepo string `hcl:"inbox_repo"`
+	TokenEnv  string `hcl:"token_env,optional"`
+}
+
+type TargetBlock struct {
+	Name  string `hcl:",label"`
+	Label string `hcl:"label"`
+	Repo  string `hcl:"repo"`
 }
 
 type OrchBlock struct {
 	PollInterval string `hcl:"poll_interval"`
 	StateFile    string `hcl:"state_file"`
 	BranchPrefix string `hcl:"branch_prefix"`
+	WorkdirRoot  string `hcl:"workdir_root"`
 }
 
 type VMBlock struct {
@@ -47,11 +55,13 @@ type VMBlock struct {
 type Job struct {
 	VM                   string            `json:"vm"`
 	Tmux                 string            `json:"tmux"`
+	Target               string            `json:"target"`      // target block name
+	TargetRepo           string            `json:"target_repo"` // resolved (e.g. denoland/deno)
 	Branch               string            `json:"branch"`
 	PR                   int               `json:"pr,omitempty"`
-	SeenReviewIDs        []int64           `json:"seen_review_ids,omitempty"`
-	SeenThreadCommentIDs []int64           `json:"seen_thread_comment_ids,omitempty"`
-	SeenIssueCommentIDs  []int64           `json:"seen_issue_comment_ids,omitempty"`
+	SeenReviewIDs        []string          `json:"seen_review_ids,omitempty"`
+	SeenThreadCommentIDs []string          `json:"seen_thread_comment_ids,omitempty"`
+	SeenIssueCommentIDs  []string          `json:"seen_issue_comment_ids,omitempty"`
 	LastHeadOID          string            `json:"last_head_oid,omitempty"`
 	LastCheckConclusions map[string]string `json:"last_check_conclusions,omitempty"`
 }
@@ -170,7 +180,7 @@ type PRView struct {
 	State      string `json:"state"`
 	HeadRefOid string `json:"headRefOid"`
 	Reviews    []struct {
-		ID     int64                  `json:"id"`
+		ID     string                 `json:"id"`
 		Author struct{ Login string } `json:"author"`
 		State  string                 `json:"state"`
 		Body   string                 `json:"body"`
@@ -179,13 +189,13 @@ type PRView struct {
 		Path     string `json:"path"`
 		Line     int    `json:"line"`
 		Comments []struct {
-			ID     int64                  `json:"id"`
+			ID     string                 `json:"id"`
 			Author struct{ Login string } `json:"author"`
 			Body   string                 `json:"body"`
 		} `json:"comments"`
 	} `json:"reviewThreads"`
 	Comments []struct {
-		ID     int64                  `json:"id"`
+		ID     string                 `json:"id"`
 		Author struct{ Login string } `json:"author"`
 		Body   string                 `json:"body"`
 	} `json:"comments"`
@@ -199,7 +209,7 @@ type PRView struct {
 func ghPRView(repo string, n int) (*PRView, error) {
 	out, errStr, err := run("gh", "pr", "view", fmt.Sprint(n),
 		"--repo", repo,
-		"--json", "state,headRefOid,reviews,reviewThreads,comments,statusCheckRollup")
+		"--json", "state,headRefOid,reviews,comments,statusCheckRollup")
 	if err != nil {
 		return nil, fmt.Errorf("gh pr view: %v: %s", err, errStr)
 	}
@@ -221,12 +231,66 @@ func tmuxHasSession(vm VMBlock, session string) (bool, error) {
 	return false, err
 }
 
-func tmuxStart(vm VMBlock, session string) error {
-	// bash -lc so the user's login PATH (e.g. ~/.local/bin for clawpatrol) is in scope.
-	cmd := fmt.Sprintf(`tmux new-session -d -s %s 'bash -lc "clawpatrol run -- claude"'`, session)
-	_, errStr, err := sshExec(vm, cmd)
+// bootstrapVM provisions outbound github auth on the VM: copies the local
+// ssh key (the same one orch uses to reach the VM, which we assume also
+// authorizes github access for the bot account) and primes known_hosts.
+// Idempotent — safe to call on every orch start.
+func bootstrapVM(vm VMBlock) error {
+	keyPath := expand(vm.Key)
+	priv, err := os.ReadFile(keyPath)
 	if err != nil {
-		return fmt.Errorf("tmux new-session: %v: %s", err, errStr)
+		return fmt.Errorf("read %s: %w", keyPath, err)
+	}
+	pub, err := os.ReadFile(keyPath + ".pub")
+	if err != nil {
+		return fmt.Errorf("read %s.pub: %w", keyPath, err)
+	}
+	script := fmt.Sprintf(`set -e
+umask 077
+mkdir -m 700 -p ~/.ssh
+echo %s | base64 -d > ~/.ssh/id_ed25519
+chmod 600 ~/.ssh/id_ed25519
+echo %s | base64 -d > ~/.ssh/id_ed25519.pub
+chmod 644 ~/.ssh/id_ed25519.pub
+touch ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+if ! grep -q '^github.com ' ~/.ssh/known_hosts 2>/dev/null; then
+  ssh-keyscan -t ed25519,rsa github.com 2>/dev/null >> ~/.ssh/known_hosts
+fi
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | head -1
+`,
+		base64.StdEncoding.EncodeToString(priv),
+		base64.StdEncoding.EncodeToString(pub))
+	out, errStr, err := sshExecIn(vm, script, "bash -s")
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, errStr)
+	}
+	if !strings.Contains(out, "successfully authenticated") {
+		return fmt.Errorf("github ssh auth check unexpected: %q", strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// tmuxStart prepares a per-issue workdir on the VM (clone via ssh, set git
+// identity, pre-stamp claude's trust flag for the dir) and launches an
+// interactive clawpatrol-wrapped claude session in tmux. Whole setup runs
+// as one bash script piped over ssh stdin to dodge nested quoting.
+func tmuxStart(vm VMBlock, session, workdir, repo, branch string) error {
+	script := fmt.Sprintf(`set -e
+mkdir -p "%s"
+cd "%s"
+if [ ! -d .git ]; then git clone "git@github.com:%s.git" . >/dev/null 2>&1; fi
+git config user.name "divybot"
+git config user.email "divybot@users.noreply.github.com"
+git fetch origin >/dev/null 2>&1
+git checkout -B "%s" origin/main 2>/dev/null || git checkout -B "%s"
+jq --arg d "%s" '.projects[$d].hasTrustDialogAccepted = true' ~/.claude.json > ~/.claude.json.tmp && mv ~/.claude.json.tmp ~/.claude.json
+tmux kill-session -t "%s" 2>/dev/null || true
+tmux new-session -d -c "%s" -s "%s" 'bash -lc "clawpatrol run -- claude --dangerously-skip-permissions"'
+`, workdir, workdir, repo, branch, branch, workdir, session, workdir, session)
+
+	_, errStr, err := sshExecIn(vm, script, "bash -s")
+	if err != nil {
+		return fmt.Errorf("tmux start: %v: %s", err, errStr)
 	}
 	return nil
 }
@@ -236,18 +300,18 @@ func tmuxKill(vm VMBlock, session string) {
 }
 
 // tmuxIdle is a heuristic for "claude TUI is at its input prompt and not
-// processing". It looks for a prompt marker and the absence of the
-// in-progress hint claude prints while it works. False negatives (we think
-// it's busy when it isn't) just defer the poke by one tick — safe.
+// processing". The status bar "bypass permissions" line is always rendered
+// once the TUI is up; "esc to interrupt" is appended only while claude is
+// working. False negatives just defer the poke by one tick — safe.
 func tmuxIdle(vm VMBlock, session string) (bool, error) {
 	out, _, err := sshExec(vm, fmt.Sprintf("tmux capture-pane -p -t %s | tail -8", session))
 	if err != nil {
 		return false, err
 	}
-	if strings.Contains(out, "esc to interrupt") {
+	if !strings.Contains(out, "bypass permissions") {
 		return false, nil
 	}
-	return strings.Contains(out, "> "), nil
+	return !strings.Contains(out, "esc to interrupt"), nil
 }
 
 func tmuxPaste(vm VMBlock, session, msg string) error {
@@ -292,12 +356,16 @@ func vmByName(cfg *Config, name string) *VMBlock {
 	return nil
 }
 
-func renderBootstrap(tmpl string, is Issue, branch string) string {
+func renderBootstrap(tmpl string, is Issue, branch, targetName, targetRepo, inboxRepo, workdir string) string {
 	return strings.NewReplacer(
 		"{{issue.number}}", fmt.Sprint(is.Number),
 		"{{issue.title}}", is.Title,
 		"{{issue.body}}", is.Body,
 		"{{branch}}", branch,
+		"{{target.name}}", targetName,
+		"{{target.repo}}", targetRepo,
+		"{{inbox.repo}}", inboxRepo,
+		"{{workdir}}", workdir,
 	).Replace(tmpl)
 }
 
@@ -343,9 +411,9 @@ func tearDown(cfg *Config, st *State, issue int) {
 	log.Printf("issue #%d: torn down (was on %s/%s)", issue, j.VM, j.Tmux)
 }
 
-func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments []int64, pushed bool, checkChanges []string) {
-	seen := func(ids []int64) map[int64]bool {
-		m := map[int64]bool{}
+func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments []string, pushed bool, checkChanges []string) {
+	seen := func(ids []string) map[string]bool {
+		m := map[string]bool{}
 		for _, id := range ids {
 			m[id] = true
 		}
@@ -394,7 +462,7 @@ func oneLine(s string, max int) string {
 	return s
 }
 
-func summarize(v *PRView, nr, ntc, nic []int64, pushed bool, checks []string) string {
+func summarize(v *PRView, nr, ntc, nic []string, pushed bool, checks []string) string {
 	var b strings.Builder
 	b.WriteString("PR update from orchestrator:\n\n")
 	for _, id := range nr {
@@ -434,41 +502,57 @@ func summarize(v *PRView, nr, ntc, nic []int64, pushed bool, checks []string) st
 	return b.String()
 }
 
-func spawn(cfg *Config, st *State, vm *VMBlock, is Issue) error {
+func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) error {
 	session := sessionName(is.Number)
 	branch := cfg.Orch.BranchPrefix + fmt.Sprint(is.Number)
-	if err := tmuxStart(*vm, session); err != nil {
+	workdir := fmt.Sprintf("%s/issue-%d", strings.TrimRight(cfg.Orch.WorkdirRoot, "/"), is.Number)
+	if err := tmuxStart(*vm, session, workdir, target.Repo, branch); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if idle, err := tmuxIdle(*vm, session); err == nil && idle {
 			break
 		}
 		time.Sleep(2 * time.Second)
 	}
-	msg := renderBootstrap(cfg.BootstrapPrompt, is, branch)
+	msg := renderBootstrap(cfg.BootstrapPrompt, is, branch, target.Name, target.Repo, cfg.GitHub.InboxRepo, workdir)
 	if err := tmuxPaste(*vm, session, msg); err != nil {
 		tmuxKill(*vm, session)
 		return fmt.Errorf("bootstrap paste: %w", err)
 	}
-	st.Jobs[is.Number] = &Job{VM: vm.Name, Tmux: session, Branch: branch, LastCheckConclusions: map[string]string{}}
-	log.Printf("issue #%d: spawned on %s/%s, branch=%s", is.Number, vm.Name, session, branch)
+	st.Jobs[is.Number] = &Job{
+		VM: vm.Name, Tmux: session,
+		Target: target.Name, TargetRepo: target.Repo,
+		Branch: branch, LastCheckConclusions: map[string]string{},
+	}
+	log.Printf("issue #%d: spawned on %s/%s, target=%s (%s), branch=%s",
+		is.Number, vm.Name, session, target.Name, target.Repo, branch)
 	return nil
 }
 
 func tick(cfg *Config, st *State) {
-	issues, err := ghIssueList(cfg.GitHub.Repo, cfg.GitHub.Label)
-	if err != nil {
-		log.Printf("list issues: %v", err)
-		return
+	// Map issue number -> (Issue, Target). First target whose label matches wins.
+	type routed struct {
+		is     Issue
+		target TargetBlock
 	}
-	open := map[int]Issue{}
-	for _, is := range issues {
-		open[is.Number] = is
+	open := map[int]routed{}
+	for _, t := range cfg.Targets {
+		issues, err := ghIssueList(cfg.GitHub.InboxRepo, t.Label)
+		if err != nil {
+			log.Printf("list issues for target %s: %v", t.Name, err)
+			continue
+		}
+		for _, is := range issues {
+			if _, dup := open[is.Number]; dup {
+				continue
+			}
+			open[is.Number] = routed{is: is, target: t}
+		}
 	}
 
-	for n, is := range open {
+	for n, r := range open {
 		if _, exists := st.Jobs[n]; exists {
 			continue
 		}
@@ -477,7 +561,7 @@ func tick(cfg *Config, st *State) {
 			log.Printf("issue #%d: no free VM, skipping", n)
 			continue
 		}
-		if err := spawn(cfg, st, vm, is); err != nil {
+		if err := spawn(cfg, st, vm, r.is, r.target); err != nil {
 			log.Printf("issue #%d: spawn failed on %s: %v", n, vm.Name, err)
 			continue
 		}
@@ -486,7 +570,7 @@ func tick(cfg *Config, st *State) {
 
 	for n, j := range st.Jobs {
 		if _, stillOpen := open[n]; !stillOpen {
-			isOpen, err := ghIssueIsOpen(cfg.GitHub.Repo, n)
+			isOpen, err := ghIssueIsOpen(cfg.GitHub.InboxRepo, n)
 			if err != nil {
 				log.Printf("issue #%d: check open failed: %v", n, err)
 			} else if !isOpen {
@@ -514,7 +598,7 @@ func tick(cfg *Config, st *State) {
 			continue
 		}
 		if j.PR == 0 {
-			pr, err := ghFindPRByBranch(cfg.GitHub.Repo, j.Branch)
+			pr, err := ghFindPRByBranch(j.TargetRepo, j.Branch)
 			if err != nil {
 				log.Printf("issue #%d: find PR failed: %v", n, err)
 				continue
@@ -523,10 +607,10 @@ func tick(cfg *Config, st *State) {
 				continue
 			}
 			j.PR = pr.Number
-			log.Printf("issue #%d: found PR #%d", n, j.PR)
+			log.Printf("issue #%d: found PR #%d in %s", n, j.PR, j.TargetRepo)
 			_ = saveState(cfg.Orch.StateFile, st)
 		}
-		v, err := ghPRView(cfg.GitHub.Repo, j.PR)
+		v, err := ghPRView(j.TargetRepo, j.PR)
 		if err != nil {
 			log.Printf("issue #%d: pr view failed: %v", n, err)
 			continue
@@ -588,8 +672,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("state: %v", err)
 	}
-	log.Printf("orch up: repo=%s label=%s vms=%d interval=%s tracked=%d",
-		cfg.GitHub.Repo, cfg.GitHub.Label, len(cfg.VMs), interval, len(st.Jobs))
+	tnames := make([]string, 0, len(cfg.Targets))
+	for _, t := range cfg.Targets {
+		tnames = append(tnames, fmt.Sprintf("%s(%s→%s)", t.Name, t.Label, t.Repo))
+	}
+	log.Printf("orch up: inbox=%s targets=[%s] vms=%d interval=%s tracked=%d",
+		cfg.GitHub.InboxRepo, strings.Join(tnames, ","), len(cfg.VMs), interval, len(st.Jobs))
+
+	for i := range cfg.VMs {
+		if err := bootstrapVM(cfg.VMs[i]); err != nil {
+			log.Printf("vm %s: bootstrap FAILED: %v", cfg.VMs[i].Name, err)
+		} else {
+			log.Printf("vm %s: bootstrapped (github ssh ok)", cfg.VMs[i].Name)
+		}
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
