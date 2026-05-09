@@ -64,10 +64,11 @@ You open issue in inbox repo, add a target label
   orchid picks free VM ─────► bootstrapVM (idempotent ssh key push)
                   │
                   ▼  (one ssh call: bash -s)
-  per-issue workdir created → git clone target repo → git config (bot identity)
-                            → branch checked out from origin/main
-                            → ~/.claude.json trust-stamped for the workdir
-                            → tmux new-session: clawpatrol run -- claude
+  shared clone of target repo at <workdir_root>/repos/<owner-repo>/
+    (one per repo per VM, fetched fresh each spawn)
+  per-issue workdir is a git WORKTREE off the shared clone
+    (cheap — shares .git/objects, no full reclone per issue or per respawn)
+  git config (bot identity), trust-stamp ~/.claude.json, tmux new-session
                   │
                   ▼  (wait for TUI idle, up to 60s)
   Bootstrap prompt pasted into the pane via tmux load-buffer / paste-buffer

@@ -70,23 +70,70 @@ type State struct {
 	Jobs map[int]*Job `json:"jobs"`
 }
 
+// retry wraps an exec.Command-style call with bounded retries on non-zero
+// exit. clawpatrol's MITM proxy is known to drop connections sporadically
+// (gh: "error connecting to api.github.com", ssh: exit 255); this hides
+// those blips so a single tick doesn't lose work. Backoff: 1s, 2s, 4s.
+const runAttempts = 4
+
 func run(name string, args ...string) (string, string, error) {
-	cmd := exec.Command(name, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	return stdout.String(), stderr.String(), err
+	return runWithStdin(nil, name, args...)
 }
 
 func runIn(stdin string, name string, args ...string) (string, string, error) {
-	cmd := exec.Command(name, args...)
-	cmd.Stdin = strings.NewReader(stdin)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	return stdout.String(), stderr.String(), err
+	return runWithStdin(strings.NewReader(stdin), name, args...)
+}
+
+func runWithStdin(stdin *strings.Reader, name string, args ...string) (string, string, error) {
+	var lastOut, lastErr string
+	var lastE error
+	for i := 0; i < runAttempts; i++ {
+		cmd := exec.Command(name, args...)
+		if stdin != nil {
+			_, _ = stdin.Seek(0, 0)
+			cmd.Stdin = stdin
+		}
+		var o, e bytes.Buffer
+		cmd.Stdout = &o
+		cmd.Stderr = &e
+		lastE = cmd.Run()
+		lastOut, lastErr = o.String(), e.String()
+		if lastE == nil {
+			return lastOut, lastErr, nil
+		}
+		if !isTransient(lastE, lastErr) || i == runAttempts-1 {
+			break
+		}
+		backoff := time.Duration(1<<uint(i)) * time.Second
+		log.Printf("retry %s: attempt %d/%d transient failure (%v); sleeping %s", name, i+1, runAttempts, lastE, backoff)
+		time.Sleep(backoff)
+	}
+	return lastOut, lastErr, lastE
+}
+
+// isTransient classifies clawpatrol-style network blips that should trigger
+// a retry. Anything else (gh 404, tmux exit 1 = no session, etc.) returns
+// false so we don't waste budget on permanent errors.
+func isTransient(err error, stderr string) bool {
+	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 255 {
+		return true // ssh connection failure
+	}
+	for _, pat := range []string{
+		"error connecting to api.github.com",
+		"Could not resolve host",
+		"Connection timed out",
+		"Connection refused",
+		"Connection reset by peer",
+		"network is unreachable",
+		"i/o timeout",
+		"TLS handshake",
+		"unexpected EOF",
+	} {
+		if strings.Contains(stderr, pat) {
+			return true
+		}
+	}
+	return false
 }
 
 func expand(p string) string {
@@ -270,23 +317,54 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | head 
 	return nil
 }
 
-// tmuxStart prepares a per-issue workdir on the VM (clone via ssh, set git
-// identity, pre-stamp claude's trust flag for the dir) and launches an
-// interactive clawpatrol-wrapped claude session in tmux. Whole setup runs
-// as one bash script piped over ssh stdin to dodge nested quoting.
-func tmuxStart(vm VMBlock, session, workdir, repo, branch string) error {
+// tmuxStart prepares a per-issue working tree on the VM and launches an
+// interactive clawpatrol-wrapped claude session in tmux. Layout per VM:
+//
+//	<workdir_root>/repos/<owner-repo>/   single shared clone per (vm, repo)
+//	<workdir_root>/issue-<N>/            git worktree off the shared clone
+//
+// Worktrees share .git/objects with the shared clone, so adding one is fast
+// and disk-cheap — no full reclone per issue. Whole setup runs as one bash
+// script piped over ssh stdin to dodge nested quoting.
+func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch string) error {
 	script := fmt.Sprintf(`set -e
-mkdir -p "%s"
-cd "%s"
-if [ ! -d .git ]; then git clone "git@github.com:%s.git" . >/dev/null 2>&1; fi
-git config user.name "divybot"
-git config user.email "divybot@users.noreply.github.com"
-git fetch origin >/dev/null 2>&1
-git checkout -B "%s" origin/main 2>/dev/null || git checkout -B "%s"
-jq --arg d "%s" '.projects[$d].hasTrustDialogAccepted = true' ~/.claude.json > ~/.claude.json.tmp && mv ~/.claude.json.tmp ~/.claude.json
-tmux kill-session -t "%s" 2>/dev/null || true
-tmux new-session -d -c "%s" -s "%s" 'bash -lc "clawpatrol run -- claude --dangerously-skip-permissions"'
-`, workdir, workdir, repo, branch, branch, workdir, session, workdir, session)
+SHARED=%q
+REPO=%q
+WORKDIR=%q
+BRANCH=%q
+SESSION=%q
+
+# 1) shared clone (once per repo per VM); always fetch fresh refs
+if [ ! -d "$SHARED/.git" ]; then
+  mkdir -p "$(dirname "$SHARED")"
+  git clone "git@github.com:$REPO.git" "$SHARED"
+fi
+git -C "$SHARED" fetch origin --prune --quiet
+
+# 2) per-issue worktree off the shared clone (worktree's .git is a file,
+#    so check -e not -d). If a previous worktree dir is gone we prune
+#    stale references from the shared clone before re-adding.
+if [ ! -e "$WORKDIR/.git" ]; then
+  rm -rf "$WORKDIR"
+  git -C "$SHARED" worktree prune
+  if git -C "$SHARED" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+    git -C "$SHARED" worktree add -B "$BRANCH" "$WORKDIR" "origin/$BRANCH"
+  else
+    git -C "$SHARED" worktree add -B "$BRANCH" "$WORKDIR" origin/main
+  fi
+fi
+
+# 3) bot identity (worktrees inherit from shared clone, but pin locally)
+git -C "$WORKDIR" config user.name divybot
+git -C "$WORKDIR" config user.email divybot@users.noreply.github.com
+
+# 4) pre-stamp claude's per-folder trust flag so the TUI doesn't prompt
+jq --arg d "$WORKDIR" '.projects[$d].hasTrustDialogAccepted = true' ~/.claude.json > ~/.claude.json.tmp && mv ~/.claude.json.tmp ~/.claude.json
+
+# 5) launch the pane
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+tmux new-session -d -c "$WORKDIR" -s "$SESSION" 'bash -lc "clawpatrol run -- claude --dangerously-skip-permissions"'
+`, sharedDir, repo, workdir, branch, session)
 
 	_, errStr, err := sshExecIn(vm, script, "bash -s")
 	if err != nil {
@@ -505,8 +583,10 @@ func summarize(v *PRView, nr, ntc, nic []string, pushed bool, checks []string) s
 func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) error {
 	session := sessionName(is.Number)
 	branch := cfg.Orch.BranchPrefix + fmt.Sprint(is.Number)
-	workdir := fmt.Sprintf("%s/issue-%d", strings.TrimRight(cfg.Orch.WorkdirRoot, "/"), is.Number)
-	if err := tmuxStart(*vm, session, workdir, target.Repo, branch); err != nil {
+	root := strings.TrimRight(cfg.Orch.WorkdirRoot, "/")
+	workdir := fmt.Sprintf("%s/issue-%d", root, is.Number)
+	sharedDir := fmt.Sprintf("%s/repos/%s", root, strings.ReplaceAll(target.Repo, "/", "-"))
+	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch); err != nil {
 		return err
 	}
 	deadline := time.Now().Add(60 * time.Second)
