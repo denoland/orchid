@@ -303,6 +303,18 @@ touch ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
 if ! grep -q '^github.com ' ~/.ssh/known_hosts 2>/dev/null; then
   ssh-keyscan -t ed25519,rsa github.com 2>/dev/null >> ~/.ssh/known_hosts
 fi
+
+# claude config: must exist BEFORE first claude launch so the
+# --dangerously-skip-permissions warning + acceptance dialogs are skipped.
+mkdir -p ~/.claude
+if [ -f ~/.claude/settings.json ]; then
+  jq '. + {skipDangerousModePermissionPrompt: true}' ~/.claude/settings.json > ~/.claude/settings.json.tmp && mv ~/.claude/settings.json.tmp ~/.claude/settings.json
+else
+  echo '{"theme":"dark","skipDangerousModePermissionPrompt":true}' > ~/.claude/settings.json
+fi
+# ensure a parseable ~/.claude.json so tmuxStart's per-workdir trust stamp works
+[ -f ~/.claude.json ] || echo '{}' > ~/.claude.json
+
 ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | head -1
 `,
 		base64.StdEncoding.EncodeToString(priv),
@@ -589,6 +601,12 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch); err != nil {
 		return err
 	}
+	// Defensive: dismiss claude's per-folder trust dialog if it appears.
+	// Default is "Yes, I trust this folder" so plain Enter accepts.
+	// Settings.json provisioned by bootstrapVM kills the dangerous-mode
+	// warnings, so trust is the only dialog we should see at first launch.
+	time.Sleep(3 * time.Second)
+	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if idle, err := tmuxIdle(*vm, session); err == nil && idle {
