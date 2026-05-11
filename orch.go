@@ -175,10 +175,15 @@ func sshExec(vm VMBlock, remote string) (string, string, error) {
 	return run("ssh", append(sshArgs(vm), remote)...)
 }
 
-// sshExecIn runs a shell command on the VM with stdin. For localhost, skips SSH.
+// sshExecIn runs a shell command on the VM with stdin. For localhost, skips SSH
+// and runs the command directly (splits remote into argv).
 func sshExecIn(vm VMBlock, stdin, remote string) (string, string, error) {
 	if isLocal(vm) {
-		return runIn(stdin, "bash", "-s")
+		parts := strings.Fields(remote)
+		if len(parts) == 0 {
+			return "", "", fmt.Errorf("empty command")
+		}
+		return runIn(stdin, parts[0], parts[1:]...)
 	}
 	return runIn(stdin, "ssh", append(sshArgs(vm), remote)...)
 }
