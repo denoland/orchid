@@ -51,10 +51,13 @@ type OrchBlock struct {
 }
 
 type VMBlock struct {
-	Name string `hcl:",label"`
-	Host string `hcl:"host"`
-	User string `hcl:"user"`
-	Key  string `hcl:"key"`
+	Name       string `hcl:",label"`
+	Host       string `hcl:"host"`
+	User       string `hcl:"user,optional"`
+	Key        string `hcl:"key,optional"`        // not needed for localhost
+	Capacity   int    `hcl:"capacity,optional"`   // 0 = unlimited
+	Sccache    bool   `hcl:"sccache,optional"`
+	SccacheDir string `hcl:"sccache_dir,optional"` // default ~/.cache/sccache
 }
 
 type Job struct {
@@ -142,6 +145,10 @@ func isTransient(err error, stderr string) bool {
 	return false
 }
 
+func isLocal(vm VMBlock) bool {
+	return vm.Host == "localhost" || vm.Host == "127.0.0.1"
+}
+
 func expand(p string) string {
 	if strings.HasPrefix(p, "~/") {
 		h, _ := os.UserHomeDir()
@@ -160,11 +167,19 @@ func sshArgs(vm VMBlock) []string {
 	}
 }
 
+// sshExec runs a shell command on the VM. For localhost, skips SSH overhead.
 func sshExec(vm VMBlock, remote string) (string, string, error) {
+	if isLocal(vm) {
+		return run("bash", "-c", remote)
+	}
 	return run("ssh", append(sshArgs(vm), remote)...)
 }
 
+// sshExecIn runs a shell command on the VM with stdin. For localhost, skips SSH.
 func sshExecIn(vm VMBlock, stdin, remote string) (string, string, error) {
+	if isLocal(vm) {
+		return runIn(stdin, "bash", "-s")
+	}
 	return runIn(stdin, "ssh", append(sshArgs(vm), remote)...)
 }
 
@@ -287,18 +302,54 @@ func tmuxHasSession(vm VMBlock, session string) (bool, error) {
 // bootstrapVM provisions outbound github auth on the VM: copies the local
 // ssh key (the same one orch uses to reach the VM, which we assume also
 // authorizes github access for the bot account) and primes known_hosts.
+// For localhost VMs, key copy is skipped — keys are already present.
 // Idempotent — safe to call on every orch start.
 func bootstrapVM(vm VMBlock) error {
-	keyPath := expand(vm.Key)
-	priv, err := os.ReadFile(keyPath)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", keyPath, err)
+	sccacheDir := vm.SccacheDir
+	if sccacheDir == "" {
+		sccacheDir = "~/.cache/sccache"
 	}
-	pub, err := os.ReadFile(keyPath + ".pub")
-	if err != nil {
-		return fmt.Errorf("read %s.pub: %w", keyPath, err)
+	sccacheSetup := ""
+	if vm.Sccache {
+		sccacheSetup = fmt.Sprintf(`
+# sccache: start tmux server (idempotent), push shared env so every
+# session on this VM inherits RUSTC_WRAPPER without per-pane setup.
+tmux start-server 2>/dev/null || true
+mkdir -p %s
+tmux setenv -g RUSTC_WRAPPER sccache
+tmux setenv -g SCCACHE_DIR %s
+`, sccacheDir, sccacheDir)
 	}
-	script := fmt.Sprintf(`set -e
+
+	// common: claude settings + optional sccache + github auth check
+	commonScript := fmt.Sprintf(`set -e
+mkdir -p ~/.claude
+if [ -f ~/.claude/settings.json ]; then
+  jq '. + {skipDangerousModePermissionPrompt: true}' ~/.claude/settings.json > ~/.claude/settings.json.tmp && mv ~/.claude/settings.json.tmp ~/.claude/settings.json
+else
+  echo '{"theme":"dark","skipDangerousModePermissionPrompt":true}' > ~/.claude/settings.json
+fi
+[ -f ~/.claude.json ] || echo '{}' > ~/.claude.json
+%s
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | head -1
+`, sccacheSetup)
+
+	var out, errStr string
+	var err error
+
+	if isLocal(vm) {
+		out, errStr, err = runIn(commonScript, "bash", "-s")
+	} else {
+		keyPath := expand(vm.Key)
+		priv, rerr := os.ReadFile(keyPath)
+		if rerr != nil {
+			return fmt.Errorf("read %s: %w", keyPath, rerr)
+		}
+		pub, rerr := os.ReadFile(keyPath + ".pub")
+		if rerr != nil {
+			return fmt.Errorf("read %s.pub: %w", keyPath, rerr)
+		}
+		remoteScript := fmt.Sprintf(`set -e
 umask 077
 mkdir -m 700 -p ~/.ssh
 echo %s | base64 -d > ~/.ssh/id_ed25519
@@ -309,23 +360,13 @@ touch ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
 if ! grep -q '^github.com ' ~/.ssh/known_hosts 2>/dev/null; then
   ssh-keyscan -t ed25519,rsa github.com 2>/dev/null >> ~/.ssh/known_hosts
 fi
+%s`,
+			base64.StdEncoding.EncodeToString(priv),
+			base64.StdEncoding.EncodeToString(pub),
+			commonScript)
+		out, errStr, err = sshExecIn(vm, remoteScript, "bash -s")
+	}
 
-# claude config: must exist BEFORE first claude launch so the
-# --dangerously-skip-permissions warning + acceptance dialogs are skipped.
-mkdir -p ~/.claude
-if [ -f ~/.claude/settings.json ]; then
-  jq '. + {skipDangerousModePermissionPrompt: true}' ~/.claude/settings.json > ~/.claude/settings.json.tmp && mv ~/.claude/settings.json.tmp ~/.claude/settings.json
-else
-  echo '{"theme":"dark","skipDangerousModePermissionPrompt":true}' > ~/.claude/settings.json
-fi
-# ensure a parseable ~/.claude.json so tmuxStart's per-workdir trust stamp works
-[ -f ~/.claude.json ] || echo '{}' > ~/.claude.json
-
-ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | head -1
-`,
-		base64.StdEncoding.EncodeToString(priv),
-		base64.StdEncoding.EncodeToString(pub))
-	out, errStr, err := sshExecIn(vm, script, "bash -s")
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, errStr)
 	}
@@ -426,21 +467,36 @@ func tmuxPaste(vm VMBlock, session, msg string) error {
 func sessionName(issue int) string { return fmt.Sprintf("claude-%d", issue) }
 
 func freeVM(cfg *Config, st *State) *VMBlock {
-	used := map[string]bool{}
+	if len(cfg.VMs) == 0 {
+		return nil
+	}
+	load := map[string]int{}
+	for i := range cfg.VMs {
+		load[cfg.VMs[i].Name] = 0
+	}
 	for _, j := range st.Jobs {
-		used[j.VM] = true
+		load[j.VM]++
 	}
 	idx := make([]int, 0, len(cfg.VMs))
 	for i := range cfg.VMs {
+		vm := &cfg.VMs[i]
+		if vm.Capacity > 0 && load[vm.Name] >= vm.Capacity {
+			continue // at cap
+		}
 		idx = append(idx, i)
 	}
-	sort.Slice(idx, func(a, b int) bool { return cfg.VMs[idx[a]].Name < cfg.VMs[idx[b]].Name })
-	for _, i := range idx {
-		if !used[cfg.VMs[i].Name] {
-			return &cfg.VMs[i]
-		}
+	if len(idx) == 0 {
+		return nil
 	}
-	return nil
+	// pick least-loaded VM; break ties by name for determinism
+	sort.Slice(idx, func(a, b int) bool {
+		na, nb := cfg.VMs[idx[a]].Name, cfg.VMs[idx[b]].Name
+		if load[na] != load[nb] {
+			return load[na] < load[nb]
+		}
+		return na < nb
+	})
+	return &cfg.VMs[idx[0]]
 }
 
 func vmByName(cfg *Config, name string) *VMBlock {
@@ -808,7 +864,7 @@ const indexTmpl = `<!DOCTYPE html>
   <td>{{.Bot}}</td>
   <td><code>{{.Session}}</code></td>
   <td>{{if .PR}}<a href="https://github.com/{{.Repo}}/pull/{{.PR}}">#{{.PR}}</a>{{end}}</td>
-  <td><a class="term" target="_blank" href="{{.TermURL}}">open ↗</a></td>
+  <td>{{if .TermURL}}<a class="term" target="_blank" href="{{.TermURL}}">open ↗</a>{{else}}local{{end}}</td>
 </tr>
 {{end}}
 </tbody>

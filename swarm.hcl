@@ -55,32 +55,37 @@ When you receive a follow-up, address it (push fixes if needed) and stop again.
 The session ends automatically when the PR is merged or closed.
 EOT
 
-vm "tiger-fusion" {
-  host = "tiger-fusion.exe.xyz"
-  user = "exedev"
-  key  = "~/.ssh/id_ed25519"
-}
+# vm "tiger-fusion" {
+#   host = "tiger-fusion.exe.xyz"
+#   user = "exedev"
+#   key  = "~/.ssh/id_ed25519"
+# }
 
-vm "divybot1" {
-  host = "divybot1.exe.xyz"
-  user = "exedev"
-  key  = "~/.ssh/id_ed25519"
-}
+# vm "divybot1" {
+#   host = "divybot1.exe.xyz"
+#   user = "exedev"
+#   key  = "~/.ssh/id_ed25519"
+# }
 
-vm "divybot2" {
-  host = "divybot2.exe.xyz"
-  user = "exedev"
-  key  = "~/.ssh/id_ed25519"
-}
+# vm "divybot2" {
+#   host = "divybot2.exe.xyz"
+#   user = "exedev"
+#   key  = "~/.ssh/id_ed25519"
+# }
 
-vm "divybot3" {
-  host = "divybot3.exe.xyz"
-  user = "exedev"
-  key  = "~/.ssh/id_ed25519"
-}
+# vm "divybot3" {
+#   host = "divybot3.exe.xyz"
+#   user = "exedev"
+#   key  = "~/.ssh/id_ed25519"
+# }
 
-vm "divybot4" {
-  host = "divybot4.exe.xyz"
-  user = "exedev"
-  key  = "~/.ssh/id_ed25519"
+# vm "divybot4" {
+#   host = "divybot4.exe.xyz"
+#   user = "exedev"
+#   key  = "~/.ssh/id_ed25519"
+# }
+
+vm "local" {
+  host     = "localhost"
+  capacity = 3
 }
