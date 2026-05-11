@@ -5,9 +5,9 @@ github {
 
 orchestrator {
   poll_interval = "30s"
-  state_file    = "/home/exedev/orch/state.json"
+  state_file    = "/root/orch/state.json"
   branch_prefix = "orch/issue-"
-  workdir_root  = "/home/exedev/orch-work"
+  workdir_root  = "/home/orchid/orch-work"
   http_addr     = ":8000"
   bot_login     = "divybot"
 }
@@ -86,6 +86,8 @@ EOT
 # }
 
 vm "local" {
-  host     = "localhost"
-  capacity = 3
+  host        = "localhost"
+  capacity    = 3
+  session_cmd  = "runuser -u orchid -- clawpatrol run -- claude --dangerously-skip-permissions"
+  session_home = "/home/orchid"
 }

@@ -54,10 +54,12 @@ type VMBlock struct {
 	Name       string `hcl:",label"`
 	Host       string `hcl:"host"`
 	User       string `hcl:"user,optional"`
-	Key        string `hcl:"key,optional"`        // not needed for localhost
-	Capacity   int    `hcl:"capacity,optional"`   // 0 = unlimited
+	Key        string `hcl:"key,optional"`         // not needed for localhost
+	Capacity   int    `hcl:"capacity,optional"`    // 0 = unlimited
 	Sccache    bool   `hcl:"sccache,optional"`
 	SccacheDir string `hcl:"sccache_dir,optional"` // default ~/.cache/sccache
+	SessionCmd  string `hcl:"session_cmd,optional"`  // default: clawpatrol run -- claude --dangerously-skip-permissions
+	SessionHome string `hcl:"session_home,optional"` // home dir of user running the session (for trust stamp)
 }
 
 type Job struct {
@@ -391,12 +393,22 @@ fi
 // and disk-cheap — no full reclone per issue. Whole setup runs as one bash
 // script piped over ssh stdin to dodge nested quoting.
 func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch string) error {
+	sessionCmd := vm.SessionCmd
+	if sessionCmd == "" {
+		sessionCmd = "clawpatrol run -- claude --dangerously-skip-permissions"
+	}
+	sessionHome := vm.SessionHome
+	if sessionHome == "" {
+		sessionHome = "~"
+	}
 	script := fmt.Sprintf(`set -e
 SHARED=%q
 REPO=%q
 WORKDIR=%q
 BRANCH=%q
 SESSION=%q
+SESSION_CMD=%q
+SESSION_HOME=%q
 
 # 1) shared clone (once per repo per VM); always fetch fresh refs
 if [ ! -d "$SHARED/.git" ]; then
@@ -422,13 +434,23 @@ fi
 git -C "$WORKDIR" config user.name divybot
 git -C "$WORKDIR" config user.email divybot@users.noreply.github.com
 
+# 3b) if session runs as a different user, chown worktree + shared clone to them
+if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ]; then
+  SESSION_USER=$(stat -c '%U' "$SESSION_HOME")
+  chown -R "$SESSION_USER:$SESSION_USER" "$WORKDIR" "$SHARED" 2>/dev/null || true
+fi
+
 # 4) pre-stamp claude's per-folder trust flag so the TUI doesn't prompt
-jq --arg d "$WORKDIR" '.projects[$d].hasTrustDialogAccepted = true' ~/.claude.json > ~/.claude.json.tmp && mv ~/.claude.json.tmp ~/.claude.json
+for CHOME in ~ "$SESSION_HOME"; do
+  CJSON="$CHOME/.claude.json"
+  [ -f "$CJSON" ] || echo '{}' > "$CJSON"
+  jq --arg d "$WORKDIR" '.projects[$d].hasTrustDialogAccepted = true' "$CJSON" > "$CJSON.tmp" && mv "$CJSON.tmp" "$CJSON"
+done
 
 # 5) launch the pane
 tmux kill-session -t "$SESSION" 2>/dev/null || true
-tmux new-session -d -c "$WORKDIR" -s "$SESSION" 'bash -lc "clawpatrol run -- claude --dangerously-skip-permissions"'
-`, sharedDir, repo, workdir, branch, session)
+tmux new-session -d -c "$WORKDIR" -s "$SESSION" "$SESSION_CMD"
+`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome)
 
 	_, errStr, err := sshExecIn(vm, script, "bash -s")
 	if err != nil {
