@@ -85,3 +85,108 @@ func TestIssueHasLabel(t *testing.T) {
 		t.Error("expected zero-value issue to have no labels")
 	}
 }
+
+func TestResolveIncludeAPI(t *testing.T) {
+	tests := []struct {
+		name    string
+		kind    string
+		ref     string
+		inbox   string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:  "relative prompt",
+			kind:  "prompt",
+			ref:   "review-pr.md",
+			inbox: "bartlomieju/agent-job-board",
+			want:  "repos/bartlomieju/agent-job-board/contents/prompts/review-pr.md",
+		},
+		{
+			name:  "relative skill",
+			kind:  "skill",
+			ref:   "lint.md",
+			inbox: "bartlomieju/agent-job-board",
+			want:  "repos/bartlomieju/agent-job-board/contents/skills/lint.md",
+		},
+		{
+			name:  "nested relative path",
+			kind:  "prompt",
+			ref:   "shared/style.md",
+			inbox: "bartlomieju/agent-job-board",
+			want:  "repos/bartlomieju/agent-job-board/contents/prompts/shared/style.md",
+		},
+		{
+			name:  "absolute github URL on main",
+			kind:  "skill",
+			ref:   "https://github.com/denoland/deno/blob/main/skills/triage.md",
+			inbox: "bartlomieju/agent-job-board",
+			want:  "repos/denoland/deno/contents/skills/triage.md?ref=main",
+		},
+		{
+			name:  "absolute URL with tag ref",
+			kind:  "prompt",
+			ref:   "https://github.com/owner/repo/blob/v1.2.3/prompts/x.md",
+			inbox: "ignored",
+			want:  "repos/owner/repo/contents/prompts/x.md?ref=v1.2.3",
+		},
+		{
+			name:    "URL missing /blob/ segment",
+			kind:    "prompt",
+			ref:     "https://github.com/owner/repo/main/file.md",
+			inbox:   "ignored",
+			wantErr: true,
+		},
+		{
+			name:    "URL too short",
+			kind:    "prompt",
+			ref:     "https://github.com/owner/repo",
+			inbox:   "ignored",
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveIncludeAPI(tc.kind, tc.ref, tc.inbox)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIncludePatternMatches(t *testing.T) {
+	body := `Plain text.
+
+[prompt:review-pr.md]
+
+Some other text. [skill:lint.md] inline.
+
+A URL form: [prompt:https://github.com/denoland/deno/blob/main/skills/triage.md]
+
+Not a match: [other:foo.md] or [prompt foo.md] or text [prompt:].
+`
+	matches := includePattern.FindAllStringSubmatch(body, -1)
+	want := [][2]string{
+		{"prompt", "review-pr.md"},
+		{"skill", "lint.md"},
+		{"prompt", "https://github.com/denoland/deno/blob/main/skills/triage.md"},
+	}
+	if len(matches) != len(want) {
+		t.Fatalf("got %d matches, want %d: %+v", len(matches), len(want), matches)
+	}
+	for i, m := range matches {
+		if m[1] != want[i][0] || m[2] != want[i][1] {
+			t.Errorf("match %d: got (%q, %q), want (%q, %q)", i, m[1], m[2], want[i][0], want[i][1])
+		}
+	}
+}

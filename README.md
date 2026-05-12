@@ -156,6 +156,45 @@ Use `{{...}}` not `${...}` to avoid HCL variable interpolation.
 
 ---
 
+## Including prompt and skill files
+
+Long prompts and reusable skills can be kept in files (e.g. in
+`prompts/` and `skills/` directories of the inbox repo) and pulled
+into a work issue with a short reference. orch fetches the file
+contents via `gh api` after `renderBootstrap` and inlines them in
+place of the reference, so the worker session sees the prompt as
+one continuous message.
+
+Two reference forms:
+
+```
+[prompt:review-pr.md]
+[skill:lint-fixes.md]
+```
+
+The bare-filename form resolves to `<type>s/<filename>` in the
+**inbox** repo — `[prompt:review-pr.md]` fetches `prompts/review-pr.md`
+and `[skill:foo.md]` fetches `skills/foo.md`. Subdirectories are
+allowed (`[prompt:shared/style.md]` → `prompts/shared/style.md`).
+
+```
+[skill:https://github.com/denoland/deno/blob/main/skills/triage.md]
+[prompt:https://github.com/owner/repo/blob/v1.0.0/prompts/x.md]
+```
+
+The URL form fetches from any public (or token-accessible) repo.
+Branch names containing `/` aren't supported by the naive URL
+parser; use a single-segment branch (`main`, `master`), a tag, or a
+commit SHA.
+
+References can appear in the issue body (substituted via
+`{{issue.body}}`) or directly in the `bootstrap_prompt` /
+`cron_bootstrap_prompt` template. If a fetch fails, the reference is
+replaced with an HTML comment marker (`<!-- include failed: ... -->`)
+in the prompt and the failure is logged — the spawn does not abort.
+
+---
+
 ## Cron lifecycle (recurring tasks)
 
 Inbox issues labeled `cron` run on a schedule instead of the one-shot

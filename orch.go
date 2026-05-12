@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -739,6 +740,74 @@ func vmBotIdentity(orch OrchBlock, vm VMBlock) (login, email string) {
 	return
 }
 
+// includePattern matches `[prompt:<ref>]` and `[skill:<ref>]` inclusions
+// anywhere in the rendered bootstrap message. The reference can be a
+// relative filename (resolved as `<type>s/<filename>` in the inbox repo,
+// note the plural) or an absolute GitHub blob URL pointing at any repo.
+var includePattern = regexp.MustCompile(`\[(prompt|skill):([^\]]+)\]`)
+
+// resolveIncludeAPI returns the gh-api path for fetching one include. It's
+// the pure-logic part of expandIncludes, factored out so it's testable
+// without hitting GitHub.
+//
+// GitHub URLs of the form https://github.com/<owner>/<repo>/blob/<ref>/<path>
+// are split naively at slashes — branch names containing `/` cannot be
+// disambiguated from the path component without asking the server, so use
+// a single-segment ref (e.g. `main`, `master`, a tag) or a commit SHA.
+func resolveIncludeAPI(kind, ref, inboxRepo string) (string, error) {
+	if strings.HasPrefix(ref, "https://github.com/") {
+		u := strings.TrimPrefix(ref, "https://github.com/")
+		// owner / repo / "blob" / ref / path...
+		parts := strings.SplitN(u, "/", 5)
+		if len(parts) < 5 || parts[2] != "blob" {
+			return "", fmt.Errorf("malformed github URL: %s", ref)
+		}
+		owner, repo, gitRef, path := parts[0], parts[1], parts[3], parts[4]
+		return fmt.Sprintf("repos/%s/%s/contents/%s?ref=%s", owner, repo, path, gitRef), nil
+	}
+	return fmt.Sprintf("repos/%s/contents/%ss/%s", inboxRepo, kind, ref), nil
+}
+
+// fetchInclude pulls a single include's content from GitHub via `gh api`,
+// decoding the base64 contents response.
+func fetchInclude(kind, ref, inboxRepo string) (string, error) {
+	apiPath, err := resolveIncludeAPI(kind, ref, inboxRepo)
+	if err != nil {
+		return "", err
+	}
+	out, errStr, err := run("gh", "api", apiPath, "--jq", ".content")
+	if err != nil {
+		return "", fmt.Errorf("gh api %s: %v: %s", apiPath, err, strings.TrimSpace(errStr))
+	}
+	// GitHub returns base64 with embedded newlines; strip them before decoding.
+	raw := strings.ReplaceAll(strings.TrimSpace(out), "\n", "")
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return "", fmt.Errorf("decode base64: %w", err)
+	}
+	return string(decoded), nil
+}
+
+// expandIncludes substitutes `[prompt:foo.md]` / `[skill:foo.md]` references
+// in the rendered bootstrap message with the contents of the referenced
+// file fetched from GitHub. Non-matching text is left alone.
+//
+// Failures are logged and replaced with an HTML-comment marker so the
+// operator can spot them in the pane (or orch.log) without the entire
+// spawn aborting on a single bad reference.
+func expandIncludes(text, inboxRepo string) string {
+	return includePattern.ReplaceAllStringFunc(text, func(match string) string {
+		m := includePattern.FindStringSubmatch(match)
+		kind, ref := m[1], m[2]
+		content, err := fetchInclude(kind, ref, inboxRepo)
+		if err != nil {
+			log.Printf("include %s: %v", match, err)
+			return fmt.Sprintf("<!-- include failed: %s: %v -->", match, err)
+		}
+		return content
+	})
+}
+
 func renderBootstrap(tmpl string, is Issue, branch, targetName, targetRepo, inboxRepo, workdir, schedule string) string {
 	return strings.NewReplacer(
 		"{{issue.number}}", fmt.Sprint(is.Number),
@@ -957,6 +1026,7 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 		tmpl = cfg.CronBootstrapPrompt
 	}
 	msg := renderBootstrap(tmpl, is, branch, target.Name, target.Repo, cfg.GitHub.InboxRepo, workdir, schedule)
+	msg = expandIncludes(msg, cfg.GitHub.InboxRepo)
 	if err := tmuxPaste(*vm, session, msg); err != nil {
 		tmuxKill(*vm, session)
 		return fmt.Errorf("bootstrap paste: %w", err)
