@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -78,8 +79,9 @@ type Job struct {
 }
 
 type State struct {
-	mu   sync.Mutex
-	Jobs map[int]*Job `json:"jobs"`
+	mu       sync.Mutex
+	Jobs     map[int]*Job `json:"jobs"`
+	httpSnap atomic.Value // stores map[int]Job; refreshed at tick start, lock-free reads
 }
 
 // retry wraps an exec.Command-style call with bounded retries on non-zero
@@ -743,6 +745,12 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 func tick(cfg *Config, st *State) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	// Publish a lock-free snapshot for the HTTP handler before doing any I/O.
+	snap := make(map[int]Job, len(st.Jobs))
+	for n, j := range st.Jobs {
+		snap[n] = *j
+	}
+	st.httpSnap.Store(snap)
 	// Map issue number -> (Issue, Target). First target whose label matches wins.
 	type routed struct {
 		is     Issue
@@ -901,7 +909,7 @@ const indexTmpl = `<!DOCTYPE html>
   .pill.free { background: #eee; color: #666; }
   a { color: #0366d6; text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .term { font-weight: 600; }
+  .pane { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -913,19 +921,19 @@ const indexTmpl = `<!DOCTYPE html>
 </div>
 <table>
 <thead><tr>
-  <th>VM</th><th>Status</th><th>Issue</th><th>Repo</th><th>Bot</th><th>Session</th><th>PR</th><th>Terminal</th>
+  <th>VM</th><th>Status</th><th>Issue</th><th>Repo</th><th>Bot</th><th>Session</th><th>PR</th><th>Pane</th>
 </tr></thead>
 <tbody>
 {{range .Rows}}
 <tr class="{{if .Busy}}busy{{else}}free{{end}}">
   <td>{{.VM}}</td>
-  <td>{{if .Busy}}<span class="pill busy">busy</span>{{else}}<span class="pill free">free</span>{{end}}</td>
+  <td>{{if .Busy}}<span class="pill busy">busy</span>{{else}}<span class="pill free">free ({{.FreeSlots}} slots)</span>{{end}}</td>
   <td>{{if .Issue}}<a href="https://github.com/{{$.Inbox}}/issues/{{.Issue}}">#{{.Issue}}</a>{{end}}</td>
   <td>{{if .Repo}}<a href="https://github.com/{{.Repo}}">{{.Repo}}</a>{{end}}</td>
   <td>{{.Bot}}</td>
-  <td><code>{{.Session}}</code></td>
+  <td>{{if .Session}}<code>{{.Session}}</code>{{end}}</td>
   <td>{{if .PR}}<a href="https://github.com/{{.Repo}}/pull/{{.PR}}">#{{.PR}}</a>{{end}}</td>
-  <td>{{if .TermURL}}<a class="term" target="_blank" href="{{.TermURL}}">open ↗</a>{{else}}local{{end}}</td>
+  <td>{{if .Session}}<a class="pane" href="/pane?session={{.Session}}">pane ↗</a>{{end}}</td>
 </tr>
 {{end}}
 </tbody>
@@ -933,15 +941,34 @@ const indexTmpl = `<!DOCTYPE html>
 </body>
 </html>`
 
+const paneTmpl = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{{.Session}} — orchid pane</title>
+<meta http-equiv="refresh" content="3">
+<style>
+  body { background: #0d1117; color: #e6edf3; margin: 0; padding: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  h2 { font-size: 14px; color: #8b949e; margin: 0 0 12px; }
+  pre { white-space: pre-wrap; word-break: break-all; margin: 0; line-height: 1.5; }
+  .err { color: #f85149; }
+</style>
+</head>
+<body>
+<h2>{{.Session}} · auto-refresh 3s</h2>
+{{if .Err}}<pre class="err">{{.Err}}</pre>{{else}}<pre>{{.Content}}</pre>{{end}}
+</body>
+</html>`
+
 type uiRow struct {
-	VM      string
-	Busy    bool
-	Issue   int
-	Repo    string
-	Bot     string
-	Session string
-	PR      int
-	TermURL string
+	VM        string
+	Busy      bool
+	FreeSlots int
+	Issue     int
+	Repo      string
+	Bot       string
+	Session   string
+	PR        int
 }
 
 type uiData struct {
@@ -951,65 +978,125 @@ type uiData struct {
 	Updated string
 }
 
-// xtermURL builds the exe.dev xterm URL for a VM host. With a session name
-// we add ?cmd=tmux+attach+-t+SESSION so the xterm auto-attaches if exe.dev
-// honors the param; falls back to a plain shell if not.
-func xtermURL(host, session string) string {
-	parts := strings.SplitN(host, ".", 2)
-	if len(parts) != 2 {
-		return ""
-	}
-	u := fmt.Sprintf("https://%s.xterm.%s/", parts[0], parts[1])
-	if session != "" {
-		u += "?cmd=" + strings.ReplaceAll("tmux attach -t "+session, " ", "+")
-	}
-	return u
-}
-
 func httpHandler(cfg *Config, st *State) http.Handler {
-	t := template.Must(template.New("ix").Parse(indexTmpl))
+	idxT := template.Must(template.New("ix").Parse(indexTmpl))
+	paneT := template.Must(template.New("pane").Parse(paneTmpl))
 	bot := cfg.Orch.BotLogin
 	if bot == "" {
 		bot = "divybot"
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
-		st.mu.Lock()
-		used := map[string]int{}
-		jobs := map[int]Job{}
-		for n, j := range st.Jobs {
-			used[j.VM] = n
-			jobs[n] = *j
+		// read lock-free snapshot published by tick
+		type jobEntry struct {
+			issue int
+			job   Job
 		}
-		st.mu.Unlock()
+		var snap map[int]Job
+		if v := st.httpSnap.Load(); v != nil {
+			snap = v.(map[int]Job)
+		}
+		entries := make([]jobEntry, 0, len(snap))
+		load := map[string]int{}
+		for n, j := range snap {
+			entries = append(entries, jobEntry{n, j})
+			load[j.VM]++
+		}
 
-		rows := make([]uiRow, 0, len(cfg.VMs))
-		for _, vm := range cfg.VMs {
-			r := uiRow{VM: vm.Name, Bot: bot}
-			if n, ok := used[vm.Name]; ok {
-				j := jobs[n]
-				r.Busy = true
-				r.Issue = n
-				r.Repo = j.TargetRepo
-				r.Session = j.Tmux
-				r.PR = j.PR
-			}
-			r.TermURL = xtermURL(vm.Host, r.Session)
-			rows = append(rows, r)
+		// one row per active job, sorted by session name
+		sort.Slice(entries, func(a, b int) bool {
+			return entries[a].job.Tmux < entries[b].job.Tmux
+		})
+		rows := make([]uiRow, 0, len(entries)+len(cfg.VMs))
+		for _, e := range entries {
+			rows = append(rows, uiRow{
+				VM: e.job.VM, Busy: true,
+				Issue: e.issue, Repo: e.job.TargetRepo,
+				Bot: bot, Session: e.job.Tmux, PR: e.job.PR,
+			})
 		}
-		sort.Slice(rows, func(i, j int) bool { return rows[i].VM < rows[j].VM })
+		// one free row per VM that has remaining capacity
+		for _, vm := range cfg.VMs {
+			used := load[vm.Name]
+			free := vm.Capacity - used
+			if vm.Capacity == 0 {
+				free = 1 // unlimited, show as available
+			}
+			if free > 0 {
+				slots := vm.Capacity - used
+				if vm.Capacity == 0 {
+					slots = 0
+				}
+				rows = append(rows, uiRow{VM: vm.Name, Busy: false, Bot: bot, FreeSlots: slots})
+			}
+		}
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_ = t.Execute(w, uiData{
+		_ = idxT.Execute(w, uiData{
 			Inbox:   cfg.GitHub.InboxRepo,
 			Targets: cfg.Targets,
 			Rows:    rows,
 			Updated: time.Now().UTC().Format("15:04:05Z"),
 		})
 	})
+
+	mux.HandleFunc("/pane", func(w http.ResponseWriter, r *http.Request) {
+		session := r.URL.Query().Get("session")
+		// validate: only allow alphanum, dash, underscore
+		for _, c := range session {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+				http.Error(w, "invalid session name", http.StatusBadRequest)
+				return
+			}
+		}
+		if session == "" {
+			http.Error(w, "session required", http.StatusBadRequest)
+			return
+		}
+
+		// find VM via lock-free snapshot
+		var vmName string
+		if v := st.httpSnap.Load(); v != nil {
+			for _, j := range v.(map[int]Job) {
+				if j.Tmux == session {
+					vmName = j.VM
+					break
+				}
+			}
+		}
+
+		var content, errStr string
+		if vmName == "" {
+			errStr = "session not found in state"
+		} else {
+			vm := vmByName(cfg, vmName)
+			if vm == nil {
+				errStr = "VM not found: " + vmName
+			} else {
+				out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -S -100 2>&1", session))
+				if err != nil {
+					errStr = err.Error()
+				} else {
+					content = out
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = paneT.Execute(w, struct {
+			Session string
+			Content string
+			Err     string
+		}{session, content, errStr})
+	})
+
+	return mux
 }
 
 func main() {
