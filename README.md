@@ -10,78 +10,21 @@ Single Go binary. HCL config. No webhooks. Polls GitHub via `gh`, drives machine
 
 ```mermaid
 flowchart LR
-  Op([Operator])
-  Inbox[("Inbox repo<br/>(GitHub)")]
-  WorkA[("Work repo A<br/>(GitHub)")]
-  WorkB[("Work repo B<br/>(GitHub)")]
-
-  subgraph Host["Orchestrator host"]
-    Orch["orch daemon<br/>(this binary)"]
-    State[("state.json")]
-    Orch <--> State
-  end
-
-  subgraph VM1["VM 1"]
-    S1["claude session<br/>(tmux pane)"]
-  end
-  subgraph VM2["VM 2"]
-    S2["claude session<br/>(tmux pane)"]
-  end
-
-  Op -- "labels issue" --> Inbox
-  Orch -- "gh issue list (poll)" --> Inbox
-  Orch == "ssh + tmux<br/>(spawn / paste prompt / poke)" ==> S1
-  Orch == "ssh + tmux" ==> S2
-  S1 -- "git push, gh pr create" --> WorkA
-  S2 -- "git push, gh pr create" --> WorkB
-  Orch -- "gh pr view (poll)" --> WorkA
-  Orch -- "gh pr view (poll)" --> WorkB
-  Op -- "review / merge" --> WorkA
-  Op -- "review / merge" --> WorkB
+  Op([You]) --> Inbox[(Inbox repo)]
+  Inbox --> Orch[orch]
+  Orch -->|ssh + tmux| Claude[claude on a VM]
+  Claude --> Work[(Work repo)]
+  Op --> Work
+  Work --> Orch
 ```
 
-Everything is poll-driven on a single ticker (default 30s). No webhooks, no
-queue, no message broker. Each tick, orch lists open labeled issues in the
-inbox, spawns sessions for new ones on free VMs, and for in-flight jobs
-checks the PR (or, for cron lifecycle, fires the next scheduled tick).
+You label an issue in the inbox. orch polls, spawns a claude session on a
+free VM, and pastes a bootstrap prompt. Claude pushes commits and opens a
+PR in the work repo. You review there. orch keeps polling the PR and
+relays new reviews / CI back into the session until the PR merges, then
+tears the session down.
 
-A typical oneshot run:
-
-```mermaid
-sequenceDiagram
-  autonumber
-  actor Op as Operator
-  participant Inbox as Inbox repo
-  participant Orch as orch
-  participant VM as VM
-  participant Cl as claude (tmux pane)
-  participant Work as Work repo
-
-  Op->>Inbox: open issue (label: deno)
-  Note over Orch: tick (30s)
-  Orch->>Inbox: gh issue list --label deno
-  Orch->>VM: ssh + tmux new-session
-  VM-->>Cl: claude --dangerously-skip-permissions
-  Orch->>Cl: paste bootstrap prompt
-  Cl->>Work: git push branch + gh pr create
-  Note over Orch: tick
-  Orch->>Work: gh pr list --head <branch>
-  Orch-->>Orch: state.json: PR #N tracked
-  Op->>Work: review / comment
-  Note over Orch: tick
-  Orch->>Work: gh pr view (sees new review)
-  Orch->>Cl: paste review summary
-  Cl->>Work: address review, push fixes
-  Op->>Work: merge
-  Note over Orch: tick
-  Orch->>Work: gh pr view → MERGED
-  Orch->>VM: tmux kill-session
-  Orch-->>Orch: state.json: job removed
-```
-
-For cron-lifecycle jobs (see the cron section below if present) the
-spawn/teardown loop fires every `schedule` instead of running once and
-waiting for a PR.
+Everything is poll-driven on one ticker (default 30s). No webhooks.
 
 ---
 
