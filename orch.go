@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"html/template"
+	"io"
+	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -685,7 +689,7 @@ func tmuxKill(vm VMBlock, session string) {
 // once the TUI is up; "esc to interrupt" is appended only while claude is
 // working. False negatives just defer the poke by one tick — safe.
 func tmuxIdle(vm VMBlock, session string) (bool, error) {
-	out, _, err := sshExec(vm, fmt.Sprintf("tmux capture-pane -p -t %s | tail -8", session))
+	out, _, err := sshExec(vm, fmt.Sprintf("tmux capture-pane -p -t %s", session))
 	if err != nil {
 		return false, err
 	}
@@ -1454,98 +1458,43 @@ func tick(cfg *Config, st *State) {
 
 // --- HTTP UI ---
 
-const indexTmpl = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>orchid</title>
-<meta http-equiv="refresh" content="5">
-<style>
-  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 24px; color: #222; }
-  h1 { font-size: 16px; margin: 0 0 4px 0; }
-  .meta { color: #666; font-size: 12px; margin-bottom: 18px; }
-  table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th, td { padding: 8px 12px; border-bottom: 1px solid #e5e5e5; text-align: left; vertical-align: top; }
-  th { background: #f6f6f6; font-weight: 600; }
-  tr.busy td, tr.cron-firing td { background: #fafffa; }
-  tr.free td, tr.cron-idle td { color: #999; }
-  tr.cron-idle td.keep { color: #222; }
-  .pill { display: inline-block; padding: 1px 8px; border-radius: 8px; font-size: 11px; }
-  .pill.busy { background: #d4edda; color: #155724; }
-  .pill.free { background: #eee; color: #666; }
-  .pill.cron-firing { background: #e7d4f7; color: #4b1d6b; }
-  .pill.cron-idle { background: #f4ecfb; color: #6f4d8e; }
-  a { color: #0366d6; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  .pane { font-weight: 600; }
-</style>
-</head>
-<body>
-<h1>orchid swarm</h1>
-<div class="meta">
-  inbox: <a href="https://github.com/{{.Inbox}}/issues">{{.Inbox}}</a> ·
-  targets: {{range $i, $t := .Targets}}{{if $i}}, {{end}}<code>{{$t.Label}}</code>→<a href="https://github.com/{{$t.Repo}}">{{$t.Repo}}</a>{{end}} ·
-  refresh 5s · updated {{.Updated}}
-</div>
-<table>
-<thead><tr>
-  <th>VM</th><th>Status</th><th>Issue</th><th>Repo</th><th>Bot</th><th>Session</th><th>PR</th><th>Pane</th>
-</tr></thead>
-<tbody>
-{{range .Rows}}
-<tr class="{{.RowClass}}">
-  <td>{{.VM}}</td>
-  <td><span class="pill {{.RowClass}}">{{.StatusText}}</span></td>
-  <td class="keep">{{if .Issue}}<a href="https://github.com/{{$.Inbox}}/issues/{{.Issue}}">#{{.Issue}}</a>{{end}}</td>
-  <td class="keep">{{if .Repo}}<a href="https://github.com/{{.Repo}}">{{.Repo}}</a>{{end}}</td>
-  <td class="keep">{{.Bot}}</td>
-  <td>{{if .Session}}<code>{{.Session}}</code>{{else if .DetailRight}}<span style="color:#999">{{.DetailRight}}</span>{{end}}</td>
-  <td>{{if .PR}}<a href="https://github.com/{{.Repo}}/pull/{{.PR}}">#{{.PR}}</a>{{else if .Cron}}—{{end}}</td>
-  <td>{{if .Session}}<a class="pane" href="/pane?session={{.Session}}">pane ↗</a>{{end}}</td>
-</tr>
-{{end}}
-</tbody>
-</table>
-</body>
-</html>`
+//go:embed all:www/dist
+var wwwFS embed.FS
 
-const paneTmpl = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>{{.Session}} — orchid pane</title>
-<meta http-equiv="refresh" content="3">
-<style>
-  body { background: #0d1117; color: #e6edf3; margin: 0; padding: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
-  h2 { font-size: 14px; color: #8b949e; margin: 0 0 12px; }
-  pre { white-space: pre-wrap; word-break: break-all; margin: 0; line-height: 1.5; }
-  .err { color: #f85149; }
-</style>
-</head>
-<body>
-<h2>{{.Session}} · auto-refresh 3s</h2>
-{{if .Err}}<pre class="err">{{.Err}}</pre>{{else}}<pre>{{.Content}}</pre>{{end}}
-</body>
-</html>`
-
-type uiRow struct {
-	VM          string
-	RowClass    string // "busy" | "free" | "cron-firing" | "cron-idle"
-	StatusText  string // pill content
-	DetailRight string // right-cell hint when no Session (e.g. "next 14:36 UTC")
-	Cron        bool
-	Issue       int
-	Repo        string
-	Bot         string
-	Session     string
-	PR          int
+type apiJobEntry struct {
+	Issue int `json:"issue"`
+	Job
 }
 
-type uiData struct {
-	Inbox   string
-	Targets []TargetBlock
-	Rows    []uiRow
-	Updated string
+type apiVMEntry struct {
+	Name     string `json:"name"`
+	Host     string `json:"host"`
+	Capacity int    `json:"capacity"`
+	Used     int    `json:"used"`
+}
+
+type apiStateResp struct {
+	Jobs  []apiJobEntry `json:"jobs"`
+	VMs   []apiVMEntry  `json:"vms"`
+	Inbox string        `json:"inbox"`
+}
+
+func wsWriteFrame(w io.Writer, opcode byte, payload []byte) error {
+	n := len(payload)
+	hdr := make([]byte, 2, 10)
+	hdr[0] = 0x80 | opcode
+	switch {
+	case n <= 125:
+		hdr[1] = byte(n)
+	case n <= 65535:
+		hdr[1] = 126
+		hdr = append(hdr, byte(n>>8), byte(n))
+	default:
+		hdr[1] = 127
+		hdr = append(hdr, 0, 0, 0, 0, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+	}
+	_, err := w.Write(append(hdr, payload...))
+	return err
 }
 
 // describe renders a markdown block describing this orch instance: config
@@ -1659,17 +1608,6 @@ button:hover{background:#0860ca}
 }
 
 func httpHandler(cfg *Config, st *State) http.Handler {
-	idxT := template.Must(template.New("ix").Parse(indexTmpl))
-	paneT := template.Must(template.New("pane").Parse(paneTmpl))
-
-	botFor := func(vmName string) string {
-		if vm := vmByName(cfg, vmName); vm != nil {
-			login, _ := vmBotIdentity(cfg.Orch, *vm)
-			return login
-		}
-		return cfg.Orch.BotLogin
-	}
-
 	secret := cfg.Orch.HTTPSecret
 
 	const cookieName = "orchid_token"
@@ -1694,8 +1632,6 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				renderLogin(w, r.URL.RequestURI(), "")
 				return
 			}
-			// ?token= in URL: set cookie and redirect to clean URL so token
-			// doesn't leak into browser history or server logs.
 			if r.URL.Query().Get("token") != "" {
 				http.SetCookie(w, &http.Cookie{
 					Name: cookieName, Value: secret,
@@ -1736,135 +1672,126 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		})
 	}
 
-	mux.HandleFunc("/", auth(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		// read lock-free snapshot published by tick
-		type jobEntry struct {
-			issue int
-			job   Job
-		}
+	// /api/state — JSON snapshot of jobs + VMs
+	mux.HandleFunc("/api/state", auth(func(w http.ResponseWriter, r *http.Request) {
 		var snap map[int]Job
 		if v := st.httpSnap.Load(); v != nil {
 			snap = v.(map[int]Job)
 		}
-		entries := make([]jobEntry, 0, len(snap))
 		load := map[string]int{}
-		for n, j := range snap {
-			entries = append(entries, jobEntry{n, j})
+		jobs := make([]apiJobEntry, 0, len(snap))
+		for issue, j := range snap {
+			jobs = append(jobs, apiJobEntry{Issue: issue, Job: j})
 			load[j.VM]++
 		}
+		sort.Slice(jobs, func(a, b int) bool { return jobs[a].Tmux < jobs[b].Tmux })
 
-		// one row per active job, sorted by session name
-		sort.Slice(entries, func(a, b int) bool {
-			return entries[a].job.Tmux < entries[b].job.Tmux
-		})
-		rows := make([]uiRow, 0, len(entries)+len(cfg.VMs))
-		for _, e := range entries {
-			row := uiRow{
-				VM: e.job.VM, Issue: e.issue, Repo: e.job.TargetRepo,
-				Bot: botFor(e.job.VM), Session: e.job.Tmux, PR: e.job.PR,
-			}
-			if e.job.Lifecycle == "cron" {
-				row.Cron = true
-				if e.job.Tmux != "" {
-					row.RowClass = "cron-firing"
-					row.StatusText = "cron · firing"
-				} else {
-					row.RowClass = "cron-idle"
-					row.StatusText = "cron · " + e.job.Schedule
-					if !e.job.NextFireAt.IsZero() {
-						row.DetailRight = "next " + e.job.NextFireAt.UTC().Format("15:04:05Z")
-					}
-				}
-			} else {
-				row.RowClass = "busy"
-				row.StatusText = "busy"
-			}
-			rows = append(rows, row)
-		}
-		// one free row per VM that has remaining capacity
+		vms := make([]apiVMEntry, 0, len(cfg.VMs))
 		for _, vm := range cfg.VMs {
-			used := load[vm.Name]
-			free := vm.Capacity - used
-			if vm.Capacity == 0 {
-				free = 1 // unlimited, show as available
-			}
-			if free > 0 {
-				slots := vm.Capacity - used
-				if vm.Capacity == 0 {
-					slots = 0
-				}
-				txt := "free"
-				if vm.Capacity > 0 {
-					txt = fmt.Sprintf("free (%d slots)", slots)
-				}
-				rows = append(rows, uiRow{
-					VM: vm.Name, RowClass: "free", StatusText: txt,
-					Bot: botFor(vm.Name),
-				})
-			}
+			vms = append(vms, apiVMEntry{
+				Name:     vm.Name,
+				Host:     vm.Host,
+				Capacity: vm.Capacity,
+				Used:     load[vm.Name],
+			})
 		}
 
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_ = idxT.Execute(w, uiData{
-			Inbox:   cfg.GitHub.InboxRepo,
-			Targets: cfg.Targets,
-			Rows:    rows,
-			Updated: time.Now().UTC().Format("15:04:05Z"),
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(apiStateResp{
+			Jobs:  jobs,
+			VMs:   vms,
+			Inbox: cfg.GitHub.InboxRepo,
 		})
 	}))
 
-	mux.HandleFunc("/pane", auth(func(w http.ResponseWriter, r *http.Request) {
-		session := r.URL.Query().Get("session")
-		// validate: only allow alphanum, dash, underscore
+	// /ws?s=<session> — WebSocket streaming tmux pane output
+	mux.HandleFunc("/ws", auth(func(w http.ResponseWriter, r *http.Request) {
+		session := r.URL.Query().Get("s")
 		for _, c := range session {
 			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
-				http.Error(w, "invalid session name", http.StatusBadRequest)
+				http.Error(w, "invalid session", http.StatusBadRequest)
 				return
 			}
 		}
 		if session == "" {
-			http.Error(w, "session required", http.StatusBadRequest)
+			http.Error(w, "s required", http.StatusBadRequest)
 			return
 		}
 
-		// find VM via lock-free snapshot
-		var vmName string
+		var vm *VMBlock
 		if v := st.httpSnap.Load(); v != nil {
 			for _, j := range v.(map[int]Job) {
 				if j.Tmux == session {
-					vmName = j.VM
+					vm = vmByName(cfg, j.VM)
 					break
 				}
 			}
 		}
-
-		var content, errStr string
-		if vmName == "" {
-			errStr = "session not found in state"
-		} else {
-			vm := vmByName(cfg, vmName)
-			if vm == nil {
-				errStr = "VM not found: " + vmName
-			} else {
-				out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -S -100 2>&1", session))
-				if err != nil {
-					errStr = err.Error()
-				} else {
-					content = out
-				}
-			}
+		if vm == nil {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
 		}
 
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_ = paneT.Execute(w, struct {
-			Session string
-			Content string
-			Err     string
-		}{session, content, errStr})
+		key := r.Header.Get("Sec-Websocket-Key")
+		if key == "" {
+			http.Error(w, "not a websocket upgrade", http.StatusBadRequest)
+			return
+		}
+		sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+		accept := base64.StdEncoding.EncodeToString(sum[:])
+
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+			return
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = buf
+
+		resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		if _, err := conn.Write([]byte(resp)); err != nil {
+			return
+		}
+
+		ticker := time.NewTicker(300 * time.Millisecond)
+		defer ticker.Stop()
+		var last string
+		for range ticker.C {
+			out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -e -S -200 2>&1", session))
+			if err != nil {
+				break
+			}
+			if out == last {
+				continue
+			}
+			last = out
+			conn.(net.Conn).SetWriteDeadline(time.Now().Add(5 * time.Second)) //nolint
+			if err := wsWriteFrame(conn, 0x02, []byte(out)); err != nil {
+				break
+			}
+		}
+	}))
+
+	// SPA static files — all other routes serve www/dist with index.html fallback
+	spaFS, _ := fs.Sub(wwwFS, "www/dist")
+	fileServer := http.FileServerFS(spaFS)
+	mux.HandleFunc("/", auth(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path != "" {
+			if _, err := fs.Stat(spaFS, path); err == nil {
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+		}
+		http.ServeFileFS(w, r, spaFS, "index.html")
 	}))
 
 	return mux
