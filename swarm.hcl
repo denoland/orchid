@@ -88,7 +88,7 @@ EOT
 
 vm "local" {
   host        = "localhost"
-  capacity    = 3
+  capacity    = 6
   session_cmd  = "runuser -u orchid -- clawpatrol run -- claude --dangerously-skip-permissions"
   session_home = "/home/orchid"
 }
