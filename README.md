@@ -117,7 +117,7 @@ ssh -T git@github.com  # key must authorize the bot account
 tmux  git  jq  claude  clawpatrol (optional but recommended)
 ```
 
-For remote VMs, orchid provisions GitHub SSH auth automatically at startup by copying the orch host's key to `~/.ssh/id_ed25519` on the VM. For localhost VMs the key is assumed to be present.
+For remote VMs, orchid provisions GitHub SSH auth automatically at startup by copying the orch host's key to `~/.ssh/id_ed25519` on the VM — but only if that file doesn't already exist. Pre-provision the worker's `~/.ssh/id_ed25519` with a key registered for the right bot if the orch host's key isn't the one you want pushing as that VM's identity. For localhost VMs the key is assumed to be present.
 
 ---
 
