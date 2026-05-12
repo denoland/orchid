@@ -6,6 +6,28 @@ Single Go binary. HCL config. No webhooks. Polls GitHub via `gh`, drives machine
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart LR
+  Op([You]) --> Inbox[(Inbox repo)]
+  Inbox --> Orch[orch]
+  Orch -->|ssh + tmux| Claude[claude on a VM]
+  Claude --> Work[(Work repo)]
+  Op --> Work
+  Work --> Orch
+```
+
+You label an issue in the inbox. orch polls, spawns a claude session on a
+free VM, and pastes a bootstrap prompt. Claude pushes commits and opens a
+PR in the work repo. You review there. orch keeps polling the PR and
+relays new reviews / CI back into the session until the PR merges, then
+tears the session down.
+
+Everything is poll-driven on one ticker (default 30s). No webhooks.
+
+---
+
 ## Quick start
 
 ```sh
