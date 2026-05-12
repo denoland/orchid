@@ -14,9 +14,9 @@ Binary:   /root/orch/orch
 Config:   /root/orch/swarm.hcl
 State:    /root/orch/state.json
 Log:      /root/orch/orch.log
-Capacity: 6 concurrent sessions
-Dashboard: http://0.0.0.0:8000/
-Pane view: http://0.0.0.0:8000/pane?session=claude-N
+Capacity: 20 concurrent sessions
+Dashboard: http://0.0.0.0:8000/?token=4e27d68d952655686bcde0007cc725e7
+Pane view: http://0.0.0.0:8000/pane?session=claude-N&token=4e27d68d952655686bcde0007cc725e7
 ntfy:     REDACTED
 ```
 
