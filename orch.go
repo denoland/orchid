@@ -25,11 +25,12 @@ import (
 )
 
 type Config struct {
-	GitHub          GitHubBlock   `hcl:"github,block"`
-	Orch            OrchBlock     `hcl:"orchestrator,block"`
-	BootstrapPrompt string        `hcl:"bootstrap_prompt"`
-	Targets         []TargetBlock `hcl:"target,block"`
-	VMs             []VMBlock     `hcl:"vm,block"`
+	GitHub              GitHubBlock   `hcl:"github,block"`
+	Orch                OrchBlock     `hcl:"orchestrator,block"`
+	BootstrapPrompt     string        `hcl:"bootstrap_prompt"`
+	CronBootstrapPrompt string        `hcl:"cron_bootstrap_prompt,optional"` // template for cron-lifecycle issues; required if any inbox issue carries the `cron` label
+	Targets             []TargetBlock `hcl:"target,block"`
+	VMs                 []VMBlock     `hcl:"vm,block"`
 }
 
 type GitHubBlock struct {
@@ -69,12 +70,19 @@ type VMBlock struct {
 	BotEmail    string `hcl:"bot_email,optional"`    // overrides orchestrator.bot_email for sessions on this VM
 }
 
+// Job lifecycle: "oneshot" (default) — issue → session → PR → teardown.
+// "cron" — issue stays open, ephemeral session fires every Schedule, no PR.
 type Job struct {
 	VM                   string            `json:"vm"`
 	Tmux                 string            `json:"tmux"`
 	Target               string            `json:"target"`      // target block name
 	TargetRepo           string            `json:"target_repo"` // resolved (e.g. denoland/deno)
 	Branch               string            `json:"branch"`
+	Lifecycle            string            `json:"lifecycle,omitempty"`       // "oneshot" (default) or "cron"
+	Schedule             string            `json:"schedule,omitempty"`        // cron only: parseable by time.ParseDuration
+	Timeout              string            `json:"timeout,omitempty"`         // cron only: max runtime per tick before orch kills the pane
+	NextFireAt           time.Time         `json:"next_fire_at,omitempty"`    // cron only: when to spawn the next ephemeral tick
+	FireStartedAt        time.Time         `json:"fire_started_at,omitempty"` // cron only: when the current tick started (used to enforce Timeout)
 	PR                   int               `json:"pr,omitempty"`
 	SeenReviewIDs        []string          `json:"seen_review_ids,omitempty"`
 	SeenThreadCommentIDs []string          `json:"seen_thread_comment_ids,omitempty"`
@@ -199,24 +207,123 @@ func sshExecIn(vm VMBlock, stdin, remote string) (string, string, error) {
 }
 
 type Issue struct {
-	Number int    `json:"number"`
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	State  string `json:"state"`
+	Number int      `json:"number"`
+	Title  string   `json:"title"`
+	Body   string   `json:"body"`
+	State  string   `json:"state"`
+	Labels []string `json:"labels"`
 }
 
 func ghIssueList(repo, label string) ([]Issue, error) {
 	out, errStr, err := run("gh", "issue", "list",
 		"--repo", repo, "--label", label, "--state", "open",
-		"--limit", "200", "--json", "number,title,body,state")
+		"--limit", "200", "--json", "number,title,body,state,labels")
 	if err != nil {
 		return nil, fmt.Errorf("gh issue list: %v: %s", err, errStr)
 	}
-	var issues []Issue
-	if err := json.Unmarshal([]byte(out), &issues); err != nil {
+	// gh returns labels as [{name, ...}, ...]; flatten to []string.
+	var raw []struct {
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		Body   string `json:"body"`
+		State  string `json:"state"`
+		Labels []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
+	}
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
 		return nil, err
 	}
+	issues := make([]Issue, 0, len(raw))
+	for _, r := range raw {
+		is := Issue{Number: r.Number, Title: r.Title, Body: r.Body, State: r.State}
+		for _, l := range r.Labels {
+			is.Labels = append(is.Labels, l.Name)
+		}
+		issues = append(issues, is)
+	}
 	return issues, nil
+}
+
+// hasLabel returns true if the issue carries the given label name.
+func (is Issue) hasLabel(name string) bool {
+	for _, l := range is.Labels {
+		if l == name {
+			return true
+		}
+	}
+	return false
+}
+
+// CronConfig holds parsed cron parameters from an issue's toml frontmatter.
+type CronConfig struct {
+	Schedule    time.Duration
+	ScheduleStr string
+	// Timeout bounds a single tick — if the claude session is still alive
+	// after this much time, orch kills the pane. Defaults to Schedule/2
+	// when not explicitly set, so there's always slack before the next
+	// fire is due.
+	Timeout    time.Duration
+	TimeoutStr string
+}
+
+// parseCronFrontmatter extracts cron parameters from a fenced toml block
+// at the top of an issue body. Returns nil when no valid frontmatter is
+// present (no fence, no schedule key, or schedule unparseable).
+//
+// Recognized shape:
+//
+//	```toml
+//	schedule = "30m"
+//	timeout  = "5m"   # optional, default = schedule / 2
+//	... (other keys ignored)
+//	```
+//
+// Anything before the opening fence (e.g. blank lines) is allowed.
+func parseCronFrontmatter(body string) *CronConfig {
+	lines := strings.Split(body, "\n")
+	i := 0
+	for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
+		i++
+	}
+	if i >= len(lines) || strings.TrimSpace(lines[i]) != "```toml" {
+		return nil
+	}
+	i++
+	cfg := &CronConfig{}
+	for ; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "```" {
+			break
+		}
+		eq := strings.Index(line, "=")
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.Trim(strings.TrimSpace(line[eq+1:]), "\"'")
+		switch key {
+		case "schedule":
+			d, err := time.ParseDuration(val)
+			if err != nil {
+				return nil
+			}
+			cfg.Schedule, cfg.ScheduleStr = d, val
+		case "timeout":
+			d, err := time.ParseDuration(val)
+			if err == nil {
+				cfg.Timeout, cfg.TimeoutStr = d, val
+			}
+		}
+	}
+	if cfg.Schedule == 0 {
+		return nil
+	}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = cfg.Schedule / 2
+		cfg.TimeoutStr = cfg.Timeout.String()
+	}
+	return cfg
 }
 
 func ghIssueIsOpen(repo string, n int) (bool, error) {
@@ -632,7 +739,7 @@ func vmBotIdentity(orch OrchBlock, vm VMBlock) (login, email string) {
 	return
 }
 
-func renderBootstrap(tmpl string, is Issue, branch, targetName, targetRepo, inboxRepo, workdir string) string {
+func renderBootstrap(tmpl string, is Issue, branch, targetName, targetRepo, inboxRepo, workdir, schedule string) string {
 	return strings.NewReplacer(
 		"{{issue.number}}", fmt.Sprint(is.Number),
 		"{{issue.title}}", is.Title,
@@ -642,6 +749,7 @@ func renderBootstrap(tmpl string, is Issue, branch, targetName, targetRepo, inbo
 		"{{target.repo}}", targetRepo,
 		"{{inbox.repo}}", inboxRepo,
 		"{{workdir}}", workdir,
+		"{{schedule}}", schedule,
 	).Replace(tmpl)
 }
 
@@ -808,7 +916,10 @@ func summarize(v *PRView, nr, ntc, nic []string, pushed bool, checks []string) s
 	return b.String()
 }
 
-func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) error {
+// startSession does the workdir + tmux + bootstrap-paste dance for one
+// session. It does NOT touch State.Jobs — the caller decides whether this
+// is a fresh oneshot job or a recurring cron tick.
+func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecycle, schedule string) error {
 	session := sessionName(is.Number)
 	branch := cfg.Orch.BranchPrefix + fmt.Sprint(is.Number)
 	root := strings.TrimRight(cfg.Orch.WorkdirRoot, "/")
@@ -841,18 +952,34 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 		tmuxKill(*vm, session)
 		return fmt.Errorf("session never reached idle prompt within 60s (claude not authenticated?); pane tail:\n%s", strings.TrimSpace(pane))
 	}
-	msg := renderBootstrap(cfg.BootstrapPrompt, is, branch, target.Name, target.Repo, cfg.GitHub.InboxRepo, workdir)
+	tmpl := cfg.BootstrapPrompt
+	if lifecycle == "cron" {
+		tmpl = cfg.CronBootstrapPrompt
+	}
+	msg := renderBootstrap(tmpl, is, branch, target.Name, target.Repo, cfg.GitHub.InboxRepo, workdir, schedule)
 	if err := tmuxPaste(*vm, session, msg); err != nil {
 		tmuxKill(*vm, session)
 		return fmt.Errorf("bootstrap paste: %w", err)
 	}
+	return nil
+}
+
+// spawn registers a fresh oneshot Job and starts its session. Cron jobs use
+// fireCron instead, since their Job is created on first sighting and the
+// session is fired/refired on a schedule.
+func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) error {
+	if err := startSession(cfg, vm, is, target, "oneshot", ""); err != nil {
+		return err
+	}
+	branch := cfg.Orch.BranchPrefix + fmt.Sprint(is.Number)
 	st.Jobs[is.Number] = &Job{
-		VM: vm.Name, Tmux: session,
+		VM: vm.Name, Tmux: sessionName(is.Number),
 		Target: target.Name, TargetRepo: target.Repo,
-		Branch: branch, LastCheckConclusions: map[string]string{},
+		Branch: branch, Lifecycle: "oneshot",
+		LastCheckConclusions: map[string]string{},
 	}
 	log.Printf("issue #%d: spawned on %s/%s, target=%s (%s), branch=%s",
-		is.Number, vm.Name, session, target.Name, target.Repo, branch)
+		is.Number, vm.Name, sessionName(is.Number), target.Name, target.Repo, branch)
 	return nil
 }
 
@@ -912,6 +1039,96 @@ Resume your work — check what is implemented, address any CI failures or revie
 	return nil
 }
 
+// fireCron starts an ephemeral session for an existing cron Job. Caller
+// updates Job.NextFireAt on success. Job is assumed to already be in state.
+func fireCron(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock, schedule string) error {
+	if err := startSession(cfg, vm, is, target, "cron", schedule); err != nil {
+		return err
+	}
+	// Update the existing Job's VM/Tmux pointer (vm may have changed across
+	// fires if capacity shifts, though in MVP it shouldn't).
+	if j := st.Jobs[is.Number]; j != nil {
+		j.VM = vm.Name
+		j.Tmux = sessionName(is.Number)
+	}
+	log.Printf("issue #%d: cron tick fired on %s/%s (schedule=%s)",
+		is.Number, vm.Name, sessionName(is.Number), schedule)
+	return nil
+}
+
+// tickCron is the lifecycle for cron jobs. State machine per cron Job:
+//
+//   - tmux session alive, within Timeout budget → claude is mid-tick; do nothing.
+//   - tmux session alive, past Timeout → kill the pane (claude didn't /exit cleanly).
+//   - tmux dead, now < NextFireAt → still waiting for the next fire.
+//   - tmux dead, now >= NextFireAt → fire ephemeral session, update timestamps.
+//
+// Schedule and timeout are re-parsed from the live issue body each tick so
+// an operator can change either by editing the issue.
+func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBlock) {
+	cron := parseCronFrontmatter(is.Body)
+	if cron == nil {
+		log.Printf("issue #%d: cron schedule no longer parseable, skipping tick", n)
+		return
+	}
+	if cron.ScheduleStr != j.Schedule || cron.TimeoutStr != j.Timeout {
+		log.Printf("issue #%d: cron config changed (schedule %s → %s, timeout %s → %s)",
+			n, j.Schedule, cron.ScheduleStr, j.Timeout, cron.TimeoutStr)
+		j.Schedule = cron.ScheduleStr
+		j.Timeout = cron.TimeoutStr
+		_ = saveState(cfg.Orch.StateFile, st)
+	}
+	now := time.Now()
+	if j.Tmux != "" {
+		if vm := vmByName(cfg, j.VM); vm != nil {
+			alive, err := tmuxHasSession(*vm, j.Tmux)
+			if err != nil {
+				log.Printf("issue #%d: tmux check failed: %v", n, err)
+				return
+			}
+			if alive {
+				// Enforce per-tick timeout: claude often forgets to /exit
+				// and leaves the pane idle at the prompt. Kill once the
+				// budget is exhausted so the next fire can happen.
+				if !j.FireStartedAt.IsZero() && now.Sub(j.FireStartedAt) > cron.Timeout {
+					log.Printf("issue #%d: cron tick exceeded timeout %s, killing pane", n, cron.Timeout)
+					tmuxKill(*vm, j.Tmux)
+					j.Tmux = ""
+					j.VM = ""
+					j.FireStartedAt = time.Time{}
+					_ = saveState(cfg.Orch.StateFile, st)
+				}
+				return
+			}
+			// Session is gone — claude finished or exited. Clear the
+			// stale Tmux marker so the next fire-due check spawns fresh.
+			j.Tmux = ""
+			j.VM = ""
+			j.FireStartedAt = time.Time{}
+			_ = saveState(cfg.Orch.StateFile, st)
+		}
+	}
+	if now.Before(j.NextFireAt) {
+		return
+	}
+	vm := freeVM(cfg, st)
+	if vm == nil {
+		log.Printf("issue #%d: cron tick due but no free VM", n)
+		return
+	}
+	if err := fireCron(cfg, st, vm, is, target, cron.ScheduleStr); err != nil {
+		log.Printf("issue #%d: cron fire failed on %s: %v", n, vm.Name, err)
+		return
+	}
+	// Stamp timestamps with the post-fire wall clock — fireCron takes
+	// ~70s (tmux setup + idle wait), so the captured `now` from the top
+	// of this function is already stale and would make the very next
+	// tick believe the timeout was exceeded.
+	fireDoneAt := time.Now()
+	j.NextFireAt = fireDoneAt.Add(cron.Schedule)
+	j.FireStartedAt = fireDoneAt
+	_ = saveState(cfg.Orch.StateFile, st)
+}
 func tick(cfg *Config, st *State) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -945,6 +1162,33 @@ func tick(cfg *Config, st *State) {
 		if _, exists := st.Jobs[n]; exists {
 			continue
 		}
+		// Cron jobs: register the Job up front with NextFireAt=zero so the
+		// first fire happens on the next pass through the existing-jobs
+		// loop below. We don't need a free VM at registration time, only
+		// at fire time.
+		if r.is.hasLabel("cron") {
+			cron := parseCronFrontmatter(r.is.Body)
+			if cron == nil {
+				log.Printf("issue #%d: cron label present but no valid `schedule` in toml frontmatter, skipping", n)
+				continue
+			}
+			if cfg.CronBootstrapPrompt == "" {
+				log.Printf("issue #%d: cron label present but cron_bootstrap_prompt unset in config, skipping", n)
+				continue
+			}
+			st.Jobs[n] = &Job{
+				Target: r.target.Name, TargetRepo: r.target.Repo,
+				Branch:    cfg.Orch.BranchPrefix + fmt.Sprint(n),
+				Lifecycle: "cron",
+				Schedule:  cron.ScheduleStr,
+				Timeout:   cron.TimeoutStr,
+			}
+			log.Printf("issue #%d: registered cron job (target=%s, schedule=%s, timeout=%s)",
+				n, r.target.Name, cron.ScheduleStr, cron.TimeoutStr)
+			_ = saveState(cfg.Orch.StateFile, st)
+			continue
+		}
+		// Oneshot: spawn immediately.
 		vm := freeVM(cfg, st)
 		if vm == nil {
 			log.Printf("issue #%d: no free VM, skipping", n)
@@ -967,6 +1211,22 @@ func tick(cfg *Config, st *State) {
 				_ = saveState(cfg.Orch.StateFile, st)
 				continue
 			}
+		}
+		// Cron lifecycle: fire ephemeral sessions on schedule, no PR watch.
+		if j.Lifecycle == "cron" {
+			r, ok := open[n]
+			if !ok {
+				// Issue gone from inbox-list (closed, label removed). Earlier
+				// block above triggers tearDown when the issue is actually
+				// closed; if we get here the label was removed but the
+				// issue's still open — drop the Job either way.
+				log.Printf("issue #%d: cron job no longer in open list, dropping", n)
+				tearDown(cfg, st, n)
+				_ = saveState(cfg.Orch.StateFile, st)
+				continue
+			}
+			tickCron(cfg, st, n, j, r.is, r.target)
+			continue
 		}
 		vm := vmByName(cfg, j.VM)
 		if vm == nil {
@@ -1096,11 +1356,14 @@ const indexTmpl = `<!DOCTYPE html>
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { padding: 8px 12px; border-bottom: 1px solid #e5e5e5; text-align: left; vertical-align: top; }
   th { background: #f6f6f6; font-weight: 600; }
-  tr.busy td { background: #fafffa; }
-  tr.free td { color: #999; }
+  tr.busy td, tr.cron-firing td { background: #fafffa; }
+  tr.free td, tr.cron-idle td { color: #999; }
+  tr.cron-idle td.keep { color: #222; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 8px; font-size: 11px; }
   .pill.busy { background: #d4edda; color: #155724; }
   .pill.free { background: #eee; color: #666; }
+  .pill.cron-firing { background: #e7d4f7; color: #4b1d6b; }
+  .pill.cron-idle { background: #f4ecfb; color: #6f4d8e; }
   a { color: #0366d6; text-decoration: none; }
   a:hover { text-decoration: underline; }
   .pane { font-weight: 600; }
@@ -1119,14 +1382,14 @@ const indexTmpl = `<!DOCTYPE html>
 </tr></thead>
 <tbody>
 {{range .Rows}}
-<tr class="{{if .Busy}}busy{{else}}free{{end}}">
+<tr class="{{.RowClass}}">
   <td>{{.VM}}</td>
-  <td>{{if .Busy}}<span class="pill busy">busy</span>{{else}}<span class="pill free">free ({{.FreeSlots}} slots)</span>{{end}}</td>
-  <td>{{if .Issue}}<a href="https://github.com/{{$.Inbox}}/issues/{{.Issue}}">#{{.Issue}}</a>{{end}}</td>
-  <td>{{if .Repo}}<a href="https://github.com/{{.Repo}}">{{.Repo}}</a>{{end}}</td>
-  <td>{{.Bot}}</td>
-  <td>{{if .Session}}<code>{{.Session}}</code>{{end}}</td>
-  <td>{{if .PR}}<a href="https://github.com/{{.Repo}}/pull/{{.PR}}">#{{.PR}}</a>{{end}}</td>
+  <td><span class="pill {{.RowClass}}">{{.StatusText}}</span></td>
+  <td class="keep">{{if .Issue}}<a href="https://github.com/{{$.Inbox}}/issues/{{.Issue}}">#{{.Issue}}</a>{{end}}</td>
+  <td class="keep">{{if .Repo}}<a href="https://github.com/{{.Repo}}">{{.Repo}}</a>{{end}}</td>
+  <td class="keep">{{.Bot}}</td>
+  <td>{{if .Session}}<code>{{.Session}}</code>{{else if .DetailRight}}<span style="color:#999">{{.DetailRight}}</span>{{end}}</td>
+  <td>{{if .PR}}<a href="https://github.com/{{.Repo}}/pull/{{.PR}}">#{{.PR}}</a>{{else if .Cron}}—{{end}}</td>
   <td>{{if .Session}}<a class="pane" href="/pane?session={{.Session}}">pane ↗</a>{{end}}</td>
 </tr>
 {{end}}
@@ -1155,14 +1418,16 @@ const paneTmpl = `<!DOCTYPE html>
 </html>`
 
 type uiRow struct {
-	VM        string
-	Busy      bool
-	FreeSlots int
-	Issue     int
-	Repo      string
-	Bot       string
-	Session   string
-	PR        int
+	VM          string
+	RowClass    string // "busy" | "free" | "cron-firing" | "cron-idle"
+	StatusText  string // pill content
+	DetailRight string // right-cell hint when no Session (e.g. "next 14:36 UTC")
+	Cron        bool
+	Issue       int
+	Repo        string
+	Bot         string
+	Session     string
+	PR          int
 }
 
 type uiData struct {
@@ -1314,11 +1579,27 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		})
 		rows := make([]uiRow, 0, len(entries)+len(cfg.VMs))
 		for _, e := range entries {
-			rows = append(rows, uiRow{
-				VM: e.job.VM, Busy: true,
-				Issue: e.issue, Repo: e.job.TargetRepo,
+			row := uiRow{
+				VM: e.job.VM, Issue: e.issue, Repo: e.job.TargetRepo,
 				Bot: botFor(e.job.VM), Session: e.job.Tmux, PR: e.job.PR,
-			})
+			}
+			if e.job.Lifecycle == "cron" {
+				row.Cron = true
+				if e.job.Tmux != "" {
+					row.RowClass = "cron-firing"
+					row.StatusText = "cron · firing"
+				} else {
+					row.RowClass = "cron-idle"
+					row.StatusText = "cron · " + e.job.Schedule
+					if !e.job.NextFireAt.IsZero() {
+						row.DetailRight = "next " + e.job.NextFireAt.UTC().Format("15:04:05Z")
+					}
+				}
+			} else {
+				row.RowClass = "busy"
+				row.StatusText = "busy"
+			}
+			rows = append(rows, row)
 		}
 		// one free row per VM that has remaining capacity
 		for _, vm := range cfg.VMs {
@@ -1332,7 +1613,14 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				if vm.Capacity == 0 {
 					slots = 0
 				}
-				rows = append(rows, uiRow{VM: vm.Name, Busy: false, Bot: botFor(vm.Name), FreeSlots: slots})
+				txt := "free"
+				if vm.Capacity > 0 {
+					txt = fmt.Sprintf("free (%d slots)", slots)
+				}
+				rows = append(rows, uiRow{
+					VM: vm.Name, RowClass: "free", StatusText: txt,
+					Bot: botFor(vm.Name),
+				})
 			}
 		}
 

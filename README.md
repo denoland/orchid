@@ -150,8 +150,70 @@ For remote VMs, orchid provisions GitHub SSH auth automatically at startup by co
 | `{{target.repo}}` | Work repo (e.g. `denoland/deno`) |
 | `{{inbox.repo}}` | Inbox repo |
 | `{{workdir}}` | Absolute path to the per-issue worktree on the VM |
+| `{{schedule}}` | Cron schedule (cron lifecycle only; empty for oneshot) |
 
 Use `{{...}}` not `${...}` to avoid HCL variable interpolation.
+
+---
+
+## Cron lifecycle (recurring tasks)
+
+Inbox issues labeled `cron` run on a schedule instead of the one-shot
+"issue → PR → done" flow. Each fire spawns an ephemeral claude session that
+runs once and exits; orchid does not watch for PRs on cron jobs. The job
+stays registered until you close the inbox issue or remove the `cron` label.
+
+The schedule is declared in a fenced toml block at the top of the issue body:
+
+````md
+```toml
+schedule = "30m"
+```
+
+# What this cron does
+You are a maintainer of denoland/fresh. Each tick, do at most one of: ...
+````
+
+`schedule` accepts any Go duration string (`30s`, `15m`, `2h`). The remainder
+of the issue body is the standing instructions for the task; orchid passes
+the entire body through `{{issue.body}}` in the cron prompt.
+
+A cron job needs both labels: the **routing label** (e.g. `fresh` → tells
+orchid which `target` repo to clone and check out) and the **`cron` label**
+(switches the lifecycle).
+
+Define a separate prompt template in swarm.hcl — the oneshot template's
+"ship a PR" framing is wrong for cron:
+
+```hcl
+cron_bootstrap_prompt = <<EOT
+You are running a scheduled task triggered by orchid. This fires every
+{{schedule}}; previous ticks have already happened (check {{target.repo}}'s
+recent activity for context).
+
+Inbox issue: {{inbox.repo}}#{{issue.number}} ({{issue.title}})
+Work repo:   {{target.repo}}
+Working tree: {{workdir}}
+
+--- standing instructions ---
+{{issue.body}}
+--- end standing instructions ---
+
+Do at most one piece of meaningful work this tick. When done — even if you
+did nothing this tick — exit cleanly with /exit so orchid frees the slot
+until the next scheduled fire.
+EOT
+```
+
+Caveats:
+- No backfill. If orchid is down when a tick was due, the missed tick is
+  dropped; the next fire happens on the regular cadence after orch comes
+  back up.
+- One concurrent session per cron job. If a tick is still running when the
+  next fire is due, that fire is skipped.
+- The same workdir is reused across ticks. If your task makes code changes,
+  reset to `origin/main` at the start (the worktree may carry leftover state
+  from a previous tick).
 
 ---
 
