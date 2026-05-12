@@ -237,10 +237,18 @@ type PRSummary struct {
 	State  string `json:"state"`
 }
 
-func ghFindPRByBranch(repo, branch string) (*PRSummary, error) {
-	out, errStr, err := run("gh", "pr", "list",
+// ghFindPRByBranch looks up an existing PR for (repo, branch). If author is
+// non-empty, the search is restricted to PRs opened by that GitHub user —
+// without this filter, two orch instances sharing a branch_prefix can
+// spuriously match each other's PRs in the same target repo.
+func ghFindPRByBranch(repo, branch, author string) (*PRSummary, error) {
+	args := []string{"pr", "list",
 		"--repo", repo, "--head", branch, "--state", "all",
-		"--limit", "5", "--json", "number,state")
+		"--limit", "5", "--json", "number,state"}
+	if author != "" {
+		args = append(args, "--author", author)
+	}
+	out, errStr, err := run("gh", args...)
 	if err != nil {
 		return nil, fmt.Errorf("gh pr list: %v: %s", err, errStr)
 	}
@@ -458,10 +466,10 @@ func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, sessionCmd
 	if sessionCmd == "" {
 		sessionCmd = "clawpatrol run -- claude --dangerously-skip-permissions"
 	}
+	// SessionHome is only needed when the session runs as a different user
+	// from the orch process (e.g. via runuser). When unset, the bootstrap
+	// script just stamps $HOME and skips the second stamp.
 	sessionHome := vm.SessionHome
-	if sessionHome == "" {
-		sessionHome = "~"
-	}
 	script := fmt.Sprintf(`set -e
 SHARED=%q
 REPO=%q
@@ -503,12 +511,20 @@ if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ]; then
   chown -R "$SESSION_USER:$SESSION_USER" "$WORKDIR" "$SHARED" 2>/dev/null || true
 fi
 
-# 4) pre-stamp claude's per-folder trust flag so the TUI doesn't prompt
-for CHOME in ~ "$SESSION_HOME"; do
-  CJSON="$CHOME/.claude.json"
+# 4) pre-stamp claude's per-folder trust flag so the TUI doesn't prompt.
+# Stamp $HOME (the user running this script) and SESSION_HOME if it's set
+# to something different (i.e. session runs as another user via runuser).
+stamp_trust() {
+  local CHOME="$1"
+  [ -z "$CHOME" ] && return
+  local CJSON="$CHOME/.claude.json"
   [ -f "$CJSON" ] || echo '{}' > "$CJSON"
   jq --arg d "$WORKDIR" '.projects[$d].hasTrustDialogAccepted = true' "$CJSON" > "$CJSON.tmp" && mv "$CJSON.tmp" "$CJSON"
-done
+}
+stamp_trust "$HOME"
+if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ] && [ "$SESSION_HOME" != "$HOME" ]; then
+  stamp_trust "$SESSION_HOME"
+fi
 
 # 5) launch the pane
 tmux kill-session -t "$SESSION" 2>/dev/null || true
@@ -809,11 +825,21 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 	time.Sleep(3 * time.Second)
 	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
 	deadline := time.Now().Add(60 * time.Second)
+	sawIdle := false
 	for time.Now().Before(deadline) {
 		if idle, err := tmuxIdle(*vm, session); err == nil && idle {
+			sawIdle = true
 			break
 		}
 		time.Sleep(2 * time.Second)
+	}
+	// If claude never reaches its idle prompt, pasting the bootstrap message
+	// is useless — it lands on whatever screen is showing (login, trust
+	// dialog, error). Fail with the pane tail so the operator can diagnose.
+	if !sawIdle {
+		pane, _, _ := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s | tail -15", session))
+		tmuxKill(*vm, session)
+		return fmt.Errorf("session never reached idle prompt within 60s (claude not authenticated?); pane tail:\n%s", strings.TrimSpace(pane))
 	}
 	msg := renderBootstrap(cfg.BootstrapPrompt, is, branch, target.Name, target.Repo, cfg.GitHub.InboxRepo, workdir)
 	if err := tmuxPaste(*vm, session, msg); err != nil {
@@ -971,7 +997,8 @@ func tick(cfg *Config, st *State) {
 			continue
 		}
 		if j.PR == 0 {
-			pr, err := ghFindPRByBranch(j.TargetRepo, j.Branch)
+			botLogin, _ := vmBotIdentity(cfg.Orch, *vm)
+			pr, err := ghFindPRByBranch(j.TargetRepo, j.Branch, botLogin)
 			if err != nil {
 				log.Printf("issue #%d: find PR failed: %v", n, err)
 				continue
