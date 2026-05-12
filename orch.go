@@ -1587,6 +1587,36 @@ func describe(cfg *Config, st *State, hostname string) string {
 	return b.String()
 }
 
+func renderLogin(w http.ResponseWriter, next, errMsg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusUnauthorized)
+	fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset=utf-8>
+<title>orchid — sign in</title>
+<style>
+body{font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f6f8fa}
+form{background:#fff;border:1px solid #d0d7de;border-radius:6px;padding:24px 28px;min-width:300px}
+h2{margin:0 0 16px;font-size:15px}
+input[type=password]{width:100%%;box-sizing:border-box;padding:6px 10px;border:1px solid #d0d7de;border-radius:4px;font-family:monospace;font-size:13px;margin-bottom:10px}
+button{width:100%%;padding:7px;background:#0969da;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px}
+button:hover{background:#0860ca}
+.err{color:#cf222e;font-size:12px;margin-bottom:8px}
+</style></head><body>
+<form method=POST action=/login>
+<h2>orchid</h2>
+%s
+<input type=hidden name=next value=%q>
+<input type=password name=token placeholder="token" autofocus>
+<button type=submit>Sign in</button>
+</form></body></html>`,
+		func() string {
+			if errMsg != "" {
+				return `<div class="err">` + errMsg + `</div>`
+			}
+			return ""
+		}(),
+		next)
+}
+
 func httpHandler(cfg *Config, st *State) http.Handler {
 	idxT := template.Must(template.New("ix").Parse(indexTmpl))
 	paneT := template.Must(template.New("pane").Parse(paneTmpl))
@@ -1601,6 +1631,8 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 
 	secret := cfg.Orch.HTTPSecret
 
+	const cookieName = "orchid_token"
+
 	auth := func(next http.HandlerFunc) http.HandlerFunc {
 		if secret == "" {
 			return next
@@ -1612,8 +1644,26 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 					tok = h[7:]
 				}
 			}
+			if tok == "" {
+				if c, err := r.Cookie(cookieName); err == nil {
+					tok = c.Value
+				}
+			}
 			if tok != secret {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				renderLogin(w, r.URL.RequestURI(), "")
+				return
+			}
+			// ?token= in URL: set cookie and redirect to clean URL so token
+			// doesn't leak into browser history or server logs.
+			if r.URL.Query().Get("token") != "" {
+				http.SetCookie(w, &http.Cookie{
+					Name: cookieName, Value: secret,
+					Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
+				})
+				q := r.URL.Query()
+				q.Del("token")
+				r.URL.RawQuery = q.Encode()
+				http.Redirect(w, r, r.URL.RequestURI(), http.StatusSeeOther)
 				return
 			}
 			next(w, r)
@@ -1621,6 +1671,29 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 	}
 
 	mux := http.NewServeMux()
+
+	if secret != "" {
+		mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				renderLogin(w, "/", "")
+				return
+			}
+			_ = r.ParseForm()
+			if r.FormValue("token") == secret {
+				http.SetCookie(w, &http.Cookie{
+					Name: cookieName, Value: secret,
+					Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
+				})
+				dest := r.FormValue("next")
+				if dest == "" {
+					dest = "/"
+				}
+				http.Redirect(w, r, dest, http.StatusSeeOther)
+			} else {
+				renderLogin(w, r.FormValue("next"), "invalid token")
+			}
+		})
+	}
 
 	mux.HandleFunc("/", auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
