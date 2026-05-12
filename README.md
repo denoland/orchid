@@ -37,7 +37,8 @@ orchestrator {
   branch_prefix = "orch/issue-"
   workdir_root  = "/home/orch/work"
   http_addr     = ":8000"        # status dashboard
-  bot_login     = "mybot"
+  bot_login     = "mybot"        # default git user.name for commits
+  bot_email     = "mybot@users.noreply.github.com" # default; falls back to <bot_login>@users.noreply.github.com
   ntfy_topic    = "mybot-abc123" # ntfy.sh push notifications (optional)
 }
 
@@ -110,6 +111,8 @@ For remote VMs, orchid provisions GitHub SSH auth automatically at startup by co
 | `sccache_dir` | `~/.cache/sccache` | Cache directory. |
 | `session_cmd` | `clawpatrol run -- claude --dangerously-skip-permissions` | Command run inside the tmux pane. |
 | `session_home` | `~` | Home dir of the session user (used to stamp claude's trust file). |
+| `bot_login` | `orchestrator.bot_login` | Overrides the orchestrator-level git `user.name` for commits made on this VM. Use to give each VM a distinct bot identity. |
+| `bot_email` | `orchestrator.bot_email`, else `<bot_login>@users.noreply.github.com` | Overrides the orchestrator-level git `user.email` for commits made on this VM. |
 
 ---
 

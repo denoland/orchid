@@ -48,20 +48,23 @@ type OrchBlock struct {
 	BranchPrefix string `hcl:"branch_prefix"`
 	WorkdirRoot  string `hcl:"workdir_root"`
 	HTTPAddr     string `hcl:"http_addr,optional"`
-	BotLogin     string `hcl:"bot_login,optional"`
+	BotLogin     string `hcl:"bot_login,optional"` // default git user.name; per-VM override available
+	BotEmail     string `hcl:"bot_email,optional"` // default git user.email; falls back to <bot_login>@users.noreply.github.com
 	NtfyTopic    string `hcl:"ntfy_topic,optional"`
 }
 
 type VMBlock struct {
-	Name       string `hcl:",label"`
-	Host       string `hcl:"host"`
-	User       string `hcl:"user,optional"`
-	Key        string `hcl:"key,optional"`         // not needed for localhost
-	Capacity   int    `hcl:"capacity,optional"`    // 0 = unlimited
-	Sccache    bool   `hcl:"sccache,optional"`
-	SccacheDir string `hcl:"sccache_dir,optional"` // default ~/.cache/sccache
+	Name        string `hcl:",label"`
+	Host        string `hcl:"host"`
+	User        string `hcl:"user,optional"`
+	Key         string `hcl:"key,optional"`      // not needed for localhost
+	Capacity    int    `hcl:"capacity,optional"` // 0 = unlimited
+	Sccache     bool   `hcl:"sccache,optional"`
+	SccacheDir  string `hcl:"sccache_dir,optional"`  // default ~/.cache/sccache
 	SessionCmd  string `hcl:"session_cmd,optional"`  // default: clawpatrol run -- claude --dangerously-skip-permissions
 	SessionHome string `hcl:"session_home,optional"` // home dir of user running the session (for trust stamp)
+	BotLogin    string `hcl:"bot_login,optional"`    // overrides orchestrator.bot_login for sessions on this VM
+	BotEmail    string `hcl:"bot_email,optional"`    // overrides orchestrator.bot_email for sessions on this VM
 }
 
 type Job struct {
@@ -395,7 +398,7 @@ fi
 // Worktrees share .git/objects with the shared clone, so adding one is fast
 // and disk-cheap — no full reclone per issue. Whole setup runs as one bash
 // script piped over ssh stdin to dodge nested quoting.
-func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch string) error {
+func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, botLogin, botEmail string) error {
 	sessionCmd := vm.SessionCmd
 	if sessionCmd == "" {
 		sessionCmd = "clawpatrol run -- claude --dangerously-skip-permissions"
@@ -412,6 +415,8 @@ BRANCH=%q
 SESSION=%q
 SESSION_CMD=%q
 SESSION_HOME=%q
+BOT_LOGIN=%q
+BOT_EMAIL=%q
 
 # 1) shared clone (once per repo per VM); always fetch fresh refs
 if [ ! -d "$SHARED/.git" ]; then
@@ -434,12 +439,12 @@ if [ ! -e "$WORKDIR/.git" ]; then
 fi
 
 # 3) bot identity (worktrees inherit from shared clone, but pin locally)
-git -C "$WORKDIR" config user.name divybot
-git -C "$WORKDIR" config user.email divybot@users.noreply.github.com
+git -C "$WORKDIR" config user.name "$BOT_LOGIN"
+git -C "$WORKDIR" config user.email "$BOT_EMAIL"
 
 # 3b) if session runs as a different user, chown worktree + shared clone to them
 if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ]; then
-  SESSION_USER=$(stat -c '%U' "$SESSION_HOME")
+  SESSION_USER=$(stat -c '%%U' "$SESSION_HOME")
   chown -R "$SESSION_USER:$SESSION_USER" "$WORKDIR" "$SHARED" 2>/dev/null || true
 fi
 
@@ -453,7 +458,7 @@ done
 # 5) launch the pane
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -c "$WORKDIR" -s "$SESSION" "$SESSION_CMD"
-`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome)
+`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome, botLogin, botEmail)
 
 	_, errStr, err := sshExecIn(vm, script, "bash -s")
 	if err != nil {
@@ -536,6 +541,24 @@ func vmByName(cfg *Config, name string) *VMBlock {
 		}
 	}
 	return nil
+}
+
+// vmBotIdentity resolves the git user.name / user.email used for commits in
+// sessions on this VM. Per-VM bot_login/bot_email override the orchestrator
+// defaults; bot_email falls back to <bot_login>@users.noreply.github.com.
+func vmBotIdentity(orch OrchBlock, vm VMBlock) (login, email string) {
+	login = vm.BotLogin
+	if login == "" {
+		login = orch.BotLogin
+	}
+	email = vm.BotEmail
+	if email == "" {
+		email = orch.BotEmail
+	}
+	if email == "" && login != "" {
+		email = login + "@users.noreply.github.com"
+	}
+	return
 }
 
 func renderBootstrap(tmpl string, is Issue, branch, targetName, targetRepo, inboxRepo, workdir string) string {
@@ -720,7 +743,8 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 	root := strings.TrimRight(cfg.Orch.WorkdirRoot, "/")
 	workdir := fmt.Sprintf("%s/issue-%d", root, is.Number)
 	sharedDir := fmt.Sprintf("%s/repos/%s", root, strings.ReplaceAll(target.Repo, "/", "-"))
-	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch); err != nil {
+	botLogin, botEmail := vmBotIdentity(cfg.Orch, *vm)
+	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, botLogin, botEmail); err != nil {
 		return err
 	}
 	// Defensive: dismiss claude's per-folder trust dialog if it appears.
@@ -990,9 +1014,13 @@ type uiData struct {
 func httpHandler(cfg *Config, st *State) http.Handler {
 	idxT := template.Must(template.New("ix").Parse(indexTmpl))
 	paneT := template.Must(template.New("pane").Parse(paneTmpl))
-	bot := cfg.Orch.BotLogin
-	if bot == "" {
-		bot = "divybot"
+
+	botFor := func(vmName string) string {
+		if vm := vmByName(cfg, vmName); vm != nil {
+			login, _ := vmBotIdentity(cfg.Orch, *vm)
+			return login
+		}
+		return cfg.Orch.BotLogin
 	}
 
 	mux := http.NewServeMux()
@@ -1027,7 +1055,7 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			rows = append(rows, uiRow{
 				VM: e.job.VM, Busy: true,
 				Issue: e.issue, Repo: e.job.TargetRepo,
-				Bot: bot, Session: e.job.Tmux, PR: e.job.PR,
+				Bot: botFor(e.job.VM), Session: e.job.Tmux, PR: e.job.PR,
 			})
 		}
 		// one free row per VM that has remaining capacity
@@ -1042,7 +1070,7 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				if vm.Capacity == 0 {
 					slots = 0
 				}
-				rows = append(rows, uiRow{VM: vm.Name, Busy: false, Bot: bot, FreeSlots: slots})
+				rows = append(rows, uiRow{VM: vm.Name, Busy: false, Bot: botFor(vm.Name), FreeSlots: slots})
 			}
 		}
 
@@ -1119,6 +1147,11 @@ func main() {
 	interval, err := time.ParseDuration(cfg.Orch.PollInterval)
 	if err != nil {
 		log.Fatalf("poll_interval: %v", err)
+	}
+	for _, vm := range cfg.VMs {
+		if login, _ := vmBotIdentity(cfg.Orch, vm); login == "" {
+			log.Fatalf("vm %q: bot_login not set; configure orchestrator.bot_login or vm.%s.bot_login", vm.Name, vm.Name)
+		}
 	}
 	st, err := loadState(cfg.Orch.StateFile)
 	if err != nil {

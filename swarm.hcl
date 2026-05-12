@@ -10,6 +10,7 @@ orchestrator {
   workdir_root  = "/home/orchid/orch-work"
   http_addr     = ":8000"
   bot_login     = "divybot"
+  bot_email     = "divybot@users.noreply.github.com"
   ntfy_topic    = "orchid-divy-7f3k9"
 }
 
@@ -88,6 +89,9 @@ EOT
 #   host = "divybot1.exe.xyz"
 #   user = "exedev"
 #   key  = "~/.ssh/id_ed25519"
+#   # Per-VM identity override; falls back to orchestrator.bot_login/bot_email if unset.
+#   # bot_login = "divybot1"
+#   # bot_email = "divybot1@users.noreply.github.com"
 # }
 
 # vm "divybot2" {
