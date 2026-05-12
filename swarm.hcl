@@ -114,7 +114,7 @@ EOT
 
 vm "local" {
   host        = "localhost"
-  capacity    = 6
-  session_cmd  = "runuser -u orchid -- clawpatrol run -- claude --dangerously-skip-permissions"
+  capacity    = 20
+  session_cmd  = "runuser -u orchid -- env GIT_AUTHOR_NAME=divybot GIT_AUTHOR_EMAIL=divybot@users.noreply.github.com GIT_COMMITTER_NAME=divybot GIT_COMMITTER_EMAIL=divybot@users.noreply.github.com clawpatrol run -- claude --dangerously-skip-permissions"
   session_home = "/home/orchid"
 }

@@ -30,20 +30,24 @@ ssh root@65.20.66.139 "tmux capture-pane -p -t claude-N -S -50"
 
 ## Restart orchid
 
+Orchid runs as a **systemd service** (`orchid.service`). Use systemctl — never `pkill`.
+
+> **WARNING:** `pkill -f '/root/orch/orch'` matches the tmux server process (its cmdline contains the orch path) and kills ALL worker sessions. Always use systemctl.
+
 ```bash
-GH_TOKEN=$(gh auth token)
-ssh root@65.20.66.139 "pkill -f '/root/orch/orch' || true"
-# scp new binary if needed (binary must be stopped before overwriting)
-ssh root@65.20.66.139 "tmux kill-session -t orchid 2>/dev/null; tmux new-session -d -c /root/orch -s orchid \"bash -c 'GH_TOKEN=$GH_TOKEN /root/orch/orch -config /root/orch/swarm.hcl >> /root/orch/orch.log 2>&1'\""
+ssh root@65.20.66.139 "systemctl restart orchid"
+ssh root@65.20.66.139 "systemctl status orchid"
 ```
+
+GH_TOKEN is stored in `/root/orch/env` (read by the unit's `EnvironmentFile=`).
 
 ## Deploy new binary
 
 ```bash
-ssh root@65.20.66.139 "pkill -f '/root/orch/orch' || true"
+ssh root@65.20.66.139 "systemctl stop orchid"
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o orch-linux .
 scp orch-linux root@65.20.66.139:/root/orch/orch && rm orch-linux
-# then restart
+ssh root@65.20.66.139 "systemctl start orchid && systemctl status orchid"
 ```
 
 ## Open work for workers

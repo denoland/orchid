@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -258,6 +259,56 @@ func ghFindPRByBranch(repo, branch string) (*PRSummary, error) {
 	return &prs[0], nil
 }
 
+// ghBranchAhead returns true if branch exists on remote and has at least one
+// commit ahead of the base branch (main). Returns false (not error) if the
+// branch doesn't exist yet.
+func ghBranchAhead(repo, branch string) (bool, error) {
+	out, errStr, err := run("gh", "api",
+		fmt.Sprintf("repos/%s/compare/main...%s", repo, branch),
+		"--jq", ".ahead_by")
+	if err != nil {
+		if strings.Contains(errStr, "No commit found") || strings.Contains(errStr, "Not Found") {
+			return false, nil
+		}
+		return false, fmt.Errorf("gh api compare: %v: %s", err, errStr)
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(out))
+	return n > 0, nil
+}
+
+// ghAutoCreatePR checks if the job's branch has been pushed with commits, and
+// if so creates a PR from the orchestrator (bypassing the clawpatrol MITM proxy
+// which blocks api.github.com credential injection for worker sessions).
+// Returns the new PR number, or 0 if the branch has no commits yet.
+func ghAutoCreatePR(cfg *Config, n int, j *Job, is Issue) (int, error) {
+	ahead, err := ghBranchAhead(j.TargetRepo, j.Branch)
+	if err != nil {
+		return 0, err
+	}
+	if !ahead {
+		return 0, nil
+	}
+	body := fmt.Sprintf("Closes %s#%d", cfg.GitHub.InboxRepo, n)
+	out, errStr, err := run("gh", "pr", "create",
+		"--repo", j.TargetRepo,
+		"--head", j.Branch,
+		"--base", "main",
+		"--title", is.Title,
+		"--body", body)
+	if err != nil {
+		return 0, fmt.Errorf("gh pr create: %v: %s", err, errStr)
+	}
+	// Output is the PR URL: https://github.com/owner/repo/pull/123
+	u := strings.TrimSpace(out)
+	parts := strings.Split(u, "/")
+	num, err := strconv.Atoi(parts[len(parts)-1])
+	if err != nil {
+		return 0, fmt.Errorf("parse PR number from %q: %w", u, err)
+	}
+	log.Printf("issue #%d: auto-created PR #%d (%s)", n, num, u)
+	return num, nil
+}
+
 type PRView struct {
 	State      string `json:"state"`
 	HeadRefOid string `json:"headRefOid"`
@@ -399,8 +450,11 @@ fi
 // Worktrees share .git/objects with the shared clone, so adding one is fast
 // and disk-cheap — no full reclone per issue. Whole setup runs as one bash
 // script piped over ssh stdin to dodge nested quoting.
-func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, botLogin, botEmail string) error {
-	sessionCmd := vm.SessionCmd
+func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, sessionCmdOverride, botLogin, botEmail string) error {
+	sessionCmd := sessionCmdOverride
+	if sessionCmd == "" {
+		sessionCmd = vm.SessionCmd
+	}
 	if sessionCmd == "" {
 		sessionCmd = "clawpatrol run -- claude --dangerously-skip-permissions"
 	}
@@ -745,7 +799,7 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 	workdir := fmt.Sprintf("%s/issue-%d", root, is.Number)
 	sharedDir := fmt.Sprintf("%s/repos/%s", root, strings.ReplaceAll(target.Repo, "/", "-"))
 	botLogin, botEmail := vmBotIdentity(cfg.Orch, *vm)
-	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, botLogin, botEmail); err != nil {
+	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, "", botLogin, botEmail); err != nil {
 		return err
 	}
 	// Defensive: dismiss claude's per-folder trust dialog if it appears.
@@ -773,6 +827,62 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 	}
 	log.Printf("issue #%d: spawned on %s/%s, target=%s (%s), branch=%s",
 		is.Number, vm.Name, session, target.Name, target.Repo, branch)
+	return nil
+}
+
+// spawnResume restarts a dead session that had an open PR, using --resume so
+// claude recovers its conversation context, then pastes a short situation report.
+func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
+	session := sessionName(n)
+	root := strings.TrimRight(cfg.Orch.WorkdirRoot, "/")
+	workdir := fmt.Sprintf("%s/issue-%d", root, n)
+	sharedDir := fmt.Sprintf("%s/repos/%s", root, strings.ReplaceAll(j.TargetRepo, "/", "-"))
+
+	base := vm.SessionCmd
+	if base == "" {
+		base = "clawpatrol run -- claude --dangerously-skip-permissions"
+	}
+	resumeCmd := strings.Replace(base,
+		"claude --dangerously-skip-permissions",
+		"claude --dangerously-skip-permissions --resume", 1)
+
+	botLogin, botEmail := vmBotIdentity(cfg.Orch, *vm)
+	if err := tmuxStart(*vm, session, workdir, sharedDir, j.TargetRepo, j.Branch, resumeCmd, botLogin, botEmail); err != nil {
+		return err
+	}
+	time.Sleep(3 * time.Second)
+	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if idle, err := tmuxIdle(*vm, session); err == nil && idle {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
+	ci := ""
+	for name, status := range j.LastCheckConclusions {
+		ci += fmt.Sprintf("  %s: %s\n", name, status)
+	}
+	if ci == "" {
+		ci = "  (no CI results yet)\n"
+	}
+	msg := fmt.Sprintf(`Your session was interrupted and has been restarted.
+
+PR: #%d (%s)
+Branch: %s
+Last known CI:
+%s
+Resume your work — check what is implemented, address any CI failures or review comments, push fixes if needed. If everything is already addressed and CI is green, stop and wait for the next review.`,
+		j.PR, prURL, j.Branch, ci)
+
+	if err := tmuxPaste(*vm, session, msg); err != nil {
+		tmuxKill(*vm, session)
+		return fmt.Errorf("resume paste: %w", err)
+	}
+	j.Tmux = session
+	log.Printf("issue #%d: resumed on %s/%s, PR #%d", n, vm.Name, session, j.PR)
 	return nil
 }
 
@@ -845,8 +955,18 @@ func tick(cfg *Config, st *State) {
 			continue
 		}
 		if !alive {
-			log.Printf("issue #%d: tmux session %q gone, tearing down", n, j.Tmux)
-			tearDown(cfg, st, n)
+			if j.PR > 0 {
+				// Session died with an open PR — respawn using --resume so
+				// claude recovers its conversation context.
+				log.Printf("issue #%d: tmux session %q gone, respawning with --resume (PR #%d)", n, j.Tmux, j.PR)
+				if err := spawnResume(cfg, st, vm, n, j); err != nil {
+					log.Printf("issue #%d: resume failed, tearing down: %v", n, err)
+					tearDown(cfg, st, n)
+				}
+			} else {
+				log.Printf("issue #%d: tmux session %q gone, tearing down", n, j.Tmux)
+				tearDown(cfg, st, n)
+			}
 			_ = saveState(cfg.Orch.StateFile, st)
 			continue
 		}
@@ -857,7 +977,20 @@ func tick(cfg *Config, st *State) {
 				continue
 			}
 			if pr == nil {
-				continue
+				// Workers can't open PRs through the clawpatrol MITM proxy
+				// (gateway doesn't inject GitHub credentials for api.github.com).
+				// Auto-create from the orchestrator once the branch has commits.
+				if r, ok := open[n]; ok {
+					prNum, err := ghAutoCreatePR(cfg, n, j, r.is)
+					if err != nil {
+						log.Printf("issue #%d: auto-create PR: %v", n, err)
+					} else if prNum > 0 {
+						pr = &PRSummary{Number: prNum, State: "OPEN"}
+					}
+				}
+				if pr == nil {
+					continue
+				}
 			}
 			j.PR = pr.Number
 			log.Printf("issue #%d: found PR #%d in %s", n, j.PR, j.TargetRepo)
