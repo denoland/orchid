@@ -578,7 +578,16 @@ func saveState(path string, s *State) error {
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// refresh HTTP snapshot after every state write (caller holds s.mu)
+	snap := make(map[int]Job, len(s.Jobs))
+	for n, j := range s.Jobs {
+		snap[n] = *j
+	}
+	s.httpSnap.Store(snap)
+	return nil
 }
 
 func tearDown(cfg *Config, st *State, issue int) {
