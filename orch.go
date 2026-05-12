@@ -530,13 +530,20 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | head 
 		if rerr != nil {
 			return fmt.Errorf("read %s.pub: %w", keyPath, rerr)
 		}
+		// Idempotent: only install ~/.ssh/id_ed25519 if it isn't already
+		// present. A pre-existing key on the worker (e.g. when one orch
+		// drives multiple worker VMs that each have their own bot
+		// identity registered with GitHub) is left alone — overwriting
+		// it would break that VM's `git push`.
 		remoteScript := fmt.Sprintf(`set -e
 umask 077
 mkdir -m 700 -p ~/.ssh
-echo %s | base64 -d > ~/.ssh/id_ed25519
-chmod 600 ~/.ssh/id_ed25519
-echo %s | base64 -d > ~/.ssh/id_ed25519.pub
-chmod 644 ~/.ssh/id_ed25519.pub
+if [ ! -e ~/.ssh/id_ed25519 ]; then
+  echo %s | base64 -d > ~/.ssh/id_ed25519
+  chmod 600 ~/.ssh/id_ed25519
+  echo %s | base64 -d > ~/.ssh/id_ed25519.pub
+  chmod 644 ~/.ssh/id_ed25519.pub
+fi
 touch ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
 if ! grep -q '^github.com ' ~/.ssh/known_hosts 2>/dev/null; then
   ssh-keyscan -t ed25519,rsa github.com 2>/dev/null >> ~/.ssh/known_hosts
