@@ -32,28 +32,50 @@ target "clawpatrol" {
 
 # Placeholders use {{...}} (not ${...}) to avoid HCL interpolation.
 bootstrap_prompt = <<EOT
-You are shepherding GitHub issue #{{issue.number}} from the inbox repo
-{{inbox.repo}}: "{{issue.title}}"
+You are implementing GitHub issue #{{issue.number}} from {{inbox.repo}}: "{{issue.title}}"
 
-The work repo for this issue is {{target.repo}}. You are running inside a
-fresh clone of {{target.repo}} at {{workdir}}, with the git remote `origin`
-pointing at it (SSH auth is already configured).
+Work repo: {{target.repo}}
+Clone: {{workdir}}
+Branch: {{branch}}
+Git remote `origin` is already authenticated via SSH.
 
 --- issue body ---
 {{issue.body}}
 --- end issue body ---
 
-Plan, implement, commit, and push to branch `{{branch}}` on origin. Open a PR
-against {{target.repo}} that closes the issue (use `gh pr create --repo
-{{target.repo}}` and reference the inbox issue with a link, e.g. "Closes
-{{inbox.repo}}#{{issue.number}}" — note GitHub doesn't auto-close cross-repo,
-that's fine, the orchestrator handles teardown).
+## Your job
 
-Then stop and wait — the orchestrator will send a follow-up message each time
-there is a new review, comment, CI status change, or push to your PR.
+Implement this fully. Read the codebase, understand it deeply, make the change.
+Large refactors are expected — do not avoid them. If the right fix touches 10
+files, touch 10 files. If it requires redesigning a data structure, redesign it.
 
-When you receive a follow-up, address it (push fixes if needed) and stop again.
-The session ends automatically when the PR is merged or closed.
+Do NOT stop early. Do NOT mark anything done without shipping a PR. The only
+acceptable outcome is a merged PR or an open PR awaiting review.
+
+If something is hard, work through it. Read more code, try a different approach,
+break the problem into smaller pieces — but keep going. Giving up and exiting
+without a PR wastes the entire session.
+
+If you get blocked on one approach, try another. Partial implementations that
+compile and pass tests are better than nothing — ship what you have and note
+what remains in the PR description.
+
+## When done
+
+Commit, push to `{{branch}}`, then:
+
+```
+gh pr create --repo {{target.repo}} \
+  --title "..." \
+  --body "..."
+```
+
+Reference the inbox issue in the PR body: "Closes {{inbox.repo}}#{{issue.number}}"
+(cross-repo closes don't auto-link, the orchestrator handles teardown).
+
+Then stop and wait. The orchestrator sends a follow-up when reviews, comments,
+or CI results arrive. Address them, push fixes, stop again.
+The session ends automatically when the PR merges or closes.
 EOT
 
 # vm "tiger-fusion" {
