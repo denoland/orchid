@@ -47,7 +47,8 @@ type OrchBlock struct {
 	BranchPrefix string `hcl:"branch_prefix"`
 	WorkdirRoot  string `hcl:"workdir_root"`
 	HTTPAddr     string `hcl:"http_addr,optional"`
-	BotLogin     string `hcl:"bot_login,optional"` // shown in the UI bot column
+	BotLogin     string `hcl:"bot_login,optional"`
+	NtfyTopic    string `hcl:"ntfy_topic,optional"`
 }
 
 type VMBlock struct {
@@ -633,6 +634,27 @@ func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments 
 	return
 }
 
+func ntfyNotify(topic, title, msg, clickURL string) {
+	if topic == "" {
+		return
+	}
+	req, err := http.NewRequest("POST", "https://ntfy.sh/"+topic, strings.NewReader(msg))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Title", title)
+	req.Header.Set("Priority", "default")
+	if clickURL != "" {
+		req.Header.Set("Click", clickURL)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("ntfy: %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
 func oneLine(s string, max int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	if len(s) > max {
@@ -797,6 +819,11 @@ func tick(cfg *Config, st *State) {
 			}
 			j.PR = pr.Number
 			log.Printf("issue #%d: found PR #%d in %s", n, j.PR, j.TargetRepo)
+			prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
+			ntfyNotify(cfg.Orch.NtfyTopic,
+				fmt.Sprintf("PR opened: issue #%d", n),
+				fmt.Sprintf("%s\n%s", j.Branch, prURL),
+				prURL)
 			_ = saveState(cfg.Orch.StateFile, st)
 		}
 		v, err := ghPRView(j.TargetRepo, j.PR)
@@ -805,6 +832,13 @@ func tick(cfg *Config, st *State) {
 			continue
 		}
 		if v.State == "MERGED" || v.State == "CLOSED" {
+			if v.State == "MERGED" && j.PR != 0 {
+				prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
+				ntfyNotify(cfg.Orch.NtfyTopic,
+					fmt.Sprintf("PR merged: issue #%d", n),
+					fmt.Sprintf("%s/pull/%d merged ✓", j.TargetRepo, j.PR),
+					prURL)
+			}
 			tearDown(cfg, st, n)
 			_ = saveState(cfg.Orch.StateFile, st)
 			continue

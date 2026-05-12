@@ -10,6 +10,7 @@ orchestrator {
   workdir_root  = "/home/orchid/orch-work"
   http_addr     = ":8000"
   bot_login     = "divybot"
+  ntfy_topic    = "orchid-divy-7f3k9"
 }
 
 # Each target maps an issue label (in the inbox repo) to a work repo.
