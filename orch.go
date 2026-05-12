@@ -48,6 +48,7 @@ type OrchBlock struct {
 	BranchPrefix string `hcl:"branch_prefix"`
 	WorkdirRoot  string `hcl:"workdir_root"`
 	HTTPAddr     string `hcl:"http_addr,optional"`
+	HTTPSecret   string `hcl:"http_secret,optional"` // bearer token for dashboard; empty = no auth
 	BotLogin     string `hcl:"bot_login,optional"` // default git user.name; per-VM override available
 	BotEmail     string `hcl:"bot_email,optional"` // default git user.email; falls back to <bot_login>@users.noreply.github.com
 	NtfyTopic    string `hcl:"ntfy_topic,optional"`
@@ -1023,9 +1024,30 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		return cfg.Orch.BotLogin
 	}
 
+	secret := cfg.Orch.HTTPSecret
+
+	auth := func(next http.HandlerFunc) http.HandlerFunc {
+		if secret == "" {
+			return next
+		}
+		return func(w http.ResponseWriter, r *http.Request) {
+			tok := r.URL.Query().Get("token")
+			if tok == "" {
+				if h := r.Header.Get("Authorization"); len(h) > 7 && h[:7] == "Bearer " {
+					tok = h[7:]
+				}
+			}
+			if tok != secret {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			next(w, r)
+		}
+	}
+
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
@@ -1081,9 +1103,9 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			Rows:    rows,
 			Updated: time.Now().UTC().Format("15:04:05Z"),
 		})
-	})
+	}))
 
-	mux.HandleFunc("/pane", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/pane", auth(func(w http.ResponseWriter, r *http.Request) {
 		session := r.URL.Query().Get("session")
 		// validate: only allow alphanum, dash, underscore
 		for _, c := range session {
@@ -1131,7 +1153,7 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			Content string
 			Err     string
 		}{session, content, errStr})
-	})
+	}))
 
 	return mux
 }
