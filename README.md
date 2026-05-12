@@ -187,6 +187,10 @@ ssh build-1.example.com tmux attach -t claude-42 -r   # read-only
 # Sessions on localhost
 tmux ls
 tmux attach -t claude-42 -r
+
+# Markdown summary of this instance (good for pasting into your own
+# operator notes / a Claude Code CLAUDE.md you read elsewhere)
+./orch -describe -config swarm.hcl
 ```
 
 Key log messages:

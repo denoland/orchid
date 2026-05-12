@@ -50,8 +50,8 @@ type OrchBlock struct {
 	WorkdirRoot  string `hcl:"workdir_root"`
 	HTTPAddr     string `hcl:"http_addr,optional"`
 	HTTPSecret   string `hcl:"http_secret,optional"` // bearer token for dashboard; empty = no auth
-	BotLogin     string `hcl:"bot_login,optional"` // default git user.name; per-VM override available
-	BotEmail     string `hcl:"bot_email,optional"` // default git user.email; falls back to <bot_login>@users.noreply.github.com
+	BotLogin     string `hcl:"bot_login,optional"`   // default git user.name; per-VM override available
+	BotEmail     string `hcl:"bot_email,optional"`   // default git user.email; falls back to <bot_login>@users.noreply.github.com
 	NtfyTopic    string `hcl:"ntfy_topic,optional"`
 }
 
@@ -1172,6 +1172,86 @@ type uiData struct {
 	Updated string
 }
 
+// describe renders a markdown block describing this orch instance: config
+// surface plus current job snapshot. Drop into a CLAUDE.md so future Claude
+// sessions know how to operate this instance without rediscovering it.
+// Hostname is the SSH target users would put after `ssh root@`; pass an empty
+// string to use os.Hostname.
+func describe(cfg *Config, st *State, hostname string) string {
+	if hostname == "" {
+		h, err := os.Hostname()
+		if err == nil {
+			hostname = h
+		} else {
+			hostname = "<unknown-host>"
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "## orchid: %s\n\n", hostname)
+	fmt.Fprintf(&b, "- Inbox:        %s\n", cfg.GitHub.InboxRepo)
+	fmt.Fprintf(&b, "- Bot:          %s", cfg.Orch.BotLogin)
+	if cfg.Orch.BotEmail != "" {
+		fmt.Fprintf(&b, " <%s>", cfg.Orch.BotEmail)
+	}
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "- Branch:       %s<N>\n", cfg.Orch.BranchPrefix)
+	fmt.Fprintf(&b, "- State:        %s\n", cfg.Orch.StateFile)
+	fmt.Fprintf(&b, "- Workdir root: %s\n", cfg.Orch.WorkdirRoot)
+	fmt.Fprintf(&b, "- Poll:         %s\n", cfg.Orch.PollInterval)
+	if cfg.Orch.HTTPAddr != "" {
+		fmt.Fprintf(&b, "- Dashboard:    http://%s%s/\n", hostname, cfg.Orch.HTTPAddr)
+	}
+	if cfg.Orch.NtfyTopic != "" {
+		fmt.Fprintf(&b, "- ntfy topic:   %s\n", cfg.Orch.NtfyTopic)
+	}
+	b.WriteString("\nTargets (label → work repo):\n")
+	for _, t := range cfg.Targets {
+		fmt.Fprintf(&b, "- `%s` → %s\n", t.Label, t.Repo)
+	}
+	b.WriteString("\nVMs:\n")
+	totalCap := 0
+	for _, vm := range cfg.VMs {
+		login, _ := vmBotIdentity(cfg.Orch, vm)
+		extra := ""
+		if login != cfg.Orch.BotLogin {
+			extra = fmt.Sprintf(", bot=%s", login)
+		}
+		cap := "unlimited"
+		if vm.Capacity > 0 {
+			cap = fmt.Sprint(vm.Capacity)
+			totalCap += vm.Capacity
+		}
+		fmt.Fprintf(&b, "- `%s`: %s (capacity %s%s)\n", vm.Name, vm.Host, cap, extra)
+	}
+	// Current job snapshot from the lock-free copy published by tick.
+	var snap map[int]Job
+	if v := st.httpSnap.Load(); v != nil {
+		snap = v.(map[int]Job)
+	}
+	fmt.Fprintf(&b, "\nActive sessions: %d", len(snap))
+	if totalCap > 0 {
+		fmt.Fprintf(&b, " / %d", totalCap)
+	}
+	b.WriteString("\n")
+	if len(snap) > 0 {
+		nums := make([]int, 0, len(snap))
+		for n := range snap {
+			nums = append(nums, n)
+		}
+		sort.Ints(nums)
+		for _, n := range nums {
+			j := snap[n]
+			pr := "no PR yet"
+			if j.PR != 0 {
+				pr = fmt.Sprintf("PR #%d", j.PR)
+			}
+			fmt.Fprintf(&b, "- issue #%d → %s: branch `%s`, %s, on %s/%s\n",
+				n, j.TargetRepo, j.Branch, pr, j.VM, j.Tmux)
+		}
+	}
+	return b.String()
+}
+
 func httpHandler(cfg *Config, st *State) http.Handler {
 	idxT := template.Must(template.New("ix").Parse(indexTmpl))
 	paneT := template.Must(template.New("pane").Parse(paneTmpl))
@@ -1320,11 +1400,26 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 
 func main() {
 	cfgPath := flag.String("config", "swarm.hcl", "path to HCL config")
+	describeFlag := flag.Bool("describe", false, "print a CLAUDE.md-shaped description of this instance and exit")
 	flag.Parse()
 
 	var cfg Config
 	if err := hclsimple.DecodeFile(*cfgPath, nil, &cfg); err != nil {
 		log.Fatalf("config: %v", err)
+	}
+	st, err := loadState(cfg.Orch.StateFile)
+	if err != nil {
+		log.Fatalf("state: %v", err)
+	}
+	if *describeFlag {
+		// Mirror the runtime publish so describe sees a non-nil snapshot.
+		snap := make(map[int]Job, len(st.Jobs))
+		for n, j := range st.Jobs {
+			snap[n] = *j
+		}
+		st.httpSnap.Store(snap)
+		fmt.Print(describe(&cfg, st, ""))
+		return
 	}
 	interval, err := time.ParseDuration(cfg.Orch.PollInterval)
 	if err != nil {
@@ -1334,10 +1429,6 @@ func main() {
 		if login, _ := vmBotIdentity(cfg.Orch, vm); login == "" {
 			log.Fatalf("vm %q: bot_login not set; configure orchestrator.bot_login or vm.%s.bot_login", vm.Name, vm.Name)
 		}
-	}
-	st, err := loadState(cfg.Orch.StateFile)
-	if err != nil {
-		log.Fatalf("state: %v", err)
 	}
 	tnames := make([]string, 0, len(cfg.Targets))
 	for _, t := range cfg.Targets {
