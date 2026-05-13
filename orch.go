@@ -1062,19 +1062,22 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 		tmuxKill(*vm, session)
 		return fmt.Errorf("session never reached idle prompt within %s (claude not authenticated?); pane tail:\n%s", idleWaitTimeout, strings.TrimSpace(pane))
 	}
-	// Set a persistent goal so claude doesn't give up mid-task or defer to follow-up PRs.
-	goalCmd := fmt.Sprintf("/goal Implement issue #%d fully and open a PR. Do not defer work to follow-up PRs. Ship everything in one PR.", is.Number)
-	if err := tmuxPaste(*vm, session, goalCmd); err != nil {
-		log.Printf("issue #%d: goal set failed (non-fatal): %v", is.Number, err)
-	}
-	// Wait for claude to finish processing the /goal command before pasting bootstrap.
-	goalDeadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(goalDeadline) {
-		if idle, _ := tmuxIdle(*vm, session); idle {
-			break
+	// Send slash commands and wait for idle after each.
+	sendSlash := func(cmd string) {
+		if err := tmuxPaste(*vm, session, cmd); err != nil {
+			log.Printf("issue #%d: %s failed (non-fatal): %v", is.Number, cmd, err)
+			return
 		}
-		time.Sleep(1 * time.Second)
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if idle, _ := tmuxIdle(*vm, session); idle {
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
 	}
+	sendSlash(fmt.Sprintf("/goal Implement issue #%d fully and open a PR. Do not defer work to follow-up PRs. Ship everything in one PR.", is.Number))
+	sendSlash("/remote-control")
 
 	tmpl := cfg.BootstrapPrompt
 	if lifecycle == "cron" {
@@ -1140,17 +1143,21 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 		time.Sleep(2 * time.Second)
 	}
 
-	goalCmd := fmt.Sprintf("/goal Implement issue #%d fully and open a PR. Do not defer work to follow-up PRs. Ship everything in one PR.", n)
-	if err := tmuxPaste(*vm, session, goalCmd); err != nil {
-		log.Printf("issue #%d: resume goal set failed (non-fatal): %v", n, err)
-	}
-	goalDeadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(goalDeadline) {
-		if idle, _ := tmuxIdle(*vm, session); idle {
-			break
+	sendSlash := func(cmd string) {
+		if err := tmuxPaste(*vm, session, cmd); err != nil {
+			log.Printf("issue #%d: %s failed (non-fatal): %v", n, cmd, err)
+			return
 		}
-		time.Sleep(1 * time.Second)
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if idle, _ := tmuxIdle(*vm, session); idle {
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
 	}
+	sendSlash(fmt.Sprintf("/goal Implement issue #%d fully and open a PR. Do not defer work to follow-up PRs. Ship everything in one PR.", n))
+	sendSlash("/remote-control")
 
 	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
 	ci := ""
