@@ -117,5 +117,5 @@ vm "local" {
 
 target "deno_core" {
   label = "deno_core"
-  repo  = "denoland/deno_core"
+  repo  = "denoland/deno"
 }
