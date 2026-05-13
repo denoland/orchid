@@ -59,6 +59,7 @@ orchestrator {
   branch_prefix = "orch/issue-"
   workdir_root  = "/home/orch/work"
   http_addr     = ":8000"        # status dashboard
+  http_secret   = "<random>"     # bearer token gating the dashboard (optional)
   bot_login     = "mybot"        # default git user.name for commits
   bot_email     = "mybot@users.noreply.github.com" # default; falls back to <bot_login>@users.noreply.github.com
   ntfy_topic    = "mybot-abc123" # ntfy.sh push notifications (optional)
@@ -121,20 +122,111 @@ For remote VMs, orchid provisions GitHub SSH auth automatically at startup by co
 
 ---
 
+## Top-level fields
+
+```hcl
+# Required. Template pasted into a worker session at spawn time for
+# oneshot issues. Supports the placeholders listed below.
+bootstrap_prompt = <<EOT
+You are working on GitHub issue #{{issue.number}} ...
+EOT
+
+# Required if any inbox issue carries the `cron` label. Template for
+# cron-lifecycle issues — the oneshot template's "ship a PR" framing
+# is wrong for cron (see Cron lifecycle section).
+cron_bootstrap_prompt = <<EOT
+You are running a scheduled task triggered by orchid ...
+EOT
+```
+
+The `github { }`, `orchestrator { }`, `target "<name>" { }` and
+`vm "<name>" { }` blocks group the rest of the configuration.
+
+---
+
+## Orchestrator block fields
+
+```hcl
+orchestrator {
+  # Required. Tick interval. One ticker drives everything: inbox
+  # poll, PR poll, cron schedule check.
+  poll_interval = "30s"
+
+  # Required. Absolute path to the JSON state file. Survives
+  # restarts; one orch instance per state file.
+  state_file = "/var/orch/state.json"
+
+  # Required. Branch name prefix for spawned PRs. Final branch is
+  # <prefix><issue-N>.
+  branch_prefix = "orch/issue-"
+
+  # Required. Absolute path on each VM under which orch creates
+  # per-issue worktrees and shared clones.
+  workdir_root = "/home/orch/work"
+
+  # Optional. Dashboard listen address. Disabled if unset.
+  http_addr = ":8000"
+
+  # Optional. Bearer token gating the dashboard. Requests must carry
+  # `?token=<secret>` or `Authorization: Bearer <secret>`. Strongly
+  # recommended unless the dashboard sits behind another auth layer.
+  http_secret = "<random>"
+
+  # Optional. Default git user.name for commits across all VMs.
+  # Required unless every VM declares its own bot_login.
+  bot_login = "mybot"
+
+  # Optional. Default git user.email. Defaults to
+  # <bot_login>@users.noreply.github.com. Per-VM override available.
+  bot_email = "mybot@users.noreply.github.com"
+
+  # Optional. orch POSTs to https://ntfy.sh/<topic> when a PR opens
+  # or merges.
+  ntfy_topic = "mybot-abc123"
+}
+```
+
+---
+
 ## VM fields
 
-| Field | Default | Description |
-|---|---|---|
-| `host` | required | Hostname, IP, `localhost`, or `127.0.0.1`. |
-| `user` | — | SSH user (remote VMs only). |
-| `key` | — | SSH private key path (remote VMs only). |
-| `capacity` | 0 (unlimited) | Max concurrent sessions on this VM. |
-| `sccache` | false | Share `sccache` across sessions via tmux global env. |
-| `sccache_dir` | `~/.cache/sccache` | Cache directory. |
-| `session_cmd` | `clawpatrol run -- claude --dangerously-skip-permissions` | Command run inside the tmux pane. |
-| `session_home` | `~` | Home dir of the session user (used to stamp claude's trust file). |
-| `bot_login` | `orchestrator.bot_login` | Overrides the orchestrator-level git `user.name` for commits made on this VM. Use to give each VM a distinct bot identity. |
-| `bot_email` | `orchestrator.bot_email`, else `<bot_login>@users.noreply.github.com` | Overrides the orchestrator-level git `user.email` for commits made on this VM. |
+```hcl
+vm "build-1" {
+  # Required. Hostname, IP, `localhost`, or `127.0.0.1`.
+  host = "build-1.example.com"
+
+  # SSH user (remote VMs only).
+  user = "deploy"
+
+  # SSH private key path (remote VMs only).
+  key = "~/.ssh/id_ed25519"
+
+  # Max concurrent sessions on this VM. Default 0 (unlimited).
+  capacity = 2
+
+  # Share sccache across sessions via tmux global env. Default false.
+  sccache = true
+
+  # sccache cache directory. Default ~/.cache/sccache.
+  sccache_dir = "~/.cache/sccache"
+
+  # Command run inside the tmux pane. Default:
+  # `clawpatrol run -- claude --dangerously-skip-permissions`.
+  session_cmd = "clawpatrol run -- claude --dangerously-skip-permissions"
+
+  # Home dir of the session user (used to stamp claude's trust
+  # file). Default ~ (the orch process's $HOME).
+  session_home = "/home/deploy"
+
+  # Overrides orchestrator.bot_login for commits made on this VM.
+  # Use to give each VM a distinct bot identity.
+  bot_login = "build-1-bot"
+
+  # Overrides orchestrator.bot_email. Defaults to
+  # <bot_login>@users.noreply.github.com.
+  bot_email = "build-1-bot@users.noreply.github.com"
+}
+```
 
 ---
 
