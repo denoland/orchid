@@ -104,6 +104,29 @@ type State struct {
 // those blips so a single tick doesn't lose work. Backoff: 1s, 2s, 4s.
 const runAttempts = 4
 
+// maxKillsPerTick caps how many dead-session respawns the polling loop will
+// fire in a single tick. Each respawn registers a fresh peer on the clawpatrol
+// WG relay; firing several together overwhelms the relay and the new sessions
+// die within minutes (denoland/clawpatrol#306). Two-per-tick keeps respawns
+// spaced by the poll interval, so a herd of 5–6 simultaneous deaths is paid
+// back over several ticks instead of all at once.
+const maxKillsPerTick = 2
+
+// killBudget tracks dead-session respawns issued so far this tick. Use
+// tryUse to attempt a kill; it returns false once the per-tick cap is hit.
+type killBudget struct {
+	max  int
+	used int
+}
+
+func (b *killBudget) tryUse() bool {
+	if b.used >= b.max {
+		return false
+	}
+	b.used++
+	return true
+}
+
 func run(name string, args ...string) (string, string, error) {
 	return runWithStdin(nil, name, args...)
 }
@@ -1278,6 +1301,12 @@ func tick(cfg *Config, st *State) {
 		_ = saveState(cfg.Orch.StateFile, st)
 	}
 
+	// Bound how many dead-session respawns we issue per tick. Each respawn
+	// registers a new peer on the clawpatrol WG relay; firing several at
+	// once overwhelms it and the freshly-spawned sessions die within
+	// minutes (see denoland/clawpatrol#306). Sessions still down on the
+	// next tick are picked up then, so kills stagger naturally.
+	budget := killBudget{max: maxKillsPerTick}
 	for n, j := range st.Jobs {
 		if _, stillOpen := open[n]; !stillOpen {
 			isOpen, err := ghIssueIsOpen(cfg.GitHub.InboxRepo, n)
@@ -1318,6 +1347,11 @@ func tick(cfg *Config, st *State) {
 			continue
 		}
 		if !alive {
+			if !budget.tryUse() {
+				log.Printf("issue #%d: tmux session %q gone, deferring respawn (kill budget %d/%d exhausted this tick)",
+					n, j.Tmux, budget.used, budget.max)
+				continue
+			}
 			if j.PR > 0 {
 				// Session died with an open PR — respawn using --resume so
 				// claude recovers its conversation context.
