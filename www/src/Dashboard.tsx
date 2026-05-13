@@ -18,7 +18,7 @@ function ciStatus(conclusions: Record<string, string>): 'fail' | 'pass' | 'pendi
 function ActivityDot({ job }: { job: Job | null }) {
   if (!job) {
     return (
-      <span className="relative inline-flex w-2 h-2">
+      <span className="relative inline-flex w-2 h-2 flex-shrink-0">
         <span className="w-2 h-2 rounded-full bg-[#e5e5e5]" />
       </span>
     )
@@ -26,16 +26,14 @@ function ActivityDot({ job }: { job: Job | null }) {
   if (job.lifecycle === 'cron') {
     const active = job.tmux !== ''
     return (
-      <span className="relative inline-flex w-2 h-2">
-        {active && (
-          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#a855f7] opacity-50" />
-        )}
+      <span className="relative inline-flex w-2 h-2 flex-shrink-0">
+        {active && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#a855f7] opacity-50" />}
         <span className={`relative w-2 h-2 rounded-full ${active ? 'bg-[#a855f7]' : 'bg-[#d4d4d4]'}`} />
       </span>
     )
   }
   return (
-    <span className="relative inline-flex w-2 h-2">
+    <span className="relative inline-flex w-2 h-2 flex-shrink-0">
       <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#22c55e] opacity-40" />
       <span className="relative w-2 h-2 rounded-full bg-[#22c55e]" />
     </span>
@@ -45,18 +43,74 @@ function ActivityDot({ job }: { job: Job | null }) {
 function CIBadge({ conclusions }: { conclusions: Record<string, string> }) {
   const s = ciStatus(conclusions)
   if (s === 'fail') return (
-    <span className="inline-flex items-center gap-1 text-[10px] font-medium text-[#dc2626] bg-[#fef2f2] border border-[#fecaca] rounded px-1.5 py-0.5">
+    <span className="inline-flex text-[10px] font-medium text-[#dc2626] bg-[#fef2f2] border border-[#fecaca] rounded px-1.5 py-0.5 flex-shrink-0">
       CI fail
     </span>
   )
   if (s === 'pass') return (
-    <span className="inline-flex items-center gap-1 text-[10px] font-medium text-[#16a34a] bg-[#f0fdf4] border border-[#bbf7d0] rounded px-1.5 py-0.5">
+    <span className="inline-flex text-[10px] font-medium text-[#16a34a] bg-[#f0fdf4] border border-[#bbf7d0] rounded px-1.5 py-0.5 flex-shrink-0">
       CI pass
     </span>
   )
   return null
 }
 
+function JobCard({ job, onClick }: { job: Job; onClick: () => void }) {
+  const repo = job.target_repo ? job.target_repo.split('/')[1] : job.target || ''
+  return (
+    <div
+      className="px-4 py-3 border-b border-[#f5f5f5] cursor-pointer hover:bg-[#fafafa] transition-colors active:bg-[#f5f5f5]"
+      onClick={onClick}
+    >
+      <div className="flex items-start gap-2.5 min-w-0">
+        <div className="mt-[5px]"><ActivityDot job={job} /></div>
+        <div className="flex-1 min-w-0">
+          <div className="text-[13px] font-medium text-[#171717] leading-snug truncate">
+            {job.issue_title || job.tmux || '—'}
+          </div>
+          <div className="flex items-center gap-2 mt-1 flex-wrap">
+            {job.issue && (
+              <a
+                href={`https://github.com/denoland/orchid/issues/${job.issue}`}
+                target="_blank" rel="noopener noreferrer"
+                className="text-[11px] text-[#a3a3a3] font-mono hover:underline"
+                onClick={(e) => e.stopPropagation()}
+              >
+                #{job.issue}
+              </a>
+            )}
+            {repo && <span className="text-[11px] text-[#a3a3a3]">{repo}</span>}
+            {job.tmux && <code className="text-[11px] text-[#c4c4c4]">{job.tmux}</code>}
+            {job.pr && (
+              <a
+                href={`https://github.com/${job.target_repo}/pull/${job.pr}`}
+                target="_blank" rel="noopener noreferrer"
+                className="text-[11px] text-[#525252] font-mono hover:underline"
+                onClick={(e) => e.stopPropagation()}
+              >
+                PR #{job.pr}
+              </a>
+            )}
+            {job.pr && <CIBadge conclusions={job.last_check_conclusions ?? {}} />}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function FreeCard() {
+  return (
+    <div className="px-4 py-3 border-b border-[#f5f5f5]">
+      <div className="flex items-center gap-2.5">
+        <ActivityDot job={null} />
+        <span className="text-[13px] text-[#d4d4d4]">free</span>
+      </div>
+    </div>
+  )
+}
+
+// Desktop-only table row variants
 function JobRow({ job, onClick }: { job: Job; onClick: () => void }) {
   const repo = job.target_repo ? job.target_repo.split('/')[1] : job.target || '—'
   return (
@@ -79,26 +133,16 @@ function JobRow({ job, onClick }: { job: Job; onClick: () => void }) {
       </td>
       <td className="px-4 py-2.5 align-middle text-[13px] text-[#525252]">
         {job.issue ? (
-          <a
-            href={`https://github.com/denoland/orchid/issues/${job.issue}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hover:underline font-mono"
-            onClick={(e) => e.stopPropagation()}
-          >
+          <a href={`https://github.com/denoland/orchid/issues/${job.issue}`} target="_blank" rel="noopener noreferrer"
+            className="hover:underline font-mono" onClick={(e) => e.stopPropagation()}>
             #{job.issue}
           </a>
         ) : '—'}
       </td>
       <td className="px-4 py-2.5 align-middle text-[13px] text-[#737373]">
         {job.target_repo ? (
-          <a
-            href={`https://github.com/${job.target_repo}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hover:underline"
-            onClick={(e) => e.stopPropagation()}
-          >
+          <a href={`https://github.com/${job.target_repo}`} target="_blank" rel="noopener noreferrer"
+            className="hover:underline" onClick={(e) => e.stopPropagation()}>
             {repo}
           </a>
         ) : '—'}
@@ -106,13 +150,8 @@ function JobRow({ job, onClick }: { job: Job; onClick: () => void }) {
       <td className="px-4 py-2.5 align-middle text-[13px]">
         {job.pr ? (
           <span className="flex items-center gap-2">
-            <a
-              href={`https://github.com/${job.target_repo}/pull/${job.pr}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="hover:underline font-mono text-[#525252]"
-              onClick={(e) => e.stopPropagation()}
-            >
+            <a href={`https://github.com/${job.target_repo}/pull/${job.pr}`} target="_blank" rel="noopener noreferrer"
+              className="hover:underline font-mono text-[#525252]" onClick={(e) => e.stopPropagation()}>
               #{job.pr}
             </a>
             <CIBadge conclusions={job.last_check_conclusions ?? {}} />
@@ -163,22 +202,22 @@ export function Dashboard({ state, tick }: Props) {
   const busy = jobs.length
   const cap = vms.reduce((s, v) => s + v.capacity, 0)
 
+  const handleClick = (tmux: string) => {
+    if (tmux) window.location.hash = `/pane/${encodeURIComponent(tmux)}`
+  }
+
   return (
-    <div className="min-h-screen bg-white px-6 pt-12 pb-8">
-      <div className="mb-6">
-        <h1 className="font-mono text-[28px] font-bold text-[#171717] tracking-tight leading-none mb-1">
+    <div className="min-h-screen bg-white px-4 sm:px-6 pt-10 sm:pt-12 pb-8">
+      <div className="mb-5 sm:mb-6">
+        <h1 className="font-mono text-[26px] sm:text-[28px] font-bold text-[#171717] tracking-tight leading-none mb-1">
           orchid
         </h1>
-        <div className="text-[12px] text-[#a3a3a3] flex items-center gap-2">
+        <div className="text-[12px] text-[#a3a3a3] flex items-center gap-2 flex-wrap">
           {cap > 0 && <span>{busy}/{cap} active</span>}
           {cap > 0 && inbox && <span>·</span>}
           {inbox && (
-            <a
-              href={`https://github.com/${inbox}/issues`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="hover:text-[#404040] transition-colors"
-            >
+            <a href={`https://github.com/${inbox}/issues`} target="_blank" rel="noopener noreferrer"
+              className="hover:text-[#404040] transition-colors">
               {inbox}
             </a>
           )}
@@ -187,43 +226,45 @@ export function Dashboard({ state, tick }: Props) {
       </div>
 
       <div className="border border-[#ebebeb] rounded-lg overflow-hidden">
-        <table className="w-full table-fixed border-collapse text-[13px]">
+        {/* Mobile: card list */}
+        <div className="sm:hidden">
+          {rows.length === 0 ? (
+            <div className="px-4 py-10 text-center text-[#a3a3a3] text-[13px]">no sessions</div>
+          ) : (
+            rows.map((row, i) =>
+              row.type === 'job' ? (
+                <JobCard key={`job-${row.job.issue}-${row.job.tmux}-${i}`} job={row.job}
+                  onClick={() => handleClick(row.job.tmux)} />
+              ) : (
+                <FreeCard key={`free-${i}`} />
+              )
+            )
+          )}
+        </div>
+
+        {/* Desktop: table */}
+        <table className="hidden sm:table w-full table-fixed border-collapse text-[13px]">
           <thead>
             <tr className="border-b border-[#ebebeb] bg-[#fafafa]">
-              <th className="px-4 py-2 text-left text-[10px] uppercase tracking-[.1em] text-[#a3a3a3] font-medium w-[42%]">
-                Session
-              </th>
-              <th className="px-4 py-2 text-left text-[10px] uppercase tracking-[.1em] text-[#a3a3a3] font-medium w-[12%]">
-                Issue
-              </th>
-              <th className="px-4 py-2 text-left text-[10px] uppercase tracking-[.1em] text-[#a3a3a3] font-medium w-[20%]">
-                Repo
-              </th>
-              <th className="px-4 py-2 text-left text-[10px] uppercase tracking-[.1em] text-[#a3a3a3] font-medium w-[26%]">
-                PR
-              </th>
+              <th className="px-4 py-2 text-left text-[10px] uppercase tracking-[.1em] text-[#a3a3a3] font-medium w-[42%]">Session</th>
+              <th className="px-4 py-2 text-left text-[10px] uppercase tracking-[.1em] text-[#a3a3a3] font-medium w-[12%]">Issue</th>
+              <th className="px-4 py-2 text-left text-[10px] uppercase tracking-[.1em] text-[#a3a3a3] font-medium w-[20%]">Repo</th>
+              <th className="px-4 py-2 text-left text-[10px] uppercase tracking-[.1em] text-[#a3a3a3] font-medium w-[26%]">PR</th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={4} className="px-4 py-10 text-center text-[#a3a3a3] text-[13px]">
-                  no sessions
-                </td>
+                <td colSpan={4} className="px-4 py-10 text-center text-[#a3a3a3] text-[13px]">no sessions</td>
               </tr>
             ) : (
               rows.map((row, i) =>
                 row.type === 'job' ? (
-                  <JobRow
-                    key={`job-${row.job.issue}-${row.job.tmux}-${i}`}
-                    job={row.job}
-                    onClick={() => {
-                      if (row.job.tmux) window.location.hash = `/pane/${encodeURIComponent(row.job.tmux)}`
-                    }}
-                  />
+                  <JobRow key={`job-${row.job.issue}-${row.job.tmux}-${i}`} job={row.job}
+                    onClick={() => handleClick(row.job.tmux)} />
                 ) : (
                   <FreeRow key={`free-${i}`} />
-                ),
+                )
               )
             )}
           </tbody>

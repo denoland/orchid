@@ -99,11 +99,14 @@ export function Pane({ session }: Props) {
 
     connect()
 
-    const onResize = () => fit.fit()
-    window.addEventListener('resize', onResize)
+    const doFit = () => { fitRef.current?.fit() }
+    window.addEventListener('resize', doFit)
+    // handle virtual keyboard on mobile
+    window.visualViewport?.addEventListener('resize', doFit)
 
     return () => {
-      window.removeEventListener('resize', onResize)
+      window.removeEventListener('resize', doFit)
+      window.visualViewport?.removeEventListener('resize', doFit)
       if (retryRef.current) clearTimeout(retryRef.current)
       if (wsRef.current) {
         wsRef.current.onclose = null
@@ -117,37 +120,26 @@ export function Pane({ session }: Props) {
   }, [session])
 
   return (
-    <div className="flex flex-col min-h-screen bg-white">
-      <div className="border-b border-[#ebebeb] px-6 h-10 flex items-center justify-between flex-shrink-0 bg-white">
+    <div className="flex flex-col bg-white" style={{ height: '100dvh' }}>
+      <div className="border-b border-[#ebebeb] px-4 h-9 flex items-center justify-between flex-shrink-0 bg-white">
         <a
           href="#/"
-          className="text-[13px] text-[#525252] hover:text-[#171717] transition-colors"
+          className="text-[12px] text-[#525252] hover:text-[#171717] transition-colors"
         >
           ← orchid
         </a>
-        <span className="text-[12px] text-[#a3a3a3] flex items-center gap-2">
-          <code className="text-[#525252] font-mono">{session}</code>
-          {status === 'reconnecting' && (
-            <span className="text-[#dc2626]">reconnecting…</span>
-          )}
-          {status === 'connecting' && (
-            <span className="text-[#d97706]">connecting…</span>
-          )}
+        <span className="text-[11px] text-[#a3a3a3] flex items-center gap-1.5 min-w-0 overflow-hidden">
+          <code className="text-[#525252] font-mono truncate">{session}</code>
+          {status === 'reconnecting' && <span className="text-[#dc2626] flex-shrink-0">reconnecting…</span>}
+          {status === 'connecting' && <span className="text-[#d97706] flex-shrink-0">connecting…</span>}
         </span>
       </div>
 
-      <div className="flex-1 p-4 overflow-hidden">
-        <div
-          className="h-full border border-[#ebebeb] rounded-lg overflow-hidden"
-          style={{ background: '#ffffff' }}
-        >
-          <div
-            ref={containerRef}
-            className="h-full"
-            style={{ padding: '10px 14px' }}
-          />
-        </div>
-      </div>
+      <div
+        ref={containerRef}
+        className="flex-1 overflow-hidden"
+        style={{ padding: '8px 10px' }}
+      />
     </div>
   )
 }
