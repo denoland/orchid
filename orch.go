@@ -109,12 +109,10 @@ type State struct {
 const runAttempts = 4
 
 // maxKillsPerTick caps how many dead-session respawns the polling loop will
-// fire in a single tick. Each respawn registers a fresh peer on the clawpatrol
-// WG relay; firing several together overwhelms the relay and the new sessions
-// die within minutes (denoland/clawpatrol#306). Two-per-tick keeps respawns
-// spaced by the poll interval, so a herd of 5–6 simultaneous deaths is paid
-// back over several ticks instead of all at once.
-const maxKillsPerTick = 2
+// fire in a single tick. Raised from 2 to 5 after removing the clawpatrol WG
+// relay dependency (the original cap was to avoid overwhelming the relay with
+// simultaneous peer registrations).
+const maxKillsPerTick = 5
 
 // killBudget tracks dead-session respawns issued so far this tick. Use
 // tryUse to attempt a kill; it returns false once the per-tick cap is hit.
@@ -1133,14 +1131,20 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 	if err := tmuxStart(*vm, session, workdir, sharedDir, j.TargetRepo, j.Branch, resumeCmd, botLogin, botEmail); err != nil {
 		return err
 	}
-	time.Sleep(3 * time.Second)
-	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
 	// Same 3-minute window as startSession; claude --resume on a heavy
-	// worktree replays the conversation and can take a while.
+	// worktree replays the conversation and can take a while. While waiting,
+	// periodically send Enter to dismiss the session-picker UI if it appears
+	// (the picker renders after startup, so a single pre-sleep Enter often
+	// fires too early and misses it).
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {
 		if idle, err := tmuxIdle(*vm, session); err == nil && idle {
 			break
+		}
+		// Dismiss session picker if visible (shows "Resume session" header).
+		if out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s", session)); err == nil &&
+			strings.Contains(out, "Resume session") {
+			_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
 		}
 		time.Sleep(2 * time.Second)
 	}
