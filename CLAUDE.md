@@ -14,9 +14,9 @@ Binary:   /root/orch/orch
 Config:   /root/orch/swarm.hcl
 State:    /root/orch/state.json
 Log:      /root/orch/orch.log
-Capacity: 20 concurrent sessions
-Dashboard: http://0.0.0.0:8000/?token=4e27d68d952655686bcde0007cc725e7
-Pane view: http://0.0.0.0:8000/pane?session=claude-N&token=4e27d68d952655686bcde0007cc725e7
+Capacity: 30 concurrent sessions
+Dashboard: https://orchid.littledivy.com/
+Pane view: https://orchid.littledivy.com/pane?session=claude-N
 ntfy:     REDACTED
 ```
 
