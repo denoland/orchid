@@ -533,9 +533,9 @@ tmux setenv -g SCCACHE_DIR %s
 	commonScript := fmt.Sprintf(`set -e
 mkdir -p ~/.claude
 if [ -f ~/.claude/settings.json ]; then
-  jq '. + {skipDangerousModePermissionPrompt: true}' ~/.claude/settings.json > ~/.claude/settings.json.tmp && mv ~/.claude/settings.json.tmp ~/.claude/settings.json
+  jq '. + {skipDangerousModePermissionPrompt: true, includeCoAuthoredBy: false}' ~/.claude/settings.json > ~/.claude/settings.json.tmp && mv ~/.claude/settings.json.tmp ~/.claude/settings.json
 else
-  echo '{"theme":"dark","skipDangerousModePermissionPrompt":true}' > ~/.claude/settings.json
+  echo '{"theme":"dark","skipDangerousModePermissionPrompt":true,"includeCoAuthoredBy":false}' > ~/.claude/settings.json
 fi
 [ -f ~/.claude.json ] || echo '{}' > ~/.claude.json
 %s
