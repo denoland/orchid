@@ -1062,6 +1062,20 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 		tmuxKill(*vm, session)
 		return fmt.Errorf("session never reached idle prompt within %s (claude not authenticated?); pane tail:\n%s", idleWaitTimeout, strings.TrimSpace(pane))
 	}
+	// Set a persistent goal so claude doesn't give up mid-task or defer to follow-up PRs.
+	goalCmd := fmt.Sprintf("/goal Implement issue #%d fully and open a PR. Do not defer work to follow-up PRs. Ship everything in one PR.", is.Number)
+	if err := tmuxPaste(*vm, session, goalCmd); err != nil {
+		log.Printf("issue #%d: goal set failed (non-fatal): %v", is.Number, err)
+	}
+	// Wait for claude to finish processing the /goal command before pasting bootstrap.
+	goalDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(goalDeadline) {
+		if idle, _ := tmuxIdle(*vm, session); idle {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+
 	tmpl := cfg.BootstrapPrompt
 	if lifecycle == "cron" {
 		tmpl = cfg.CronBootstrapPrompt
@@ -1124,6 +1138,18 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 			break
 		}
 		time.Sleep(2 * time.Second)
+	}
+
+	goalCmd := fmt.Sprintf("/goal Implement issue #%d fully and open a PR. Do not defer work to follow-up PRs. Ship everything in one PR.", n)
+	if err := tmuxPaste(*vm, session, goalCmd); err != nil {
+		log.Printf("issue #%d: resume goal set failed (non-fatal): %v", n, err)
+	}
+	goalDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(goalDeadline) {
+		if idle, _ := tmuxIdle(*vm, session); idle {
+			break
+		}
+		time.Sleep(1 * time.Second)
 	}
 
 	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
