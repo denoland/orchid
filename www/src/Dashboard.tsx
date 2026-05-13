@@ -164,11 +164,14 @@ export function Dashboard({ state, tick }: Props) {
   const cap = vms.reduce((s, v) => s + v.capacity, 0)
 
   return (
-    <div className="min-h-screen bg-white px-6 py-8">
-      <div className="mb-4 flex items-baseline justify-between">
-        <span className="font-mono text-[13px] font-semibold text-[#171717]">orchid</span>
-        <span className="text-[12px] text-[#a3a3a3]">
-          {cap > 0 && <>{busy}/{cap} · </>}
+    <div className="min-h-screen bg-white px-6 pt-12 pb-8">
+      <div className="mb-6">
+        <h1 className="font-mono text-[28px] font-bold text-[#171717] tracking-tight leading-none mb-1">
+          orchid
+        </h1>
+        <div className="text-[12px] text-[#a3a3a3] flex items-center gap-2">
+          {cap > 0 && <span>{busy}/{cap} active</span>}
+          {cap > 0 && inbox && <span>·</span>}
           {inbox && (
             <a
               href={`https://github.com/${inbox}/issues`}
@@ -179,8 +182,8 @@ export function Dashboard({ state, tick }: Props) {
               {inbox}
             </a>
           )}
-          {inbox && <> · </>}↻{tick}s
-        </span>
+          <span>· ↻{tick}s</span>
+        </div>
       </div>
 
       <div className="border border-[#ebebeb] rounded-lg overflow-hidden">
