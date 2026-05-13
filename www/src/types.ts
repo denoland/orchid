@@ -5,6 +5,7 @@ export interface Job {
   target: string
   target_repo: string
   branch: string
+  issue_title: string
   lifecycle: string   // "oneshot" | "cron"
   schedule: string
   pr: number

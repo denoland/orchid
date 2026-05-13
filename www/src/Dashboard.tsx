@@ -43,9 +43,16 @@ function JobRow({ job, onClick }: { job: Job; onClick: () => void }) {
       onClick={onClick}
     >
       <td className="px-3 sm:px-[14px] py-[9px] align-middle">
-        <span className="flex items-center gap-2">
+        <span className="flex items-center gap-2 min-w-0">
           <StatusDot job={job} />
-          <code className="text-[12px] text-[#171717]">{job.tmux || '—'}</code>
+          <span className="flex flex-col min-w-0">
+            <span className="text-[12px] text-[#171717] truncate leading-tight">
+              {job.issue_title || job.tmux || '—'}
+            </span>
+            {job.issue_title && job.tmux && (
+              <code className="text-[10px] text-[#a3a3a3] leading-tight">{job.tmux}</code>
+            )}
+          </span>
         </span>
       </td>
       <td className="px-3 sm:px-[14px] py-[9px] align-middle text-[13px] text-[#404040]">
