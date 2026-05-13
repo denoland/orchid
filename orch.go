@@ -1041,7 +1041,11 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 	// warnings, so trust is the only dialog we should see at first launch.
 	time.Sleep(3 * time.Second)
 	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
-	deadline := time.Now().Add(60 * time.Second)
+	// 3 minutes covers slow claude TUI startup in heavy worktrees (e.g.
+	// fresh deno checkout: lockfile parse + project scan can push first
+	// idle past the 60s mark on a contended VM).
+	const idleWaitTimeout = 3 * time.Minute
+	deadline := time.Now().Add(idleWaitTimeout)
 	sawIdle := false
 	for time.Now().Before(deadline) {
 		if idle, err := tmuxIdle(*vm, session); err == nil && idle {
@@ -1056,7 +1060,7 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 	if !sawIdle {
 		pane, _, _ := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s | tail -15", session))
 		tmuxKill(*vm, session)
-		return fmt.Errorf("session never reached idle prompt within 60s (claude not authenticated?); pane tail:\n%s", strings.TrimSpace(pane))
+		return fmt.Errorf("session never reached idle prompt within %s (claude not authenticated?); pane tail:\n%s", idleWaitTimeout, strings.TrimSpace(pane))
 	}
 	tmpl := cfg.BootstrapPrompt
 	if lifecycle == "cron" {
@@ -1112,7 +1116,9 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 	}
 	time.Sleep(3 * time.Second)
 	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
-	deadline := time.Now().Add(60 * time.Second)
+	// Same 3-minute window as startSession; claude --resume on a heavy
+	// worktree replays the conversation and can take a while.
+	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {
 		if idle, err := tmuxIdle(*vm, session); err == nil && idle {
 			break
