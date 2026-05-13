@@ -40,7 +40,6 @@ type Config struct {
 
 type GitHubBlock struct {
 	InboxRepo string `hcl:"inbox_repo"`
-	TokenEnv  string `hcl:"token_env,optional"`
 }
 
 type TargetBlock struct {

@@ -1,6 +1,5 @@
 github {
   inbox_repo = "denoland/orchid"
-  token_env  = "GITHUB_TOKEN"
 }
 
 orchestrator {
