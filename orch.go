@@ -87,6 +87,7 @@ type Job struct {
 	Timeout              string            `json:"timeout,omitempty"`         // cron only: max runtime per tick before orch kills the pane
 	NextFireAt           time.Time         `json:"next_fire_at,omitempty"`    // cron only: when to spawn the next ephemeral tick
 	FireStartedAt        time.Time         `json:"fire_started_at,omitempty"` // cron only: when the current tick started (used to enforce Timeout)
+	IssueTitle           string            `json:"issue_title,omitempty"`
 	PR                   int               `json:"pr,omitempty"`
 	SeenReviewIDs        []string          `json:"seen_review_ids,omitempty"`
 	SeenThreadCommentIDs []string          `json:"seen_thread_comment_ids,omitempty"`
@@ -1104,6 +1105,7 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 		VM: vm.Name, Tmux: sessionName(is.Number),
 		Target: target.Name, TargetRepo: target.Repo,
 		Branch: branch, Lifecycle: "oneshot",
+		IssueTitle:           is.Title,
 		LastCheckConclusions: map[string]string{},
 	}
 	log.Printf("issue #%d: spawned on %s/%s, target=%s (%s), branch=%s",
@@ -1324,10 +1326,11 @@ func tick(cfg *Config, st *State) {
 			}
 			st.Jobs[n] = &Job{
 				Target: r.target.Name, TargetRepo: r.target.Repo,
-				Branch:    cfg.Orch.BranchPrefix + fmt.Sprint(n),
-				Lifecycle: "cron",
-				Schedule:  cron.ScheduleStr,
-				Timeout:   cron.TimeoutStr,
+				Branch:     cfg.Orch.BranchPrefix + fmt.Sprint(n),
+				Lifecycle:  "cron",
+				Schedule:   cron.ScheduleStr,
+				Timeout:    cron.TimeoutStr,
+				IssueTitle: r.is.Title,
 			}
 			log.Printf("issue #%d: registered cron job (target=%s, schedule=%s, timeout=%s)",
 				n, r.target.Name, cron.ScheduleStr, cron.TimeoutStr)
@@ -1354,6 +1357,9 @@ func tick(cfg *Config, st *State) {
 	// next tick are picked up then, so kills stagger naturally.
 	budget := killBudget{max: maxKillsPerTick}
 	for n, j := range st.Jobs {
+		if r, inOpen := open[n]; inOpen && j.IssueTitle == "" {
+			j.IssueTitle = r.is.Title
+		}
 		if _, stillOpen := open[n]; !stillOpen {
 			isOpen, err := ghIssueIsOpen(cfg.GitHub.InboxRepo, n)
 			if err != nil {
