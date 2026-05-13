@@ -687,6 +687,10 @@ func tmuxKill(vm VMBlock, session string) {
 // processing". The status bar "bypass permissions" line is always rendered
 // once the TUI is up; "esc to interrupt" is appended only while claude is
 // working. False negatives just defer the poke by one tick — safe.
+//
+// We capture the entire visible pane (not `tail -N`) because claude's welcome
+// screen leaves trailing blank rows below the footer; a small tail window
+// would miss the "bypass permissions" line and falsely report not-idle.
 func tmuxIdle(vm VMBlock, session string) (bool, error) {
 	out, _, err := sshExec(vm, fmt.Sprintf("tmux capture-pane -p -t %s", session))
 	if err != nil {
