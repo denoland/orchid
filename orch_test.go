@@ -164,6 +164,56 @@ func TestResolveIncludeAPI(t *testing.T) {
 	}
 }
 
+func TestKillBudget(t *testing.T) {
+	t.Run("max=2 allows two kills then refuses", func(t *testing.T) {
+		b := killBudget{max: 2}
+		if !b.tryUse() {
+			t.Fatal("first tryUse should succeed")
+		}
+		if !b.tryUse() {
+			t.Fatal("second tryUse should succeed")
+		}
+		if b.tryUse() {
+			t.Fatal("third tryUse should be refused (budget exhausted)")
+		}
+		if b.tryUse() {
+			t.Fatal("fourth tryUse should still be refused")
+		}
+		if b.used != 2 {
+			t.Errorf("used: got %d, want 2 (refused calls must not increment)", b.used)
+		}
+	})
+
+	t.Run("staggers a herd across ticks", func(t *testing.T) {
+		// Simulate 6 simultaneously dead sessions across successive ticks.
+		// With maxKillsPerTick=2, we expect 3 ticks to drain the herd.
+		dead := 6
+		ticks := 0
+		for dead > 0 {
+			b := killBudget{max: maxKillsPerTick}
+			killedThisTick := 0
+			for dead > 0 && b.tryUse() {
+				dead--
+				killedThisTick++
+			}
+			if killedThisTick > maxKillsPerTick {
+				t.Fatalf("tick %d killed %d > cap %d", ticks, killedThisTick, maxKillsPerTick)
+			}
+			ticks++
+		}
+		if want := 3; ticks != want {
+			t.Errorf("ticks to drain 6 dead with cap %d: got %d, want %d", maxKillsPerTick, ticks, want)
+		}
+	})
+
+	t.Run("max=0 refuses everything", func(t *testing.T) {
+		b := killBudget{max: 0}
+		if b.tryUse() {
+			t.Fatal("max=0 must refuse all calls")
+		}
+	})
+}
+
 func TestIncludePatternMatches(t *testing.T) {
 	body := `Plain text.
 
