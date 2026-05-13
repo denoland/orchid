@@ -9,8 +9,8 @@ orchestrator {
   branch_prefix = "orch/issue-"
   workdir_root  = "/home/orchid/orch-work"
   http_addr     = ":8000"
+  http_secret   = "123"
   bot_login     = "divybot"
-  bot_email     = "divybot@users.noreply.github.com"
   ntfy_topic    = "orchid-divy-7f3k9"
 }
 
@@ -89,9 +89,6 @@ EOT
 #   host = "divybot1.exe.xyz"
 #   user = "exedev"
 #   key  = "~/.ssh/id_ed25519"
-#   # Per-VM identity override; falls back to orchestrator.bot_login/bot_email if unset.
-#   # bot_login = "divybot1"
-#   # bot_email = "divybot1@users.noreply.github.com"
 # }
 
 # vm "divybot2" {
@@ -114,7 +111,12 @@ EOT
 
 vm "local" {
   host        = "localhost"
-  capacity    = 20
+  capacity    = 30
   session_cmd  = "runuser -u orchid -- env GIT_AUTHOR_NAME=divybot GIT_AUTHOR_EMAIL=divybot@users.noreply.github.com GIT_COMMITTER_NAME=divybot GIT_COMMITTER_EMAIL=divybot@users.noreply.github.com clawpatrol run -- claude --dangerously-skip-permissions"
   session_home = "/home/orchid"
+}
+
+target "deno_core" {
+  label = "deno_core"
+  repo  = "denoland/deno_core"
 }
