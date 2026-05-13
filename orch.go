@@ -1488,6 +1488,45 @@ type apiStateResp struct {
 	Inbox string        `json:"inbox"`
 }
 
+func wsReadFrame(r io.Reader) (opcode byte, payload []byte, err error) {
+	hdr := make([]byte, 2)
+	if _, err = io.ReadFull(r, hdr); err != nil {
+		return
+	}
+	opcode = hdr[0] & 0x0f
+	masked := hdr[1]&0x80 != 0
+	n := int(hdr[1] & 0x7f)
+	if n == 126 {
+		ext := make([]byte, 2)
+		if _, err = io.ReadFull(r, ext); err != nil {
+			return
+		}
+		n = int(ext[0])<<8 | int(ext[1])
+	} else if n == 127 {
+		ext := make([]byte, 8)
+		if _, err = io.ReadFull(r, ext); err != nil {
+			return
+		}
+		n = int(ext[4])<<24 | int(ext[5])<<16 | int(ext[6])<<8 | int(ext[7])
+	}
+	var mask [4]byte
+	if masked {
+		if _, err = io.ReadFull(r, mask[:]); err != nil {
+			return
+		}
+	}
+	payload = make([]byte, n)
+	if _, err = io.ReadFull(r, payload); err != nil {
+		return
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= mask[i%4]
+		}
+	}
+	return
+}
+
 func wsWriteFrame(w io.Writer, opcode byte, payload []byte) error {
 	n := len(payload)
 	hdr := make([]byte, 2, 10)
@@ -1770,21 +1809,39 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			return
 		}
 
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				_, payload, err := wsReadFrame(conn)
+				if err != nil || len(payload) == 0 {
+					return
+				}
+				b64 := base64.StdEncoding.EncodeToString(payload)
+				sshExec(*vm, fmt.Sprintf("echo %s | base64 -d | tmux load-buffer -b orch-in - && tmux paste-buffer -b orch-in -t %s -d", b64, session))
+			}
+		}()
+
 		ticker := time.NewTicker(300 * time.Millisecond)
 		defer ticker.Stop()
 		var last string
-		for range ticker.C {
-			out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -e -S -200 2>&1", session))
-			if err != nil {
-				break
-			}
-			if out == last {
-				continue
-			}
-			last = out
-			conn.(net.Conn).SetWriteDeadline(time.Now().Add(5 * time.Second)) //nolint
-			if err := wsWriteFrame(conn, 0x02, []byte(out)); err != nil {
-				break
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -e -S -200 2>&1", session))
+				if err != nil {
+					return
+				}
+				if out == last {
+					continue
+				}
+				last = out
+				conn.(net.Conn).SetWriteDeadline(time.Now().Add(5 * time.Second)) //nolint
+				if err := wsWriteFrame(conn, 0x02, []byte(out)); err != nil {
+					return
+				}
 			}
 		}
 	}))

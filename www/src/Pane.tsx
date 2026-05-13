@@ -95,6 +95,12 @@ export function Pane({ session }: Props) {
       }
     }
 
+    term.onData((data) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(data)
+      }
+    })
+
     connect()
 
     const onResize = () => fit.fit()
