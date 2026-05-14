@@ -17,7 +17,6 @@ function parseRoute(): Route {
 export default function App() {
   const [route, setRoute] = useState<Route>(parseRoute)
   const [state, setState] = useState<State>({ jobs: [], vms: [], inbox: '' })
-  const [tick, setTick] = useState(3)
 
   useEffect(() => {
     const onHash = () => setRoute(parseRoute())
@@ -41,18 +40,11 @@ export default function App() {
     }
 
     poll()
-    const pollInterval = setInterval(poll, 3000)
-
-    // countdown tick
-    setTick(3)
-    const tickInterval = setInterval(() => {
-      setTick((t) => (t <= 1 ? 3 : t - 1))
-    }, 1000)
+    const pollInterval = setInterval(poll, 1000)
 
     return () => {
       cancelled = true
       clearInterval(pollInterval)
-      clearInterval(tickInterval)
     }
   }, [])
 
@@ -60,5 +52,5 @@ export default function App() {
     return <Pane session={route.session} />
   }
 
-  return <Dashboard state={state} tick={tick} />
+  return <Dashboard state={state} />
 }

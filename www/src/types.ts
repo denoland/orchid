@@ -11,6 +11,7 @@ export interface Job {
   pr: number
   next_fire_at: string
   last_check_conclusions: Record<string, string>
+  activity?: number[]
 }
 
 export interface VM {
