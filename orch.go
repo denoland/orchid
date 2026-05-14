@@ -94,12 +94,15 @@ type Job struct {
 	SeenIssueCommentIDs  []string          `json:"seen_issue_comment_ids,omitempty"`
 	LastHeadOID          string            `json:"last_head_oid,omitempty"`
 	LastCheckConclusions map[string]string `json:"last_check_conclusions,omitempty"`
+	LastMergeState       string            `json:"last_merge_state,omitempty"`
+	Activity             []int             `json:"activity,omitempty"`
 }
 
 type State struct {
-	mu       sync.Mutex
-	Jobs     map[int]*Job `json:"jobs"`
-	httpSnap atomic.Value // stores map[int]Job; refreshed at tick start, lock-free reads
+	mu         sync.Mutex
+	Jobs       map[int]*Job `json:"jobs"`
+	paneLines  map[int]int  // last pane line count per issue, not persisted
+	httpSnap   atomic.Value // stores map[int]Job; refreshed at tick start, lock-free reads
 }
 
 // retry wraps an exec.Command-style call with bounded retries on non-zero
@@ -451,8 +454,9 @@ func ghAutoCreatePR(cfg *Config, n int, j *Job, is Issue) (int, error) {
 }
 
 type PRView struct {
-	State      string `json:"state"`
-	HeadRefOid string `json:"headRefOid"`
+	State            string `json:"state"`
+	HeadRefOid       string `json:"headRefOid"`
+	MergeStateStatus string `json:"mergeStateStatus"`
 	Reviews    []struct {
 		ID     string                 `json:"id"`
 		Author struct{ Login string } `json:"author"`
@@ -483,7 +487,7 @@ type PRView struct {
 func ghPRView(repo string, n int) (*PRView, error) {
 	out, errStr, err := run("gh", "pr", "view", fmt.Sprint(n),
 		"--repo", repo,
-		"--json", "state,headRefOid,reviews,comments,statusCheckRollup")
+		"--json", "state,headRefOid,mergeStateStatus,reviews,comments,statusCheckRollup")
 	if err != nil {
 		return nil, fmt.Errorf("gh pr view: %v: %s", err, errStr)
 	}
@@ -861,7 +865,7 @@ func renderBootstrap(tmpl string, is Issue, branch, targetName, targetRepo, inbo
 func loadState(path string) (*State, error) {
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return &State{Jobs: map[int]*Job{}}, nil
+		return &State{Jobs: map[int]*Job{}, paneLines: map[int]int{}}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -873,6 +877,7 @@ func loadState(path string) (*State, error) {
 	if s.Jobs == nil {
 		s.Jobs = map[int]*Job{}
 	}
+	s.paneLines = map[int]int{}
 	return &s, nil
 }
 
@@ -1281,6 +1286,44 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 	j.FireStartedAt = fireDoneAt
 	_ = saveState(cfg.Orch.StateFile, st)
 }
+// sampleActivity polls each live session's tmux scrollback size and appends
+// a delta to the job's Activity ring buffer. Runs on a fast ticker (5s)
+// independent of the main tick to keep sparklines responsive.
+func sampleActivity(cfg *Config, st *State) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for n, j := range st.Jobs {
+		if j.Tmux == "" {
+			continue
+		}
+		vm := vmByName(cfg, j.VM)
+		if vm == nil {
+			continue
+		}
+		out, _, err := sshExec(*vm, fmt.Sprintf("tmux display-message -p -t %s '#{history_size}'", j.Tmux))
+		if err != nil {
+			continue
+		}
+		size, _ := strconv.Atoi(strings.TrimSpace(out))
+		prev := st.paneLines[n]
+		delta := size - prev
+		if delta < 0 {
+			delta = 0
+		}
+		st.paneLines[n] = size
+		j.Activity = append(j.Activity, delta)
+		if len(j.Activity) > 30 {
+			j.Activity = j.Activity[len(j.Activity)-30:]
+		}
+	}
+	// Refresh the lock-free snapshot so /api/state serves fresh activity data.
+	snap := make(map[int]Job, len(st.Jobs))
+	for n, j := range st.Jobs {
+		snap[n] = *j
+	}
+	st.httpSnap.Store(snap)
+}
+
 func tick(cfg *Config, st *State) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -1472,25 +1515,32 @@ func tick(cfg *Config, st *State) {
 			_ = saveState(cfg.Orch.StateFile, st)
 			continue
 		}
-		nr, ntc, nic, pushed, checks := diffPR(j, v)
-		if len(nr) == 0 && len(ntc) == 0 && len(nic) == 0 && !pushed && len(checks) == 0 {
-			j.LastHeadOID = v.HeadRefOid
-			continue
+		nr, ntc, nic, _, checks := diffPR(j, v)
+		mergeConflict := v.MergeStateStatus == "DIRTY" && j.LastMergeState != "DIRTY"
+		j.LastMergeState = v.MergeStateStatus
+
+		// Classify which new reviews are actionable (need session work) vs. informational.
+		var actionableReviews []string
+		for _, id := range nr {
+			for _, r := range v.Reviews {
+				if r.ID == id && r.State == "CHANGES_REQUESTED" {
+					actionableReviews = append(actionableReviews, id)
+				}
+			}
 		}
-		idle, err := tmuxIdle(*vm, j.Tmux)
-		if err != nil {
-			log.Printf("issue #%d: idle check failed: %v", n, err)
-			continue
+
+		// Classify which CI changes are failures vs. passes.
+		var failChecks, passChecks []string
+		for _, c := range checks {
+			if strings.Contains(strings.ToUpper(c), "FAILURE") {
+				failChecks = append(failChecks, c)
+			} else {
+				passChecks = append(passChecks, c)
+			}
 		}
-		if !idle {
-			log.Printf("issue #%d: pane busy, deferring poke", n)
-			continue
-		}
-		msg := summarize(v, nr, ntc, nic, pushed, checks)
-		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
-			log.Printf("issue #%d: poke failed: %v", n, err)
-			continue
-		}
+
+		// Always record seen IDs and CI results so non-actionable events
+		// (APPROVED, CI green) don't re-fire on the next tick.
 		j.SeenReviewIDs = append(j.SeenReviewIDs, nr...)
 		j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, ntc...)
 		j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, nic...)
@@ -1503,8 +1553,37 @@ func tick(cfg *Config, st *State) {
 				j.LastCheckConclusions[c.Name] = c.Conclusion
 			}
 		}
+
+		// Only poke the session when there's actual work: CI failure,
+		// CHANGES_REQUESTED review, inline review comments, or merge conflict.
+		if len(failChecks) == 0 && len(actionableReviews) == 0 && len(ntc) == 0 && len(nic) == 0 && !mergeConflict {
+			_ = saveState(cfg.Orch.StateFile, st)
+			if len(passChecks) > 0 {
+				log.Printf("issue #%d: CI green, skipping poke", n)
+			}
+			continue
+		}
+		idle, err := tmuxIdle(*vm, j.Tmux)
+		if err != nil {
+			log.Printf("issue #%d: idle check failed: %v", n, err)
+			continue
+		}
+		if !idle {
+			log.Printf("issue #%d: pane busy, deferring poke", n)
+			continue
+		}
+		// Summarize only the actionable parts for the session.
+		msg := summarize(v, actionableReviews, ntc, nic, false, failChecks)
+		if mergeConflict {
+			msg += "\n- PR has a merge conflict — rebase onto the target branch."
+		}
+		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
+			log.Printf("issue #%d: poke failed: %v", n, err)
+			continue
+		}
 		_ = saveState(cfg.Orch.StateFile, st)
-		log.Printf("issue #%d: poked PR #%d", n, j.PR)
+		log.Printf("issue #%d: poked PR #%d (CI failures: %d, reviews: %d, comments: %d, conflict: %v)",
+			n, j.PR, len(failChecks), len(actionableReviews), len(ntc)+len(nic), mergeConflict)
 	}
 }
 
@@ -1967,6 +2046,8 @@ func main() {
 
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	at := time.NewTicker(5 * time.Second)
+	defer at.Stop()
 	tick(&cfg, st)
 	for {
 		select {
@@ -1975,6 +2056,8 @@ func main() {
 			return
 		case <-t.C:
 			tick(&cfg, st)
+		case <-at.C:
+			sampleActivity(&cfg, st)
 		}
 	}
 }
