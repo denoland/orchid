@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { State, Job } from './types'
 
 interface Props {
@@ -200,8 +201,31 @@ function FreeRow() {
   )
 }
 
+function OperatorButton({ session }: { session: string }) {
+  const [spawning, setSpawning] = useState(false)
+  if (session) {
+    return (
+      <a href={`#/pane/${encodeURIComponent(session)}`}
+        className="text-[11px] font-mono text-[#525252] hover:text-[#171717] border border-[#e5e5e5] rounded px-2 py-0.5 transition-colors">
+        operator ↗
+      </a>
+    )
+  }
+  const spawn = async () => {
+    setSpawning(true)
+    await fetch('/api/operator', { method: 'POST' }).catch(() => {})
+    setTimeout(() => setSpawning(false), 8000)
+  }
+  return (
+    <button onClick={spawn} disabled={spawning}
+      className="text-[11px] font-mono text-[#a3a3a3] hover:text-[#525252] border border-dashed border-[#e5e5e5] rounded px-2 py-0.5 transition-colors disabled:opacity-50">
+      {spawning ? 'spawning…' : 'operator offline'}
+    </button>
+  )
+}
+
 export function Dashboard({ state }: Props) {
-  const { jobs = [], vms = [], inbox = '' } = state
+  const { jobs = [], vms = [], inbox = '', operator = '' } = state
 
   const rows: Array<{ type: 'job'; job: Job } | { type: 'free' }> = []
 
@@ -230,19 +254,24 @@ export function Dashboard({ state }: Props) {
 
   return (
     <div className="min-h-screen bg-white px-4 sm:px-6 pt-4 sm:pt-6 pb-8">
-      <div className="mb-5 sm:mb-6">
-        <h1 className="font-mono text-[26px] sm:text-[28px] font-bold text-[#171717] tracking-tight leading-none mb-1">
-          orchid
-        </h1>
-        <div className="text-[12px] text-[#a3a3a3] flex items-center gap-2 flex-wrap">
-          {cap > 0 && <span>{busy}/{cap} active</span>}
-          {cap > 0 && inbox && <span>·</span>}
-          {inbox && (
-            <a href={`https://github.com/${inbox}/issues`} target="_blank" rel="noopener noreferrer"
-              className="hover:text-[#404040] transition-colors">
-              {inbox}
-            </a>
-          )}
+      <div className="mb-5 sm:mb-6 flex items-start justify-between gap-4">
+        <div>
+          <h1 className="font-mono text-[26px] sm:text-[28px] font-bold text-[#171717] tracking-tight leading-none mb-1">
+            orchid
+          </h1>
+          <div className="text-[12px] text-[#a3a3a3] flex items-center gap-2 flex-wrap">
+            {cap > 0 && <span>{busy}/{cap} active</span>}
+            {cap > 0 && inbox && <span>·</span>}
+            {inbox && (
+              <a href={`https://github.com/${inbox}/issues`} target="_blank" rel="noopener noreferrer"
+                className="hover:text-[#404040] transition-colors">
+                {inbox}
+              </a>
+            )}
+          </div>
+        </div>
+        <div className="mt-1 flex-shrink-0">
+          <OperatorButton session={operator} />
         </div>
       </div>
 

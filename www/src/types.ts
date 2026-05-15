@@ -25,4 +25,5 @@ export interface State {
   jobs: Job[]
   vms: VM[]
   inbox: string
+  operator: string // tmux session name if alive, "" if dead
 }
