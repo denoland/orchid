@@ -1102,8 +1102,8 @@ func pruneOrphanWorkdirs(cfg *Config, st *State) {
 			if err != nil {
 				continue
 			}
-			if vmName, ok := active[n]; ok && vmName == vm.Name {
-				continue // still active on this VM
+			if _, ok := active[n]; ok {
+				continue // still active (any VM — co-located VMs share filesystem)
 			}
 			log.Printf("pruning orphan workdir %s on %s", line, vm.Name)
 			pruneWorkdir(vm, root, n)
