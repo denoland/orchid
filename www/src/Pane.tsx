@@ -31,13 +31,13 @@ const XTERM_THEME = {
   brightWhite: '#1a1a1a',
 }
 
+const POLL_MS = 1500
+
 export function Pane({ session }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
-  const wsRef = useRef<WebSocket | null>(null)
-  const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const [status, setStatus] = useState<'connecting' | 'connected' | 'reconnecting'>('connecting')
+  const [status, setStatus] = useState<'connecting' | 'connected' | 'error'>('connecting')
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -60,59 +60,38 @@ export function Pane({ session }: Props) {
     termRef.current = term
     fitRef.current = fit
 
-    function connect() {
-      if (wsRef.current) {
-        wsRef.current.onclose = null
-        wsRef.current.onerror = null
-        wsRef.current.close()
+    let cancelled = false
+    let last = ''
+
+    async function poll() {
+      try {
+        const res = await fetch(`/api/pane?s=${encodeURIComponent(session)}`)
+        if (!res.ok) { setStatus('error'); return }
+        const body = await res.text()
+        if (cancelled) return
+        if (body !== last) {
+          term.clear()
+          term.write(body)
+          last = body
+        }
+        setStatus('connected')
+      } catch {
+        if (!cancelled) setStatus('error')
       }
-
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const host = window.location.host
-      const ws = new WebSocket(`${proto}//${host}/ws?s=${encodeURIComponent(session)}`)
-      ws.binaryType = 'arraybuffer'
-      wsRef.current = ws
-
-      ws.onopen = () => setStatus('connected')
-
-      ws.onmessage = (ev) => {
-        const data =
-          ev.data instanceof ArrayBuffer
-            ? new Uint8Array(ev.data)
-            : ev.data
-        term.write(data)
-      }
-
-      ws.onclose = () => {
-        setStatus('reconnecting')
-        retryRef.current = setTimeout(connect, 1500)
-      }
-
-      ws.onerror = () => ws.close()
     }
 
-    term.onData((data) => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(data)
-      }
-    })
-
-    connect()
+    poll()
+    const interval = setInterval(poll, POLL_MS)
 
     const doFit = () => { fitRef.current?.fit() }
     window.addEventListener('resize', doFit)
-    // handle virtual keyboard on mobile
     window.visualViewport?.addEventListener('resize', doFit)
 
     return () => {
+      cancelled = true
+      clearInterval(interval)
       window.removeEventListener('resize', doFit)
       window.visualViewport?.removeEventListener('resize', doFit)
-      if (retryRef.current) clearTimeout(retryRef.current)
-      if (wsRef.current) {
-        wsRef.current.onclose = null
-        wsRef.current.onerror = null
-        wsRef.current.close()
-      }
       term.dispose()
       termRef.current = null
       fitRef.current = null
@@ -130,7 +109,7 @@ export function Pane({ session }: Props) {
         </a>
         <span className="text-[11px] text-[#a3a3a3] flex items-center gap-1.5 min-w-0 overflow-hidden">
           <code className="text-[#525252] font-mono truncate">{session}</code>
-          {status === 'reconnecting' && <span className="text-[#dc2626] flex-shrink-0">reconnecting…</span>}
+          {status === 'error' && <span className="text-[#dc2626] flex-shrink-0">disconnected</span>}
           {status === 'connecting' && <span className="text-[#d97706] flex-shrink-0">connecting…</span>}
         </span>
       </div>

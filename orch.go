@@ -3,16 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -49,15 +46,32 @@ type TargetBlock struct {
 }
 
 type OrchBlock struct {
-	PollInterval string `hcl:"poll_interval"`
-	StateFile    string `hcl:"state_file"`
-	BranchPrefix string `hcl:"branch_prefix"`
-	WorkdirRoot  string `hcl:"workdir_root"`
-	HTTPAddr     string `hcl:"http_addr,optional"`
-	HTTPSecret   string `hcl:"http_secret,optional"` // bearer token for dashboard; empty = no auth
-	BotLogin     string `hcl:"bot_login,optional"`   // default git user.name; per-VM override available
-	BotEmail     string `hcl:"bot_email,optional"`   // default git user.email; falls back to <bot_login>@users.noreply.github.com
-	NtfyTopic    string `hcl:"ntfy_topic,optional"`
+	PollInterval string         `hcl:"poll_interval"`
+	StateFile    string         `hcl:"state_file"`
+	BranchPrefix string         `hcl:"branch_prefix"`
+	WorkdirRoot  string         `hcl:"workdir_root"`
+	HTTPAddr     string         `hcl:"http_addr,optional"`
+	HTTPSecret   string         `hcl:"http_secret,optional"` // bearer token for dashboard; empty = no auth
+	BotLogin     string         `hcl:"bot_login,optional"`   // default git user.name; per-VM override available
+	BotEmail     string         `hcl:"bot_email,optional"`   // default git user.email; falls back to <bot_login>@users.noreply.github.com
+	NtfyTopic    string         `hcl:"ntfy_topic,optional"`
+	Mentions     *MentionsBlock `hcl:"mentions,block"` // optional mention-watcher
+}
+
+// MentionsBlock configures the cross-repo mention watcher. When set, orch
+// polls the configured org's repos for @-mentions of any bot account
+// (gathered from VM bot_login fields), classifies the mentioner as
+// org-member or external (using a periodically refreshed cache), and
+// dispatches: (a) mention on a tracked PR → poke that session; (b) member
+// mention → open inbox issue with LLM-summarized title + ack on source;
+// (c) external mention → canned reply on source.
+type MentionsBlock struct {
+	PollInterval   string   `hcl:"poll_interval,optional"`   // mention polling cadence; default 5m
+	Org            string   `hcl:"org"`                      // GitHub org used for membership classification (e.g. "denoland")
+	MaintainerTTL  string   `hcl:"maintainer_ttl,optional"`  // how often to refresh the cached member list; default 1h
+	Acknowledge    bool     `hcl:"acknowledge,optional"`     // if true, add a 👀 reaction to the mentioning comment after opening an inbox issue (GitHub auto-creates the "mentioned in" backlink, so a separate ack comment isn't needed)
+	HumanOverrides []string `hcl:"human_overrides,optional"` // logins to force-treat as humans even if they match the bot heuristic
+	LLMCommand     []string `hcl:"llm_command,optional"`     // command for the actionable-mention LLM gate; default ["claude", "-p"]; e.g. ["codex", "exec"] to keep claude budget for workers
 }
 
 type VMBlock struct {
@@ -72,6 +86,9 @@ type VMBlock struct {
 	SessionHome string `hcl:"session_home,optional"` // home dir of user running the session (for trust stamp)
 	BotLogin    string `hcl:"bot_login,optional"`    // overrides orchestrator.bot_login for sessions on this VM
 	BotEmail    string `hcl:"bot_email,optional"`    // overrides orchestrator.bot_email for sessions on this VM
+	Agent       string `hcl:"agent,optional"`        // "claude" (default) or "codex" — drives idle marker, resume cmd, trust setup
+	IdleMarker  string `hcl:"idle_marker,optional"`  // optional override of the agent default idle pane substring
+	BusyMarker  string `hcl:"busy_marker,optional"`  // optional override of the agent default busy pane substring
 }
 
 // Job lifecycle: "oneshot" (default) — issue → session → PR → teardown.
@@ -82,27 +99,46 @@ type Job struct {
 	Target               string            `json:"target"`      // target block name
 	TargetRepo           string            `json:"target_repo"` // resolved (e.g. denoland/deno)
 	Branch               string            `json:"branch"`
+	IssueTitle           string            `json:"issue_title,omitempty"` // mirrored from inbox issue; refreshed each poll
 	Lifecycle            string            `json:"lifecycle,omitempty"`       // "oneshot" (default) or "cron"
 	Schedule             string            `json:"schedule,omitempty"`        // cron only: parseable by time.ParseDuration
 	Timeout              string            `json:"timeout,omitempty"`         // cron only: max runtime per tick before orch kills the pane
 	NextFireAt           time.Time         `json:"next_fire_at,omitempty"`    // cron only: when to spawn the next ephemeral tick
 	FireStartedAt        time.Time         `json:"fire_started_at,omitempty"` // cron only: when the current tick started (used to enforce Timeout)
-	IssueTitle           string            `json:"issue_title,omitempty"`
 	PR                   int               `json:"pr,omitempty"`
 	SeenReviewIDs        []string          `json:"seen_review_ids,omitempty"`
 	SeenThreadCommentIDs []string          `json:"seen_thread_comment_ids,omitempty"`
 	SeenIssueCommentIDs  []string          `json:"seen_issue_comment_ids,omitempty"`
 	LastHeadOID          string            `json:"last_head_oid,omitempty"`
 	LastCheckConclusions map[string]string `json:"last_check_conclusions,omitempty"`
-	LastMergeState       string            `json:"last_merge_state,omitempty"`
-	Activity             []int             `json:"activity,omitempty"`
 }
 
 type State struct {
-	mu         sync.Mutex
-	Jobs       map[int]*Job `json:"jobs"`
-	paneLines  map[int]int  // last pane line count per issue, not persisted
-	httpSnap   atomic.Value // stores map[int]Job; refreshed at tick start, lock-free reads
+	mu            sync.Mutex
+	Jobs          map[int]*Job     `json:"jobs"`
+	MentionCursor *time.Time       `json:"mention_cursor,omitempty"` // last "updated" timestamp seen by the mention poller
+	Maintainers   *MaintainerCache `json:"maintainers,omitempty"`    // cached org member list
+	httpSnap      atomic.Value     // stores map[int]Job; refreshed at tick start, lock-free reads
+}
+
+// MaintainerCache caches the configured org's member logins. Refreshed
+// lazily by the mention poller when older than MentionsBlock.MaintainerTTL.
+type MaintainerCache struct {
+	FetchedAt time.Time `json:"fetched_at"`
+	Members   []string  `json:"members"`
+}
+
+// has returns true if login is in the cached member list.
+func (c *MaintainerCache) has(login string) bool {
+	if c == nil {
+		return false
+	}
+	for _, m := range c.Members {
+		if m == login {
+			return true
+		}
+	}
+	return false
 }
 
 // retry wraps an exec.Command-style call with bounded retries on non-zero
@@ -112,10 +148,12 @@ type State struct {
 const runAttempts = 4
 
 // maxKillsPerTick caps how many dead-session respawns the polling loop will
-// fire in a single tick. Raised from 2 to 5 after removing the clawpatrol WG
-// relay dependency (the original cap was to avoid overwhelming the relay with
-// simultaneous peer registrations).
-const maxKillsPerTick = 5
+// fire in a single tick. Each respawn registers a fresh peer on the clawpatrol
+// WG relay; firing several together overwhelms the relay and the new sessions
+// die within minutes (denoland/clawpatrol#306). Two-per-tick keeps respawns
+// spaced by the poll interval, so a herd of 5–6 simultaneous deaths is paid
+// back over several ticks instead of all at once.
+const maxKillsPerTick = 2
 
 // killBudget tracks dead-session respawns issued so far this tick. Use
 // tryUse to attempt a kill; it returns false once the per-tick cap is hit.
@@ -132,22 +170,29 @@ func (b *killBudget) tryUse() bool {
 	return true
 }
 
+// orchBootTime is captured at process start. The mention poller never
+// looks at mentions older than this — even if state.MentionCursor
+// somehow points further back (long downtime, hand-edited state file,
+// etc.), so a restart never replays accumulated upstream mentions.
+// Missing a mention is acceptable; dispatching the same mention twice
+// is not.
+var orchBootTime = time.Now()
+
 func run(name string, args ...string) (string, string, error) {
-	return runWithStdin(nil, name, args...)
+	return runIn("", name, args...)
 }
 
+// runIn execs name+args with optional string stdin, retrying transient
+// failures (clawpatrol MITM blips, ssh exit 255) with exponential backoff.
+// Pass "" for no stdin. Each retry creates a fresh strings.Reader so the
+// stdin replays cleanly.
 func runIn(stdin string, name string, args ...string) (string, string, error) {
-	return runWithStdin(strings.NewReader(stdin), name, args...)
-}
-
-func runWithStdin(stdin *strings.Reader, name string, args ...string) (string, string, error) {
 	var lastOut, lastErr string
 	var lastE error
 	for i := 0; i < runAttempts; i++ {
 		cmd := exec.Command(name, args...)
-		if stdin != nil {
-			_, _ = stdin.Seek(0, 0)
-			cmd.Stdin = stdin
+		if stdin != "" {
+			cmd.Stdin = strings.NewReader(stdin)
 		}
 		var o, e bytes.Buffer
 		cmd.Stdout = &o
@@ -243,10 +288,16 @@ type Issue struct {
 	Labels []string `json:"labels"`
 }
 
+// ghIssueList returns open issues in repo. If label is non-empty, restricts
+// to that label; if empty, returns every open issue (used by tick to fetch
+// the full inbox in one call instead of one-call-per-target).
 func ghIssueList(repo, label string) ([]Issue, error) {
-	out, errStr, err := run("gh", "issue", "list",
-		"--repo", repo, "--label", label, "--state", "open",
-		"--limit", "200", "--json", "number,title,body,state,labels")
+	args := []string{"issue", "list", "--repo", repo, "--state", "open",
+		"--limit", "200", "--json", "number,title,body,state,labels"}
+	if label != "" {
+		args = append(args, "--label", label)
+	}
+	out, errStr, err := run("gh", args...)
 	if err != nil {
 		return nil, fmt.Errorf("gh issue list: %v: %s", err, errStr)
 	}
@@ -355,19 +406,6 @@ func parseCronFrontmatter(body string) *CronConfig {
 	return cfg
 }
 
-func ghIssueIsOpen(repo string, n int) (bool, error) {
-	out, errStr, err := run("gh", "issue", "view", fmt.Sprint(n),
-		"--repo", repo, "--json", "state")
-	if err != nil {
-		return false, fmt.Errorf("gh issue view: %v: %s", err, errStr)
-	}
-	var s struct{ State string }
-	if err := json.Unmarshal([]byte(out), &s); err != nil {
-		return false, err
-	}
-	return s.State == "OPEN", nil
-}
-
 type PRSummary struct {
 	Number int    `json:"number"`
 	State  string `json:"state"`
@@ -454,9 +492,8 @@ func ghAutoCreatePR(cfg *Config, n int, j *Job, is Issue) (int, error) {
 }
 
 type PRView struct {
-	State            string `json:"state"`
-	HeadRefOid       string `json:"headRefOid"`
-	MergeStateStatus string `json:"mergeStateStatus"`
+	State      string `json:"state"`
+	HeadRefOid string `json:"headRefOid"`
 	Reviews    []struct {
 		ID     string                 `json:"id"`
 		Author struct{ Login string } `json:"author"`
@@ -478,16 +515,17 @@ type PRView struct {
 		Body   string                 `json:"body"`
 	} `json:"comments"`
 	StatusCheckRollup []struct {
-		Name       string `json:"name"`
-		Status     string `json:"status"`
-		Conclusion string `json:"conclusion"`
+		Name        string `json:"name"`
+		Status      string `json:"status"`
+		Conclusion  string `json:"conclusion"`
+		CompletedAt string `json:"completedAt"` // RFC3339; latest run per name wins
 	} `json:"statusCheckRollup"`
 }
 
 func ghPRView(repo string, n int) (*PRView, error) {
 	out, errStr, err := run("gh", "pr", "view", fmt.Sprint(n),
 		"--repo", repo,
-		"--json", "state,headRefOid,mergeStateStatus,reviews,comments,statusCheckRollup")
+		"--json", "state,headRefOid,reviews,comments,statusCheckRollup")
 	if err != nil {
 		return nil, fmt.Errorf("gh pr view: %v: %s", err, errStr)
 	}
@@ -614,6 +652,7 @@ func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, sessionCmd
 	// from the orch process (e.g. via runuser). When unset, the bootstrap
 	// script just stamps $HOME and skips the second stamp.
 	sessionHome := vm.SessionHome
+	agent := vmAgent(vm).name
 	script := fmt.Sprintf(`set -e
 SHARED=%q
 REPO=%q
@@ -624,6 +663,7 @@ SESSION_CMD=%q
 SESSION_HOME=%q
 BOT_LOGIN=%q
 BOT_EMAIL=%q
+AGENT=%q
 
 # 1) shared clone (once per repo per VM); always fetch fresh refs
 if [ ! -d "$SHARED/.git" ]; then
@@ -655,25 +695,29 @@ if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ]; then
   chown -R "$SESSION_USER:$SESSION_USER" "$WORKDIR" "$SHARED" 2>/dev/null || true
 fi
 
-# 4) pre-stamp claude's per-folder trust flag so the TUI doesn't prompt.
-# Stamp $HOME (the user running this script) and SESSION_HOME if it's set
-# to something different (i.e. session runs as another user via runuser).
-stamp_trust() {
-  local CHOME="$1"
-  [ -z "$CHOME" ] && return
-  local CJSON="$CHOME/.claude.json"
-  [ -f "$CJSON" ] || echo '{}' > "$CJSON"
-  jq --arg d "$WORKDIR" '.projects[$d].hasTrustDialogAccepted = true' "$CJSON" > "$CJSON.tmp" && mv "$CJSON.tmp" "$CJSON"
-}
-stamp_trust "$HOME"
-if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ] && [ "$SESSION_HOME" != "$HOME" ]; then
-  stamp_trust "$SESSION_HOME"
+# 4) agent-specific pre-warm. Claude needs its per-folder trust dialog
+# pre-stamped so the TUI does not prompt; codex stores trust in ~/.codex/
+# and is operator-onboarded via the codex login subcommand once per VM,
+# no per-folder stamping. Stamp $HOME (the user running this script) and
+# SESSION_HOME if set to a different user.
+if [ "$AGENT" = "claude" ]; then
+  stamp_trust() {
+    local CHOME="$1"
+    [ -z "$CHOME" ] && return
+    local CJSON="$CHOME/.claude.json"
+    [ -f "$CJSON" ] || echo '{}' > "$CJSON"
+    jq --arg d "$WORKDIR" '.projects[$d].hasTrustDialogAccepted = true' "$CJSON" > "$CJSON.tmp" && mv "$CJSON.tmp" "$CJSON"
+  }
+  stamp_trust "$HOME"
+  if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ] && [ "$SESSION_HOME" != "$HOME" ]; then
+    stamp_trust "$SESSION_HOME"
+  fi
 fi
 
 # 5) launch the pane
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -c "$WORKDIR" -s "$SESSION" "$SESSION_CMD"
-`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome, botLogin, botEmail)
+`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome, botLogin, botEmail, agent)
 
 	_, errStr, err := sshExecIn(vm, script, "bash -s")
 	if err != nil {
@@ -686,39 +730,66 @@ func tmuxKill(vm VMBlock, session string) {
 	_, _, _ = sshExec(vm, fmt.Sprintf("tmux kill-session -t %s 2>/dev/null", session))
 }
 
-// tmuxIdle is a heuristic for "claude TUI is at its input prompt and not
-// processing". The status bar "bypass permissions" line is always rendered
-// once the TUI is up; "esc to interrupt" is appended only while claude is
-// working. False negatives just defer the poke by one tick — safe.
+// tmuxIdle returns whether the agent TUI is at its input prompt AND, if it
+// can tell, which agent is actually running in the pane. The detected name
+// is independent of vm.Agent — it reads from the pane content — so it can
+// be used to detect rename-worthy drift (a session started under one agent
+// before the VM was switched to another).
 //
-// We capture the entire visible pane (not `tail -N`) because claude's welcome
-// screen leaves trailing blank rows below the footer; a small tail window
-// would miss the "bypass permissions" line and falsely report not-idle.
-func tmuxIdle(vm VMBlock, session string) (bool, error) {
-	out, _, err := sshExec(vm, fmt.Sprintf("tmux capture-pane -p -t %s", session))
-	if err != nil {
-		return false, err
+// detected can be "" if the pane content matches no known agent marker
+// (transient state during startup, or unknown agent).
+//
+// We capture the entire visible pane (not `tail -N`) because some agents'
+// welcome screens leave trailing blank rows below the footer; a small tail
+// window would miss the marker and falsely report not-idle.
+func tmuxIdle(vm VMBlock, session string) (idle bool, detected string, err error) {
+	out, _, e := sshExec(vm, fmt.Sprintf("tmux capture-pane -p -t %s", session))
+	if e != nil {
+		return false, "", e
 	}
-	if !strings.Contains(out, "bypass permissions") {
-		return false, nil
+	detected = detectAgentFromPane(out)
+	spec := vmAgent(vm)
+	if !strings.Contains(out, spec.idleMarker) {
+		return false, detected, nil
 	}
-	return !strings.Contains(out, "esc to interrupt"), nil
+	if spec.busyMarker != "" && strings.Contains(out, spec.busyMarker) {
+		return false, detected, nil
+	}
+	return true, detected, nil
+}
+
+// detectAgentFromPane reads the pane content and returns the agent name
+// that's actually running in the pane (claude or codex), or "" if no
+// known marker matches. Independent of vm.Agent config.
+func detectAgentFromPane(pane string) string {
+	switch {
+	case strings.Contains(pane, "gpt-"):
+		return "codex"
+	case strings.Contains(pane, "bypass permissions"):
+		return "claude"
+	}
+	return ""
 }
 
 func tmuxPaste(vm VMBlock, session, msg string) error {
 	if _, errStr, err := sshExecIn(vm, msg, "tmux load-buffer -b orch -"); err != nil {
 		return fmt.Errorf("load-buffer: %v: %s", err, errStr)
 	}
-	if _, errStr, err := sshExec(vm, fmt.Sprintf("tmux paste-buffer -b orch -t %s -d", session)); err != nil {
-		return fmt.Errorf("paste-buffer: %v: %s", err, errStr)
-	}
-	if _, errStr, err := sshExec(vm, fmt.Sprintf("tmux send-keys -t %s Enter", session)); err != nil {
-		return fmt.Errorf("send-keys: %v: %s", err, errStr)
+	cmd := fmt.Sprintf("tmux paste-buffer -b orch -t %s -d && sleep 0.3 && tmux send-keys -t %s Enter", session, session)
+	if _, errStr, err := sshExec(vm, cmd); err != nil {
+		return fmt.Errorf("paste-buffer+enter: %v: %s", err, errStr)
 	}
 	return nil
 }
 
-func sessionName(issue int) string { return fmt.Sprintf("claude-%d", issue) }
+// sessionName picks a tmux session id that reflects the agent running in
+// the pane. Empty agent falls back to "claude" for back-compat.
+func sessionName(issue int, agent string) string {
+	if agent == "" {
+		agent = "claude"
+	}
+	return fmt.Sprintf("%s-%d", agent, issue)
+}
 
 func freeVM(cfg *Config, st *State) *VMBlock {
 	if len(cfg.VMs) == 0 {
@@ -760,6 +831,67 @@ func vmByName(cfg *Config, name string) *VMBlock {
 		}
 	}
 	return nil
+}
+
+// agentSpec describes the per-agent quirks orch needs to drive a worker
+// session: how to detect the TUI's idle/busy state by capturing the pane,
+// and how to transform a fresh start command into a resume command.
+type agentSpec struct {
+	name        string
+	idleMarker  string                    // substring present when the TUI is at its input prompt
+	busyMarker  string                    // substring present when the TUI is processing (empty = "busy iff !idle")
+	resumeXform func(sessionCmd string) string // returns a session_cmd that resumes the most recent conversation
+}
+
+// agentSpecs are the built-in defaults; per-VM idle_marker/busy_marker can override.
+var agentSpecs = map[string]agentSpec{
+	"claude": {
+		name:       "claude",
+		idleMarker: "bypass permissions",
+		busyMarker: "esc to interrupt",
+		resumeXform: func(s string) string {
+			return strings.Replace(s,
+				"claude --dangerously-skip-permissions",
+				"claude --dangerously-skip-permissions --resume", 1)
+		},
+	},
+	"codex": {
+		name: "codex",
+		// Codex's footer always renders the model line "<model> <preset> · <workdir>".
+		// "gpt-" matches gpt-5.5 / gpt-5.6 / etc. without binding to a specific
+		// version. It's also stable across the welcome screen and the input
+		// prompt (the per-tip hints below the prompt rotate).
+		idleMarker: "gpt-",
+		busyMarker: "", // no reliable busy marker; "not idle" suffices
+		resumeXform: func(s string) string {
+			// Replace the bare `codex` invocation with `codex resume --last`.
+			// Operators write session_cmd as `... exec codex` (or similar);
+			// the trailing `codex` is what we transform.
+			return strings.Replace(s, "exec codex", "exec codex resume --last", 1)
+		},
+	},
+}
+
+// vmAgent returns the agent spec for vm, applying per-VM marker overrides
+// on top of the agent's built-in defaults. Unknown agent name falls back
+// to claude.
+func vmAgent(vm VMBlock) agentSpec {
+	name := vm.Agent
+	if name == "" {
+		name = "claude"
+	}
+	spec, ok := agentSpecs[name]
+	if !ok {
+		log.Printf("vm %q: unknown agent %q, falling back to claude", vm.Name, name)
+		spec = agentSpecs["claude"]
+	}
+	if vm.IdleMarker != "" {
+		spec.idleMarker = vm.IdleMarker
+	}
+	if vm.BusyMarker != "" {
+		spec.busyMarker = vm.BusyMarker
+	}
+	return spec
 }
 
 // vmBotIdentity resolves the git user.name / user.email used for commits in
@@ -865,7 +997,7 @@ func renderBootstrap(tmpl string, is Issue, branch, targetName, targetRepo, inbo
 func loadState(path string) (*State, error) {
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return &State{Jobs: map[int]*Job{}, paneLines: map[int]int{}}, nil
+		return &State{Jobs: map[int]*Job{}}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -877,7 +1009,6 @@ func loadState(path string) (*State, error) {
 	if s.Jobs == nil {
 		s.Jobs = map[int]*Job{}
 	}
-	s.paneLines = map[int]int{}
 	return &s, nil
 }
 
@@ -945,13 +1076,23 @@ func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments 
 	if j.LastHeadOID != "" && j.LastHeadOID != v.HeadRefOid {
 		pushed = true
 	}
-	prev := j.LastCheckConclusions
+	// Build latest-per-name map: GitHub returns all historical runs; we only
+	// care about the most recent completed run for each check name.
+	latest := map[string]string{} // name → conclusion
+	latestAt := map[string]string{}
 	for _, c := range v.StatusCheckRollup {
 		if c.Status != "COMPLETED" {
 			continue
 		}
-		if prev[c.Name] != c.Conclusion {
-			checkChanges = append(checkChanges, fmt.Sprintf("%s: %s", c.Name, c.Conclusion))
+		if c.CompletedAt > latestAt[c.Name] {
+			latestAt[c.Name] = c.CompletedAt
+			latest[c.Name] = c.Conclusion
+		}
+	}
+	prev := j.LastCheckConclusions
+	for name, conclusion := range latest {
+		if prev[name] != conclusion {
+			checkChanges = append(checkChanges, fmt.Sprintf("%s: %s", name, conclusion))
 		}
 	}
 	return
@@ -1030,7 +1171,7 @@ func summarize(v *PRView, nr, ntc, nic []string, pushed bool, checks []string) s
 // session. It does NOT touch State.Jobs — the caller decides whether this
 // is a fresh oneshot job or a recurring cron tick.
 func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecycle, schedule string) error {
-	session := sessionName(is.Number)
+	session := sessionName(is.Number, vmAgent(*vm).name)
 	branch := cfg.Orch.BranchPrefix + fmt.Sprint(is.Number)
 	root := strings.TrimRight(cfg.Orch.WorkdirRoot, "/")
 	workdir := fmt.Sprintf("%s/issue-%d", root, is.Number)
@@ -1052,7 +1193,7 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 	deadline := time.Now().Add(idleWaitTimeout)
 	sawIdle := false
 	for time.Now().Before(deadline) {
-		if idle, err := tmuxIdle(*vm, session); err == nil && idle {
+		if idle, _, err := tmuxIdle(*vm, session); err == nil && idle {
 			sawIdle = true
 			break
 		}
@@ -1066,23 +1207,6 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 		tmuxKill(*vm, session)
 		return fmt.Errorf("session never reached idle prompt within %s (claude not authenticated?); pane tail:\n%s", idleWaitTimeout, strings.TrimSpace(pane))
 	}
-	// Send slash commands and wait for idle after each.
-	sendSlash := func(cmd string) {
-		if err := tmuxPaste(*vm, session, cmd); err != nil {
-			log.Printf("issue #%d: %s failed (non-fatal): %v", is.Number, cmd, err)
-			return
-		}
-		deadline := time.Now().Add(30 * time.Second)
-		for time.Now().Before(deadline) {
-			if idle, _ := tmuxIdle(*vm, session); idle {
-				break
-			}
-			time.Sleep(1 * time.Second)
-		}
-	}
-	sendSlash(fmt.Sprintf("/goal Implement issue #%d fully and open a PR. Do not defer work to follow-up PRs. Ship everything in one PR.", is.Number))
-	sendSlash("/remote-control")
-
 	tmpl := cfg.BootstrapPrompt
 	if lifecycle == "cron" {
 		tmpl = cfg.CronBootstrapPrompt
@@ -1105,21 +1229,39 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 	}
 	branch := cfg.Orch.BranchPrefix + fmt.Sprint(is.Number)
 	st.Jobs[is.Number] = &Job{
-		VM: vm.Name, Tmux: sessionName(is.Number),
+		VM: vm.Name, Tmux: sessionName(is.Number, vmAgent(*vm).name),
 		Target: target.Name, TargetRepo: target.Repo,
 		Branch: branch, Lifecycle: "oneshot",
 		IssueTitle:           is.Title,
 		LastCheckConclusions: map[string]string{},
 	}
 	log.Printf("issue #%d: spawned on %s/%s, target=%s (%s), branch=%s",
-		is.Number, vm.Name, sessionName(is.Number), target.Name, target.Repo, branch)
+		is.Number, vm.Name, sessionName(is.Number, vmAgent(*vm).name), target.Name, target.Repo, branch)
+	// React 👀 on the inbox issue so a human watching the inbox sees an
+	// immediate "picked up" signal without having to open the dashboard.
+	// Idempotent (GitHub returns the existing reaction on duplicate POSTs)
+	// so respawns from death/resume don't compound. Best-effort: a failure
+	// here doesn't abort the spawn.
+	_, _, err := run("gh", "api", "-X", "POST",
+		fmt.Sprintf("repos/%s/issues/%d/reactions", cfg.GitHub.InboxRepo, is.Number),
+		"-f", "content=eyes")
+	if err != nil {
+		log.Printf("issue #%d: eyes reaction on inbox failed: %v", is.Number, err)
+	}
 	return nil
 }
 
 // spawnResume restarts a dead session that had an open PR, using --resume so
 // claude recovers its conversation context, then pastes a short situation report.
 func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
-	session := sessionName(n)
+	session := sessionName(n, vmAgent(*vm).name)
+	// VM may have switched agents between spawn and respawn — keep state in
+	// sync with the new tmux name (no in-pane rename needed; old session is
+	// already dead and tmuxStart creates the new one fresh).
+	if j.Tmux != session {
+		log.Printf("issue #%d: tmux name updating %s → %s (agent change)", n, j.Tmux, session)
+		j.Tmux = session
+	}
 	root := strings.TrimRight(cfg.Orch.WorkdirRoot, "/")
 	workdir := fmt.Sprintf("%s/issue-%d", root, n)
 	sharedDir := fmt.Sprintf("%s/repos/%s", root, strings.ReplaceAll(j.TargetRepo, "/", "-"))
@@ -1128,47 +1270,23 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 	if base == "" {
 		base = "clawpatrol run -- claude --dangerously-skip-permissions"
 	}
-	resumeCmd := strings.Replace(base,
-		"claude --dangerously-skip-permissions",
-		"claude --dangerously-skip-permissions --resume", 1)
+	resumeCmd := vmAgent(*vm).resumeXform(base)
 
 	botLogin, botEmail := vmBotIdentity(cfg.Orch, *vm)
 	if err := tmuxStart(*vm, session, workdir, sharedDir, j.TargetRepo, j.Branch, resumeCmd, botLogin, botEmail); err != nil {
 		return err
 	}
+	time.Sleep(3 * time.Second)
+	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
 	// Same 3-minute window as startSession; claude --resume on a heavy
-	// worktree replays the conversation and can take a while. While waiting,
-	// periodically send Enter to dismiss the session-picker UI if it appears
-	// (the picker renders after startup, so a single pre-sleep Enter often
-	// fires too early and misses it).
+	// worktree replays the conversation and can take a while.
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {
-		if idle, err := tmuxIdle(*vm, session); err == nil && idle {
+		if idle, _, err := tmuxIdle(*vm, session); err == nil && idle {
 			break
-		}
-		// Dismiss session picker if visible (shows "Resume session" header).
-		if out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s", session)); err == nil &&
-			strings.Contains(out, "Resume session") {
-			_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
 		}
 		time.Sleep(2 * time.Second)
 	}
-
-	sendSlash := func(cmd string) {
-		if err := tmuxPaste(*vm, session, cmd); err != nil {
-			log.Printf("issue #%d: %s failed (non-fatal): %v", n, cmd, err)
-			return
-		}
-		deadline := time.Now().Add(30 * time.Second)
-		for time.Now().Before(deadline) {
-			if idle, _ := tmuxIdle(*vm, session); idle {
-				break
-			}
-			time.Sleep(1 * time.Second)
-		}
-	}
-	sendSlash(fmt.Sprintf("/goal Implement issue #%d fully and open a PR. Do not defer work to follow-up PRs. Ship everything in one PR.", n))
-	sendSlash("/remote-control")
 
 	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
 	ci := ""
@@ -1204,12 +1322,13 @@ func fireCron(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock,
 	}
 	// Update the existing Job's VM/Tmux pointer (vm may have changed across
 	// fires if capacity shifts, though in MVP it shouldn't).
+	session := sessionName(is.Number, vmAgent(*vm).name)
 	if j := st.Jobs[is.Number]; j != nil {
 		j.VM = vm.Name
-		j.Tmux = sessionName(is.Number)
+		j.Tmux = session
 	}
 	log.Printf("issue #%d: cron tick fired on %s/%s (schedule=%s)",
-		is.Number, vm.Name, sessionName(is.Number), schedule)
+		is.Number, vm.Name, session, schedule)
 	return nil
 }
 
@@ -1286,42 +1405,468 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 	j.FireStartedAt = fireDoneAt
 	_ = saveState(cfg.Orch.StateFile, st)
 }
-// sampleActivity polls each live session's tmux scrollback size and appends
-// a delta to the job's Activity ring buffer. Runs on a fast ticker (5s)
-// independent of the main tick to keep sparklines responsive.
-func sampleActivity(cfg *Config, st *State) {
+
+// --- mention watcher ---
+
+// Mention is one @-mention of a configured bot found in a comment on an
+// issue or PR in a configured target repo.
+type Mention struct {
+	Repo       string    // owner/repo where the mention lives
+	IsPR       bool      // true if the host is a PR, false for an issue
+	Number     int       // issue or PR number on Repo
+	HostURL    string    // canonical URL of the host issue/PR
+	HostAuthor string    // login that opened the host issue/PR (used to detect bot-self mentions)
+	CommentID  string    // unique GitHub node id of the comment carrying the mention
+	CommentURL string    // direct link to that specific comment
+	Author     string    // login that wrote the comment
+	Body       string    // raw comment body
+	CreatedAt  time.Time // comment creation time (used to advance the cursor)
+	Bot        string    // which configured bot was mentioned
+}
+
+// isBotLogin returns true if the given GitHub login looks like a bot.
+// Heuristic order:
+//
+//  1. Any login configured as one of orchid's own bots (orch + per-VM
+//     bot_login fields) is always a bot.
+//  2. mentions.human_overrides force-classify a login as human even if
+//     the heuristic below would mark it otherwise.
+//  3. Otherwise, treat as bot if the login contains "bot"
+//     (case-insensitive). Catches `crowlbot`, `denobot`, `nathanwhitbot`,
+//     `avocet-bot`, etc. — including org-member bots that
+//     `orgs/<org>/members` returns alongside humans.
+//
+// Caller is responsible for the consequences: dispatch skips both
+// comment authors and host (issue/PR) authors classified as bots, so a
+// false-positive here means a real human's mention gets ignored. Use
+// human_overrides for any human whose login happens to contain "bot".
+func isBotLogin(cfg *Config, login string) bool {
+	for _, b := range botLogins(cfg) {
+		if login == b {
+			return true
+		}
+	}
+	if cfg.Orch.Mentions != nil {
+		for _, h := range cfg.Orch.Mentions.HumanOverrides {
+			if login == h {
+				return false
+			}
+		}
+	}
+	return strings.Contains(strings.ToLower(login), "bot")
+}
+
+// botLogins gathers all unique bot logins across the orchestrator default
+// and per-VM overrides. These are the @-mentions we look for.
+func botLogins(cfg *Config) []string {
+	seen := map[string]bool{}
+	if cfg.Orch.BotLogin != "" {
+		seen[cfg.Orch.BotLogin] = true
+	}
+	for _, vm := range cfg.VMs {
+		if vm.BotLogin != "" {
+			seen[vm.BotLogin] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for l := range seen {
+		out = append(out, l)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// fetchMaintainers pulls the full membership list of the configured org.
+// Hard-fails (returns error) if the orch token lacks read:org or isn't in
+// the org — there's no quiet fallback because misclassifying members as
+// external would silently downgrade their requests to canned replies.
+func fetchMaintainers(org string) ([]string, error) {
+	out, errStr, err := run("gh", "api", "--paginate",
+		fmt.Sprintf("orgs/%s/members", org),
+		"--jq", ".[].login")
+	if err != nil {
+		return nil, fmt.Errorf("gh api orgs/%s/members: %v: %s", org, err, strings.TrimSpace(errStr))
+	}
+	var members []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			members = append(members, line)
+		}
+	}
+	return members, nil
+}
+
+// refreshMaintainers replaces the cache if it's missing or older than ttl.
+// The fetched member list is filtered through isBotLogin — bots that
+// happen to be org members would otherwise be classified as
+// "maintainers" and route their automated mentions to inbox-issue
+// creation, causing bot-on-bot dispatch loops.
+// Caller must hold st.mu.
+func refreshMaintainers(cfg *Config, st *State, ttl time.Duration) error {
+	if st.Maintainers != nil && time.Since(st.Maintainers.FetchedAt) < ttl {
+		return nil
+	}
+	members, err := fetchMaintainers(cfg.Orch.Mentions.Org)
+	if err != nil {
+		return err
+	}
+	humans := make([]string, 0, len(members))
+	for _, m := range members {
+		if !isBotLogin(cfg, m) {
+			humans = append(humans, m)
+		}
+	}
+	st.Maintainers = &MaintainerCache{FetchedAt: time.Now(), Members: humans}
+	log.Printf("mentions: refreshed maintainer cache for %s (%d humans, %d bots filtered)",
+		cfg.Orch.Mentions.Org, len(humans), len(members)-len(humans))
+	_ = saveState(cfg.Orch.StateFile, st)
+	return nil
+}
+
+// searchMentions returns mentions of `bot` in `repo` (issues + PRs) where
+// the comment was created strictly after `since`. Two-stage: search the
+// issue/PR set first, then fetch comments per item to find the specific
+// commenting events.
+func searchMentions(repo, bot string, since time.Time) ([]Mention, error) {
+	type item struct {
+		Number int                    `json:"number"`
+		URL    string                 `json:"url"`
+		Author struct{ Login string } `json:"author"`
+		IsPR   bool
+	}
+	collect := func(kind string) ([]item, error) {
+		out, errStr, err := run("gh", "search", kind,
+			"mentions:"+bot,
+			"repo:"+repo,
+			"updated:>="+since.UTC().Format("2006-01-02"),
+			"--limit", "100",
+			"--json", "number,url,author")
+		if err != nil {
+			return nil, fmt.Errorf("gh search %s: %v: %s", kind, err, strings.TrimSpace(errStr))
+		}
+		var items []item
+		if err := json.Unmarshal([]byte(out), &items); err != nil {
+			return nil, err
+		}
+		for i := range items {
+			items[i].IsPR = (kind == "prs")
+		}
+		return items, nil
+	}
+	issues, err := collect("issues")
+	if err != nil {
+		return nil, err
+	}
+	prs, err := collect("prs")
+	if err != nil {
+		return nil, err
+	}
+	all := append(issues, prs...)
+
+	type ghComment struct {
+		ID        string                 `json:"id"`
+		URL       string                 `json:"url"`
+		Body      string                 `json:"body"`
+		CreatedAt time.Time              `json:"createdAt"`
+		Author    struct{ Login string } `json:"author"`
+	}
+	mentionTag := "@" + bot
+	var mentions []Mention
+	for _, it := range all {
+		var commentsField string
+		if it.IsPR {
+			commentsField = "comments"
+		} else {
+			commentsField = "comments"
+		}
+		viewKind := "issue"
+		if it.IsPR {
+			viewKind = "pr"
+		}
+		out, errStr, err := run("gh", viewKind, "view", fmt.Sprint(it.Number),
+			"--repo", repo, "--json", commentsField, "--jq", "."+commentsField)
+		if err != nil {
+			log.Printf("mentions: %s view %s#%d: %v: %s", viewKind, repo, it.Number, err, strings.TrimSpace(errStr))
+			continue
+		}
+		var comments []ghComment
+		if err := json.Unmarshal([]byte(out), &comments); err != nil {
+			log.Printf("mentions: parse comments for %s#%d: %v", repo, it.Number, err)
+			continue
+		}
+		for _, c := range comments {
+			if !c.CreatedAt.After(since) {
+				continue
+			}
+			if !strings.Contains(c.Body, mentionTag) {
+				continue
+			}
+			mentions = append(mentions, Mention{
+				Repo: repo, IsPR: it.IsPR, Number: it.Number,
+				HostURL: it.URL, HostAuthor: it.Author.Login,
+				CommentID: c.ID, CommentURL: c.URL,
+				Author: c.Author.Login, Body: c.Body,
+				CreatedAt: c.CreatedAt, Bot: bot,
+			})
+		}
+	}
+	return mentions, nil
+}
+
+// inferMentionAction asks an LLM (run on the orch host) to either (a)
+// summarize what action the comment is requesting, in ≤15 words, or
+// (b) return the literal "NOOP" if the comment is purely informational
+// (status update, FYI, automated bot chatter, etc.). Defaults to
+// `claude -p`; configurable via mentions.llm_command (e.g. ["codex","exec"]
+// to keep claude budget for workers).
+//
+// Returns the summary if the comment is actionable, or "" if NOOP /
+// the model call failed. Caller treats "" as "skip dispatch" — better
+// to silently ignore an ambiguous mention than to spam the inbox with
+// no-op tracking issues.
+func inferMentionAction(cfg *Config, m Mention) string {
+	// Cheap pre-filter for obviously-NOOP comments: short acks like "thanks",
+	// "lgtm", emoji-only, +1, etc. Skips the ~5s LLM call entirely for the
+	// common-case noise. We only match SHORT bodies so a long "thanks for
+	// fixing X, the symptom was Y" still falls through to the LLM which can
+	// pick out an embedded request.
+	if isShortNoop(m.Body) {
+		return ""
+	}
+	prompt := fmt.Sprintf(`Read the GitHub comment below. Decide whether it is asking the bot to perform a specific, concrete action (review, rebase, fix, investigate, address feedback, retry, look at, etc.).
+
+Reply with EXACTLY one line:
+  - If it IS an actionable request, reply with the action in 15 words or fewer. No preamble, no quoting.
+  - If it is informational only (status update, FYI, thanks, summary of work the commenter already did, automated bot output, etc.), reply with the literal word: NOOP
+
+Comment from @%s in %s#%d:
+%s`, m.Author, m.Repo, m.Number, m.Body)
+	llmCmd := []string{"claude", "-p"}
+	if cfg.Orch.Mentions != nil && len(cfg.Orch.Mentions.LLMCommand) > 0 {
+		llmCmd = cfg.Orch.Mentions.LLMCommand
+	}
+	out, _, err := runIn(prompt, llmCmd[0], llmCmd[1:]...)
+	if err != nil {
+		log.Printf("mentions: %s failed for %s: %v (treating as NOOP to avoid spam)", strings.Join(llmCmd, " "), m.CommentURL, err)
+		return ""
+	}
+	summary := strings.TrimSpace(out)
+	if i := strings.IndexByte(summary, '\n'); i >= 0 {
+		summary = strings.TrimSpace(summary[:i])
+	}
+	if summary == "" || strings.EqualFold(summary, "NOOP") {
+		return ""
+	}
+	return summary
+}
+
+// shortNoopPattern matches very-short ack/thanks/FYI bodies that are almost
+// never actionable. Anchored, case-insensitive, allows leading @-mention and
+// trailing punctuation/emoji. Tested in orch_test.go.
+var shortNoopPattern = regexp.MustCompile(
+	`(?i)^\s*(@\S+\s+)?(thanks?|thx|ty|tysm|cheers|nice|cool|lgtm|ok(ay)?|sgtm|got\s?it|fyi|np|nm|\+1|sounds?\s+good|will\s+do|done|ack(nowledged)?)\b[\s!.,?\W]*$`,
+)
+
+// isShortNoop returns true if the comment body is short enough and matches
+// an obviously-noop pattern. Used by inferMentionAction to skip the LLM
+// call for the common noise case.
+func isShortNoop(body string) bool {
+	t := strings.TrimSpace(body)
+	if len(t) > 80 {
+		return false
+	}
+	return shortNoopPattern.MatchString(t)
+}
+
+// targetLabelFor returns the routing label whose target.repo matches repo.
+// Empty string if no target points at that repo.
+func targetLabelFor(cfg *Config, repo string) string {
+	for _, t := range cfg.Targets {
+		if t.Repo == repo {
+			return t.Label
+		}
+	}
+	return ""
+}
+
+// dispatchMention is the policy split: classify the mention into one of
+// three buckets and act on it. Caller must hold st.mu.
+func dispatchMention(cfg *Config, st *State, m Mention) {
+	// Bot filters first — drop anything bot-authored.
+	if isBotLogin(cfg, m.Author) {
+		return
+	}
+	// Host-author bot filter: skip if the issue/PR was opened by a
+	// THIRD-PARTY bot (e.g. dependabot, crowlbot). PRs opened by OUR
+	// own bots are exempt — a human pinging us on one of our own PRs
+	// is exactly the case we want to handle (tracked-PR poke, or
+	// maintainer-routed inbox issue if the PR is no longer tracked).
+	if isBotLogin(cfg, m.HostAuthor) {
+		ourBot := false
+		for _, b := range botLogins(cfg) {
+			if m.HostAuthor == b {
+				ourBot = true
+				break
+			}
+		}
+		if !ourBot {
+			return
+		}
+	}
+
+	// Mention on a PR orch already tracks → poke that worker session.
+	// Skip the LLM gate here; the worker decides whether the comment is
+	// actionable as part of its existing review-handling.
+	if m.IsPR {
+		for n, j := range st.Jobs {
+			if j.PR != m.Number || j.TargetRepo != m.Repo {
+				continue
+			}
+			vm := vmByName(cfg, j.VM)
+			if vm == nil {
+				return
+			}
+			msg := fmt.Sprintf("New @-mention by @%s on PR #%d (%s):\n\n%s", m.Author, m.Number, m.CommentURL, oneLine(m.Body, 400))
+			if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
+				log.Printf("mentions: poke #%d failed: %v", n, err)
+				return
+			}
+			log.Printf("mentions: poked tracked PR session for issue #%d (PR #%d, by @%s)", n, m.Number, m.Author)
+			return
+		}
+	}
+
+	// LLM gate: only continue if the comment is actually requesting work.
+	// Returns "" for NOOP (informational, status, FYI) — silently skip.
+	summary := inferMentionAction(cfg, m)
+	if summary == "" {
+		log.Printf("mentions: skipping non-actionable mention from @%s in %s#%d", m.Author, m.Repo, m.Number)
+		return
+	}
+
+	// Maintainer (org-member, post-bot-filter) → open inbox issue with the
+	// LLM-summarized action as the title.
+	if st.Maintainers.has(m.Author) {
+		label := targetLabelFor(cfg, m.Repo)
+		if label == "" {
+			log.Printf("mentions: maintainer mention in %s but no matching target label, falling back to external reply", m.Repo)
+		} else {
+			title := fmt.Sprintf("@%s: %s", m.Author, summary)
+			body := fmt.Sprintf("Triggered by mention in %s.\n\n@%s wrote:\n\n> %s\n\nInferred action: %s",
+				m.CommentURL, m.Author, oneLine(m.Body, 800), summary)
+			out, errStr, err := run("gh", "issue", "create",
+				"--repo", cfg.GitHub.InboxRepo,
+				"--label", label,
+				"--title", title,
+				"--body", body)
+			if err != nil {
+				log.Printf("mentions: gh issue create failed for %s: %v: %s", m.CommentURL, err, strings.TrimSpace(errStr))
+				return
+			}
+			newURL := strings.TrimSpace(out)
+			parts := strings.Split(newURL, "/")
+			newNum, _ := strconv.Atoi(parts[len(parts)-1])
+			log.Printf("mentions: opened inbox issue #%d for maintainer @%s mention in %s#%d",
+				newNum, m.Author, m.Repo, m.Number)
+			// Append explicit close instructions now that we know the new
+			// issue number. Mention-routed inbox issues are review/response
+			// tasks — there is no PR to ship, so nothing closes the inbox
+			// issue automatically and the worker session would otherwise
+			// linger forever waiting for follow-up that never comes.
+			closeInstr := fmt.Sprintf(
+				"\n\n---\n\n## When done\n\nThis is a review/response task — there is no PR to ship from this issue. After you've posted your response on the source comment/PR, close this inbox issue and exit:\n\n```sh\ngh issue close --repo %s %d --comment \"done\"\n```\n",
+				cfg.GitHub.InboxRepo, newNum)
+			if _, errStr, err := run("gh", "issue", "edit", fmt.Sprint(newNum),
+				"--repo", cfg.GitHub.InboxRepo,
+				"--body", body+closeInstr); err != nil {
+				log.Printf("mentions: append close instructions to inbox #%d failed: %v: %s", newNum, err, strings.TrimSpace(errStr))
+			}
+			if cfg.Orch.Mentions.Acknowledge {
+				// React to the mentioning comment with 👀 instead of posting
+				// a "Tracking in inbox#N" reply — GitHub already auto-creates
+				// a "mentioned in" backlink on the source comment when we
+				// reference its URL in the new inbox issue body, so the
+				// comment is needless noise. The reaction is a quieter ack.
+				_, _, err := run("gh", "api", "graphql", "-f",
+					fmt.Sprintf("query=mutation { addReaction(input: {subjectId: %q, content: EYES}) { reaction { content } } }", m.CommentID))
+				if err != nil {
+					log.Printf("mentions: eyes reaction on %s failed: %v", m.CommentURL, err)
+				}
+			}
+			return
+		}
+	}
+
+	// (d) External user → canned reply on source.
+	reply := fmt.Sprintf("Hi @%s — I'm an automated bot. @%s has been notified and will follow up.", m.Author, "bartlomieju")
+	kind := "issue"
+	if m.IsPR {
+		kind = "pr"
+	}
+	if _, _, err := run("gh", kind, "comment", fmt.Sprint(m.Number), "--repo", m.Repo, "--body", reply); err != nil {
+		log.Printf("mentions: external reply on %s#%d failed: %v", m.Repo, m.Number, err)
+		return
+	}
+	log.Printf("mentions: replied to external @%s in %s#%d", m.Author, m.Repo, m.Number)
+}
+
+// mentionTick runs one polling cycle: refresh the cache if stale, then
+// search each (target.repo × bot) pair for new mentions and dispatch.
+func mentionTick(cfg *Config, st *State) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	for n, j := range st.Jobs {
-		if j.Tmux == "" {
+
+	ttl, _ := time.ParseDuration(cfg.Orch.Mentions.MaintainerTTL)
+	if ttl == 0 {
+		ttl = 1 * time.Hour
+	}
+	if err := refreshMaintainers(cfg, st, ttl); err != nil {
+		log.Printf("mentions: maintainer refresh failed (skipping cycle): %v", err)
+		return
+	}
+
+	// Cursor: floor at orch boot time. On a fresh process (cursor nil)
+	// we start at boot time; on a restart with a cursor that predates
+	// boot (long downtime, stale state) we still floor at boot. This
+	// is the deliberate trade: missing pre-boot mentions is acceptable
+	// — silently re-dispatching them on every restart is not.
+	since := orchBootTime
+	if st.MentionCursor != nil && st.MentionCursor.After(orchBootTime) {
+		since = *st.MentionCursor
+	}
+
+	bots := botLogins(cfg)
+	seen := map[string]bool{}
+	maxSeen := since
+	for _, t := range cfg.Targets {
+		// Skip the inbox repo itself — mentions there are noise
+		// (operator chatter on tracking issues we ourselves created),
+		// and the search counts against the same rate limit.
+		if t.Repo == cfg.GitHub.InboxRepo {
 			continue
 		}
-		vm := vmByName(cfg, j.VM)
-		if vm == nil {
-			continue
-		}
-		out, _, err := sshExec(*vm, fmt.Sprintf("tmux display-message -p -t %s '#{history_size}'", j.Tmux))
-		if err != nil {
-			continue
-		}
-		size, _ := strconv.Atoi(strings.TrimSpace(out))
-		prev := st.paneLines[n]
-		delta := size - prev
-		if delta < 0 {
-			delta = 0
-		}
-		st.paneLines[n] = size
-		j.Activity = append(j.Activity, delta)
-		if len(j.Activity) > 30 {
-			j.Activity = j.Activity[len(j.Activity)-30:]
+		for _, b := range bots {
+			ms, err := searchMentions(t.Repo, b, since)
+			if err != nil {
+				log.Printf("mentions: search %s × %s failed: %v", t.Repo, b, err)
+				continue
+			}
+			for _, m := range ms {
+				if seen[m.CommentID] {
+					continue // same comment found via multiple bot searches
+				}
+				seen[m.CommentID] = true
+				dispatchMention(cfg, st, m)
+				if m.CreatedAt.After(maxSeen) {
+					maxSeen = m.CreatedAt
+				}
+			}
 		}
 	}
-	// Refresh the lock-free snapshot so /api/state serves fresh activity data.
-	snap := make(map[int]Job, len(st.Jobs))
-	for n, j := range st.Jobs {
-		snap[n] = *j
+	if maxSeen.After(since) {
+		st.MentionCursor = &maxSeen
+		_ = saveState(cfg.Orch.StateFile, st)
 	}
-	st.httpSnap.Store(snap)
 }
 
 func tick(cfg *Config, st *State) {
@@ -1333,23 +1878,28 @@ func tick(cfg *Config, st *State) {
 		snap[n] = *j
 	}
 	st.httpSnap.Store(snap)
-	// Map issue number -> (Issue, Target). First target whose label matches wins.
+	// One inbox call instead of one-per-target. allOpen holds every open
+	// inbox issue (used to detect closed-issue teardown without a separate
+	// ghIssueIsOpen probe per job). open is the subset routed to a target
+	// by label match — first target whose label matches wins.
 	type routed struct {
 		is     Issue
 		target TargetBlock
 	}
+	allOpen := map[int]Issue{}
 	open := map[int]routed{}
-	for _, t := range cfg.Targets {
-		issues, err := ghIssueList(cfg.GitHub.InboxRepo, t.Label)
-		if err != nil {
-			log.Printf("list issues for target %s: %v", t.Name, err)
-			continue
-		}
+	issues, err := ghIssueList(cfg.GitHub.InboxRepo, "")
+	if err != nil {
+		log.Printf("list inbox issues: %v", err)
+	} else {
 		for _, is := range issues {
-			if _, dup := open[is.Number]; dup {
-				continue
+			allOpen[is.Number] = is
+			for _, t := range cfg.Targets {
+				if is.hasLabel(t.Label) {
+					open[is.Number] = routed{is: is, target: t}
+					break
+				}
 			}
-			open[is.Number] = routed{is: is, target: t}
 		}
 	}
 
@@ -1404,18 +1954,31 @@ func tick(cfg *Config, st *State) {
 	// next tick are picked up then, so kills stagger naturally.
 	budget := killBudget{max: maxKillsPerTick}
 	for n, j := range st.Jobs {
-		if r, inOpen := open[n]; inOpen && j.IssueTitle == "" {
+		if r, routedOpen := open[n]; routedOpen {
 			j.IssueTitle = r.is.Title
-		}
-		if _, stillOpen := open[n]; !stillOpen {
-			isOpen, err := ghIssueIsOpen(cfg.GitHub.InboxRepo, n)
-			if err != nil {
-				log.Printf("issue #%d: check open failed: %v", n, err)
-			} else if !isOpen {
+			// Lifecycle drift: an operator may have added or removed the
+			// `cron` label after we registered the job. Re-evaluate from
+			// the live label set; if it disagrees with j.Lifecycle, drop
+			// the job so the next tick's registration loop picks it up
+			// fresh under the right lifecycle. Avoids the issue #4 case
+			// (registered as oneshot, label flipped to cron, schedule
+			// never fired).
+			wantCron := r.is.hasLabel("cron")
+			isCron := j.Lifecycle == "cron"
+			if wantCron != isCron {
+				log.Printf("issue #%d: lifecycle drift (have=%q want=%s) — dropping for re-registration",
+					n, j.Lifecycle, map[bool]string{true: "cron", false: "oneshot"}[wantCron])
 				tearDown(cfg, st, n)
 				_ = saveState(cfg.Orch.StateFile, st)
 				continue
 			}
+		} else if _, stillOpen := allOpen[n]; !stillOpen {
+			// Not in the freshly-fetched open list — issue is closed.
+			// (Or its target label was removed; in that case allOpen
+			// would still contain it and we'd keep the job running.)
+			tearDown(cfg, st, n)
+			_ = saveState(cfg.Orch.StateFile, st)
+			continue
 		}
 		// Cron lifecycle: fire ephemeral sessions on schedule, no PR watch.
 		if j.Lifecycle == "cron" {
@@ -1480,6 +2043,18 @@ func tick(cfg *Config, st *State) {
 				if r, ok := open[n]; ok {
 					prNum, err := ghAutoCreatePR(cfg, n, j, r.is)
 					if err != nil {
+						// Branch already has a PR opened by a different
+						// account (e.g. another orchid instance sharing the
+						// same branch_prefix won the race). Our --author
+						// filter correctly excluded it, but we can't push
+						// either. Drop the session — keep retrying just
+						// spams the log every tick.
+						if strings.Contains(err.Error(), "already exists") {
+							log.Printf("issue #%d: branch %s already has a PR by another account, tearing down", n, j.Branch)
+							tearDown(cfg, st, n)
+							_ = saveState(cfg.Orch.StateFile, st)
+							continue
+						}
 						log.Printf("issue #%d: auto-create PR: %v", n, err)
 					} else if prNum > 0 {
 						pr = &PRSummary{Number: prNum, State: "OPEN"}
@@ -1499,6 +2074,7 @@ func tick(cfg *Config, st *State) {
 			_ = saveState(cfg.Orch.StateFile, st)
 		}
 		v, err := ghPRView(j.TargetRepo, j.PR)
+		viewedAt := time.Now()
 		if err != nil {
 			log.Printf("issue #%d: pr view failed: %v", n, err)
 			continue
@@ -1515,32 +2091,56 @@ func tick(cfg *Config, st *State) {
 			_ = saveState(cfg.Orch.StateFile, st)
 			continue
 		}
-		nr, ntc, nic, _, checks := diffPR(j, v)
-		mergeConflict := v.MergeStateStatus == "DIRTY" && j.LastMergeState != "DIRTY"
-		j.LastMergeState = v.MergeStateStatus
-
-		// Classify which new reviews are actionable (need session work) vs. informational.
-		var actionableReviews []string
-		for _, id := range nr {
-			for _, r := range v.Reviews {
-				if r.ID == id && r.State == "CHANGES_REQUESTED" {
-					actionableReviews = append(actionableReviews, id)
+		nr, ntc, nic, pushed, checks := diffPR(j, v)
+		if len(nr) == 0 && len(ntc) == 0 && len(nic) == 0 && !pushed && len(checks) == 0 {
+			j.LastHeadOID = v.HeadRefOid
+			continue
+		}
+		idle, detected, err := tmuxIdle(*vm, j.Tmux)
+		if err != nil {
+			log.Printf("issue #%d: idle check failed: %v", n, err)
+			continue
+		}
+		// Tmux name drift: if we detected a different agent in the pane than
+		// the session id implies, rename the live tmux session and update
+		// state. This catches the case where a session was respawned under
+		// a different agent (operator switched vm.agent between deploys)
+		// and the old "claude-N" name now lies about a codex pane.
+		if detected != "" {
+			if want := sessionName(n, detected); want != j.Tmux {
+				if _, _, e := sshExec(*vm, fmt.Sprintf("tmux rename-session -t %s %s", j.Tmux, want)); e == nil {
+					log.Printf("issue #%d: tmux renamed %s → %s (detected %s in pane)", n, j.Tmux, want, detected)
+					j.Tmux = want
+					_ = saveState(cfg.Orch.StateFile, st)
 				}
 			}
 		}
-
-		// Classify which CI changes are failures vs. passes.
-		var failChecks, passChecks []string
-		for _, c := range checks {
-			if strings.Contains(strings.ToUpper(c), "FAILURE") {
-				failChecks = append(failChecks, c)
-			} else {
-				passChecks = append(passChecks, c)
+		if !idle {
+			log.Printf("issue #%d: pane busy, deferring poke", n)
+			continue
+		}
+		// Re-check PR state immediately before poking — but only if the
+		// original view is stale enough to be worth a fresh API call.
+		// Within a single tick iteration the gap is usually 1-2s (just
+		// the SSH idle check). Re-fetching every time burns ~10 calls/tick
+		// for a near-zero merge-race window. Threshold is conservative.
+		const reCheckAfter = 5 * time.Second
+		if time.Since(viewedAt) >= reCheckAfter {
+			fresh, ferr := ghPRView(j.TargetRepo, j.PR)
+			if ferr != nil {
+				log.Printf("issue #%d: pre-poke pr re-check failed: %v", n, ferr)
+			} else if fresh.State == "MERGED" || fresh.State == "CLOSED" {
+				log.Printf("issue #%d: PR %s between view and poke — skipping poke and tearing down", n, fresh.State)
+				tearDown(cfg, st, n)
+				_ = saveState(cfg.Orch.StateFile, st)
+				continue
 			}
 		}
-
-		// Always record seen IDs and CI results so non-actionable events
-		// (APPROVED, CI green) don't re-fire on the next tick.
+		msg := summarize(v, nr, ntc, nic, pushed, checks)
+		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
+			log.Printf("issue #%d: poke failed: %v", n, err)
+			continue
+		}
 		j.SeenReviewIDs = append(j.SeenReviewIDs, nr...)
 		j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, ntc...)
 		j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, nic...)
@@ -1548,42 +2148,15 @@ func tick(cfg *Config, st *State) {
 		if j.LastCheckConclusions == nil {
 			j.LastCheckConclusions = map[string]string{}
 		}
+		latestAt := map[string]string{}
 		for _, c := range v.StatusCheckRollup {
-			if c.Status == "COMPLETED" {
+			if c.Status == "COMPLETED" && c.CompletedAt > latestAt[c.Name] {
+				latestAt[c.Name] = c.CompletedAt
 				j.LastCheckConclusions[c.Name] = c.Conclusion
 			}
 		}
-
-		// Only poke the session when there's actual work: CI failure,
-		// CHANGES_REQUESTED review, inline review comments, or merge conflict.
-		if len(failChecks) == 0 && len(actionableReviews) == 0 && len(ntc) == 0 && len(nic) == 0 && !mergeConflict {
-			_ = saveState(cfg.Orch.StateFile, st)
-			if len(passChecks) > 0 {
-				log.Printf("issue #%d: CI green, skipping poke", n)
-			}
-			continue
-		}
-		idle, err := tmuxIdle(*vm, j.Tmux)
-		if err != nil {
-			log.Printf("issue #%d: idle check failed: %v", n, err)
-			continue
-		}
-		if !idle {
-			log.Printf("issue #%d: pane busy, deferring poke", n)
-			continue
-		}
-		// Summarize only the actionable parts for the session.
-		msg := summarize(v, actionableReviews, ntc, nic, false, failChecks)
-		if mergeConflict {
-			msg += "\n- PR has a merge conflict — rebase onto the target branch."
-		}
-		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
-			log.Printf("issue #%d: poke failed: %v", n, err)
-			continue
-		}
 		_ = saveState(cfg.Orch.StateFile, st)
-		log.Printf("issue #%d: poked PR #%d (CI failures: %d, reviews: %d, comments: %d, conflict: %v)",
-			n, j.PR, len(failChecks), len(actionableReviews), len(ntc)+len(nic), mergeConflict)
+		log.Printf("issue #%d: poked PR #%d", n, j.PR)
 	}
 }
 
@@ -1602,69 +2175,14 @@ type apiVMEntry struct {
 	Host     string `json:"host"`
 	Capacity int    `json:"capacity"`
 	Used     int    `json:"used"`
+	Bot      string `json:"bot"`   // resolved bot login (per-VM override → orch default)
+	Agent    string `json:"agent"` // "claude" / "codex" / etc — drives dashboard display
 }
 
 type apiStateResp struct {
 	Jobs  []apiJobEntry `json:"jobs"`
 	VMs   []apiVMEntry  `json:"vms"`
 	Inbox string        `json:"inbox"`
-}
-
-func wsReadFrame(r io.Reader) (opcode byte, payload []byte, err error) {
-	hdr := make([]byte, 2)
-	if _, err = io.ReadFull(r, hdr); err != nil {
-		return
-	}
-	opcode = hdr[0] & 0x0f
-	masked := hdr[1]&0x80 != 0
-	n := int(hdr[1] & 0x7f)
-	if n == 126 {
-		ext := make([]byte, 2)
-		if _, err = io.ReadFull(r, ext); err != nil {
-			return
-		}
-		n = int(ext[0])<<8 | int(ext[1])
-	} else if n == 127 {
-		ext := make([]byte, 8)
-		if _, err = io.ReadFull(r, ext); err != nil {
-			return
-		}
-		n = int(ext[4])<<24 | int(ext[5])<<16 | int(ext[6])<<8 | int(ext[7])
-	}
-	var mask [4]byte
-	if masked {
-		if _, err = io.ReadFull(r, mask[:]); err != nil {
-			return
-		}
-	}
-	payload = make([]byte, n)
-	if _, err = io.ReadFull(r, payload); err != nil {
-		return
-	}
-	if masked {
-		for i := range payload {
-			payload[i] ^= mask[i%4]
-		}
-	}
-	return
-}
-
-func wsWriteFrame(w io.Writer, opcode byte, payload []byte) error {
-	n := len(payload)
-	hdr := make([]byte, 2, 10)
-	hdr[0] = 0x80 | opcode
-	switch {
-	case n <= 125:
-		hdr[1] = byte(n)
-	case n <= 65535:
-		hdr[1] = 126
-		hdr = append(hdr, byte(n>>8), byte(n))
-	default:
-		hdr[1] = 127
-		hdr = append(hdr, 0, 0, 0, 0, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
-	}
-	_, err := w.Write(append(hdr, payload...))
-	return err
 }
 
 // describe renders a markdown block describing this orch instance: config
@@ -1858,11 +2376,14 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 
 		vms := make([]apiVMEntry, 0, len(cfg.VMs))
 		for _, vm := range cfg.VMs {
+			bot, _ := vmBotIdentity(cfg.Orch, vm)
 			vms = append(vms, apiVMEntry{
 				Name:     vm.Name,
 				Host:     vm.Host,
 				Capacity: vm.Capacity,
 				Used:     load[vm.Name],
+				Bot:      bot,
+				Agent:    vmAgent(vm).name,
 			})
 		}
 
@@ -1875,8 +2396,10 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		})
 	}))
 
-	// /ws?s=<session> — WebSocket streaming tmux pane output
-	mux.HandleFunc("/ws", auth(func(w http.ResponseWriter, r *http.Request) {
+	// /api/pane?s=<session> — returns tmux capture-pane snapshot as text/plain.
+	// Frontend polls this every ~1.5s instead of holding a WebSocket. Single
+	// SSH call per request, no framing, no goroutine-per-tab.
+	mux.HandleFunc("/api/pane", auth(func(w http.ResponseWriter, r *http.Request) {
 		session := r.URL.Query().Get("s")
 		for _, c := range session {
 			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
@@ -1888,7 +2411,6 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			http.Error(w, "s required", http.StatusBadRequest)
 			return
 		}
-
 		var vm *VMBlock
 		if v := st.httpSnap.Load(); v != nil {
 			for _, j := range v.(map[int]Job) {
@@ -1902,70 +2424,14 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			http.Error(w, "session not found", http.StatusNotFound)
 			return
 		}
-
-		key := r.Header.Get("Sec-Websocket-Key")
-		if key == "" {
-			http.Error(w, "not a websocket upgrade", http.StatusBadRequest)
-			return
-		}
-		sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-		accept := base64.StdEncoding.EncodeToString(sum[:])
-
-		hj, ok := w.(http.Hijacker)
-		if !ok {
-			http.Error(w, "hijack unsupported", http.StatusInternalServerError)
-			return
-		}
-		conn, buf, err := hj.Hijack()
+		out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -e -S -200 2>&1", session))
 		if err != nil {
+			http.Error(w, "capture failed", http.StatusBadGateway)
 			return
 		}
-		defer conn.Close()
-		_ = buf
-
-		resp := "HTTP/1.1 101 Switching Protocols\r\n" +
-			"Upgrade: websocket\r\n" +
-			"Connection: Upgrade\r\n" +
-			"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
-		if _, err := conn.Write([]byte(resp)); err != nil {
-			return
-		}
-
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			for {
-				_, payload, err := wsReadFrame(conn)
-				if err != nil || len(payload) == 0 {
-					return
-				}
-				b64 := base64.StdEncoding.EncodeToString(payload)
-				sshExec(*vm, fmt.Sprintf("echo %s | base64 -d | tmux load-buffer -b orch-in - && tmux paste-buffer -b orch-in -t %s -d", b64, session))
-			}
-		}()
-
-		ticker := time.NewTicker(300 * time.Millisecond)
-		defer ticker.Stop()
-		var last string
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -e -S -200 2>&1", session))
-				if err != nil {
-					return
-				}
-				if out == last {
-					continue
-				}
-				last = out
-				conn.(net.Conn).SetWriteDeadline(time.Now().Add(5 * time.Second)) //nolint
-				if err := wsWriteFrame(conn, 0x02, []byte(out)); err != nil {
-					return
-				}
-			}
-		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(out))
 	}))
 
 	// SPA static files — all other routes serve www/dist with index.html fallback
@@ -2044,10 +2510,38 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Mention watcher: validate org access at startup so a missing
+	// `read:org` scope or non-member token surfaces immediately, not on
+	// the first tick. This is intentionally a hard fail — silently
+	// downgrading members to "external" would route their requests to
+	// the canned reply.
+	if cfg.Orch.Mentions != nil {
+		if _, err := fetchMaintainers(cfg.Orch.Mentions.Org); err != nil {
+			log.Fatalf("mentions: cannot read org %s members (token needs read:org and to be in the org): %v",
+				cfg.Orch.Mentions.Org, err)
+		}
+		mentionInterval, err := time.ParseDuration(cfg.Orch.Mentions.PollInterval)
+		if err != nil || mentionInterval == 0 {
+			mentionInterval = 5 * time.Minute
+		}
+		go func() {
+			mt := time.NewTicker(mentionInterval)
+			defer mt.Stop()
+			mentionTick(&cfg, st)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-mt.C:
+					mentionTick(&cfg, st)
+				}
+			}
+		}()
+		log.Printf("mentions: poller started, every %s, org=%s", mentionInterval, cfg.Orch.Mentions.Org)
+	}
+
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	at := time.NewTicker(5 * time.Second)
-	defer at.Stop()
 	tick(&cfg, st)
 	for {
 		select {
@@ -2056,8 +2550,6 @@ func main() {
 			return
 		case <-t.C:
 			tick(&cfg, st)
-		case <-at.C:
-			sampleActivity(&cfg, st)
 		}
 	}
 }
