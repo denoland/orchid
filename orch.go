@@ -775,7 +775,7 @@ func tmuxPaste(vm VMBlock, session, msg string) error {
 	if _, errStr, err := sshExecIn(vm, msg, "tmux load-buffer -b orch -"); err != nil {
 		return fmt.Errorf("load-buffer: %v: %s", err, errStr)
 	}
-	cmd := fmt.Sprintf("tmux paste-buffer -b orch -t %s -d && sleep 0.3 && tmux send-keys -t %s Enter", session, session)
+	cmd := fmt.Sprintf("tmux paste-buffer -b orch -t %s -d && sleep 1 && tmux send-keys -t %s C-m", session, session)
 	if _, errStr, err := sshExec(vm, cmd); err != nil {
 		return fmt.Errorf("paste-buffer+enter: %v: %s", err, errStr)
 	}
@@ -862,12 +862,19 @@ var agentSpecs = map[string]agentSpec{
 		// version. It's also stable across the welcome screen and the input
 		// prompt (the per-tip hints below the prompt rotate).
 		idleMarker: "gpt-",
-		busyMarker: "", // no reliable busy marker; "not idle" suffices
+		busyMarker: "esc to interrupt",
 		resumeXform: func(s string) string {
-			// Replace the bare `codex` invocation with `codex resume --last`.
-			// Operators write session_cmd as `... exec codex` (or similar);
-			// the trailing `codex` is what we transform.
-			return strings.Replace(s, "exec codex", "exec codex resume --last", 1)
+			// Handle both `exec codex` (shell wrapper) and bare binary invocation.
+			// Insert `resume --last` right after the codex binary (before any flags).
+			if strings.Contains(s, "exec codex") {
+				return strings.Replace(s, "exec codex", "exec codex resume --last", 1)
+			}
+			// bare: `.../bin/codex [flags]` → `.../bin/codex resume --last [flags]`
+			if i := strings.Index(s, "/bin/codex"); i >= 0 {
+				j := i + len("/bin/codex")
+				return s[:j] + " resume --last" + s[j:]
+			}
+			return s
 		},
 	},
 }
@@ -1185,7 +1192,7 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 	// Settings.json provisioned by bootstrapVM kills the dangerous-mode
 	// warnings, so trust is the only dialog we should see at first launch.
 	time.Sleep(3 * time.Second)
-	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
+	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s C-m", session))
 	// 3 minutes covers slow claude TUI startup in heavy worktrees (e.g.
 	// fresh deno checkout: lockfile parse + project scan can push first
 	// idle past the 60s mark on a contended VM).
@@ -1277,7 +1284,7 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 		return err
 	}
 	time.Sleep(3 * time.Second)
-	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
+	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s C-m", session))
 	// Same 3-minute window as startSession; claude --resume on a heavy
 	// worktree replays the conversation and can take a while.
 	deadline := time.Now().Add(3 * time.Minute)
