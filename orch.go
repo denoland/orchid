@@ -1045,11 +1045,70 @@ func tearDown(cfg *Config, st *State, issue int) {
 	if j == nil {
 		return
 	}
-	if vm := vmByName(cfg, j.VM); vm != nil {
+	vm := vmByName(cfg, j.VM)
+	if vm != nil {
 		tmuxKill(*vm, j.Tmux)
+		pruneWorkdir(*vm, cfg.Orch.WorkdirRoot, issue)
 	}
 	delete(st.Jobs, issue)
 	log.Printf("issue #%d: torn down (was on %s/%s)", issue, j.VM, j.Tmux)
+}
+
+// pruneWorkdir removes the per-issue workdir (git worktree + build artifacts).
+// Called on teardown and periodically for orphans.
+func pruneWorkdir(vm VMBlock, root string, issue int) {
+	root = strings.TrimRight(root, "/")
+	dir := fmt.Sprintf("%s/issue-%d", root, issue)
+	// remove the worktree from git first so the shared clone stays consistent
+	pruneCmd := fmt.Sprintf(
+		"cd %s/issue-%d 2>/dev/null && git worktree remove --force %s/issue-%d 2>/dev/null || true; rm -rf %s/issue-%d",
+		root, issue, root, issue, root, issue,
+	)
+	if _, _, err := sshExec(vm, pruneCmd); err != nil {
+		log.Printf("prune workdir %s: %v", dir, err)
+	} else {
+		log.Printf("pruned workdir %s", dir)
+	}
+}
+
+// pruneOrphanWorkdirs removes workdirs for issues no longer in active state.
+// Runs periodically so long-dead workdirs don't fill the disk.
+func pruneOrphanWorkdirs(cfg *Config, st *State) {
+	st.mu.Lock()
+	active := make(map[int]string) // issue → VM name
+	for n, j := range st.Jobs {
+		active[n] = j.VM
+	}
+	st.mu.Unlock()
+
+	root := strings.TrimRight(cfg.Orch.WorkdirRoot, "/")
+	for _, vm := range cfg.VMs {
+		out, _, err := sshExec(vm, fmt.Sprintf("ls -d %s/issue-* 2>/dev/null", root))
+		if err != nil || out == "" {
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			// extract issue number from path like /path/issue-42
+			parts := strings.Split(line, "/")
+			base := parts[len(parts)-1]
+			if !strings.HasPrefix(base, "issue-") {
+				continue
+			}
+			n, err := strconv.Atoi(strings.TrimPrefix(base, "issue-"))
+			if err != nil {
+				continue
+			}
+			if vmName, ok := active[n]; ok && vmName == vm.Name {
+				continue // still active on this VM
+			}
+			log.Printf("pruning orphan workdir %s on %s", line, vm.Name)
+			pruneWorkdir(vm, root, n)
+		}
+	}
 }
 
 func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments []string, pushed bool, checkChanges []string) {
@@ -2546,6 +2605,20 @@ func main() {
 		}()
 		log.Printf("mentions: poller started, every %s, org=%s", mentionInterval, cfg.Orch.Mentions.Org)
 	}
+
+	go func() {
+		pt := time.NewTicker(time.Hour)
+		defer pt.Stop()
+		pruneOrphanWorkdirs(&cfg, st)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pt.C:
+				pruneOrphanWorkdirs(&cfg, st)
+			}
+		}
+	}()
 
 	t := time.NewTicker(interval)
 	defer t.Stop()
