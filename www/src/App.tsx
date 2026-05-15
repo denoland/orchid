@@ -16,7 +16,7 @@ function parseRoute(): Route {
 
 export default function App() {
   const [route, setRoute] = useState<Route>(parseRoute)
-  const [state, setState] = useState<State>({ jobs: [], vms: [], inbox: '' })
+  const [state, setState] = useState<State>({ jobs: [], vms: [], inbox: '', operator: '' })
 
   useEffect(() => {
     const onHash = () => setRoute(parseRoute())

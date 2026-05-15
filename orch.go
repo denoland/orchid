@@ -783,6 +783,78 @@ func tmuxPaste(vm VMBlock, session, msg string) error {
 	return nil
 }
 
+const operatorTmux = "operator"
+
+// localVM returns the first localhost VM in the config, or nil.
+func localVM(cfg *Config) *VMBlock {
+	for i := range cfg.VMs {
+		if isLocal(cfg.VMs[i]) {
+			return &cfg.VMs[i]
+		}
+	}
+	return nil
+}
+
+// operatorAlive returns whether the operator tmux session exists on any local VM.
+func operatorAlive(cfg *Config) bool {
+	vm := localVM(cfg)
+	if vm == nil {
+		return false
+	}
+	_, _, err := sshExec(*vm, fmt.Sprintf("tmux has-session -t %s 2>/dev/null", operatorTmux))
+	return err == nil
+}
+
+// spawnOperator creates the operator tmux session running claude as the
+// session_home user, waits for the idle prompt, then enables remote-control.
+// Runs in its own goroutine — blocks up to 3 min waiting for claude to start.
+func spawnOperator(cfg *Config) {
+	vm := localVM(cfg)
+	if vm == nil {
+		return
+	}
+	sessionHome := "/home/orchid"
+	for _, v := range cfg.VMs {
+		if isLocal(v) && v.SessionHome != "" {
+			sessionHome = v.SessionHome
+			break
+		}
+	}
+	cmd := fmt.Sprintf(
+		"tmux new-session -d -s %s -c %s 'runuser -u orchid -- claude --dangerously-skip-permissions'",
+		operatorTmux, sessionHome,
+	)
+	if _, _, err := sshExec(*vm, cmd); err != nil {
+		log.Printf("operator: spawn failed: %v", err)
+		return
+	}
+	log.Printf("operator: session started, waiting for idle prompt")
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		time.Sleep(3 * time.Second)
+		out, _, _ := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s", operatorTmux))
+		if strings.Contains(out, "trust this folder") || strings.Contains(out, "I trust") {
+			_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s '1' C-m", operatorTmux))
+			continue
+		}
+		if strings.Contains(out, "bypass permissions") {
+			_ = tmuxPaste(*vm, operatorTmux, "/remote-control\n")
+			log.Printf("operator: ready, remote-control enabled")
+			return
+		}
+	}
+	log.Printf("operator: timed out waiting for idle prompt")
+}
+
+// ensureOperator checks if the operator session is alive and spawns it if not.
+func ensureOperator(cfg *Config) {
+	if operatorAlive(cfg) {
+		return
+	}
+	log.Printf("operator: session not found, spawning")
+	go spawnOperator(cfg)
+}
+
 // sessionName picks a tmux session id that reflects the agent running in
 // the pane. Empty agent falls back to "claude" for back-compat.
 func sessionName(issue int, agent string) string {
@@ -2247,9 +2319,10 @@ type apiVMEntry struct {
 }
 
 type apiStateResp struct {
-	Jobs  []apiJobEntry `json:"jobs"`
-	VMs   []apiVMEntry  `json:"vms"`
-	Inbox string        `json:"inbox"`
+	Jobs     []apiJobEntry `json:"jobs"`
+	VMs      []apiVMEntry  `json:"vms"`
+	Inbox    string        `json:"inbox"`
+	Operator string        `json:"operator"` // tmux session name if alive, "" if dead
 }
 
 // describe renders a markdown block describing this orch instance: config
@@ -2456,10 +2529,15 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
+		op := ""
+		if operatorAlive(cfg) {
+			op = operatorTmux
+		}
 		_ = json.NewEncoder(w).Encode(apiStateResp{
-			Jobs:  jobs,
-			VMs:   vms,
-			Inbox: cfg.GitHub.InboxRepo,
+			Jobs:     jobs,
+			VMs:      vms,
+			Inbox:    cfg.GitHub.InboxRepo,
+			Operator: op,
 		})
 	}))
 
@@ -2527,6 +2605,20 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write([]byte(out))
+	}))
+
+	// POST /api/operator — spawn (or respawn) the operator claude session.
+	mux.HandleFunc("/api/operator", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		if operatorAlive(cfg) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		go spawnOperator(cfg)
+		w.WriteHeader(http.StatusAccepted)
 	}))
 
 	// SPA static files — all other routes serve www/dist with index.html fallback
@@ -2645,6 +2737,21 @@ func main() {
 				return
 			case <-pt.C:
 				pruneOrphanWorkdirs(&cfg, st)
+			}
+		}
+	}()
+
+	// Operator session watcher: ensure the operator claude session is always alive.
+	go func() {
+		ot := time.NewTicker(30 * time.Second)
+		defer ot.Stop()
+		ensureOperator(&cfg)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ot.C:
+				ensureOperator(&cfg)
 			}
 		}
 	}()
