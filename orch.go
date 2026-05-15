@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -2463,8 +2464,30 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 	}))
 
 	// /api/pane?s=<session> — returns tmux capture-pane snapshot as text/plain.
-	// Frontend polls this every ~1.5s instead of holding a WebSocket. Single
-	// SSH call per request, no framing, no goroutine-per-tab.
+	// paneVM resolves a tmux session to its VM. Checks active jobs first,
+	// then falls back to scanning localhost VMs (for operator sessions not
+	// tracked in state).
+	paneVM := func(session string) *VMBlock {
+		if v := st.httpSnap.Load(); v != nil {
+			for _, j := range v.(map[int]Job) {
+				if j.Tmux == session {
+					return vmByName(cfg, j.VM)
+				}
+			}
+		}
+		for i := range cfg.VMs {
+			if isLocal(cfg.VMs[i]) {
+				_, _, err := sshExec(cfg.VMs[i], fmt.Sprintf("tmux has-session -t %s 2>/dev/null", session))
+				if err == nil {
+					return &cfg.VMs[i]
+				}
+			}
+		}
+		return nil
+	}
+
+	// GET  /api/pane?s=<session> — snapshot of pane content (ANSI)
+	// POST /api/pane?s=<session> — forward body bytes as tmux input
 	mux.HandleFunc("/api/pane", auth(func(w http.ResponseWriter, r *http.Request) {
 		session := r.URL.Query().Get("s")
 		for _, c := range session {
@@ -2477,17 +2500,23 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			http.Error(w, "s required", http.StatusBadRequest)
 			return
 		}
-		var vm *VMBlock
-		if v := st.httpSnap.Load(); v != nil {
-			for _, j := range v.(map[int]Job) {
-				if j.Tmux == session {
-					vm = vmByName(cfg, j.VM)
-					break
-				}
-			}
-		}
+		vm := paneVM(session)
 		if vm == nil {
 			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodPost {
+			body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+			if err != nil || len(body) == 0 {
+				http.Error(w, "bad body", http.StatusBadRequest)
+				return
+			}
+			if _, errStr, err := sshExecIn(*vm, string(body),
+				fmt.Sprintf("tmux load-buffer -b input - && tmux paste-buffer -b input -t %s -d", session)); err != nil {
+				http.Error(w, "send failed: "+errStr, http.StatusBadGateway)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -e -S -200 2>&1", session))

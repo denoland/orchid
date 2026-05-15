@@ -80,6 +80,13 @@ export function Pane({ session }: Props) {
       }
     }
 
+    term.onData((data) => {
+      fetch(`/api/pane?s=${encodeURIComponent(session)}`, {
+        method: 'POST',
+        body: data,
+      }).catch(() => {})
+    })
+
     poll()
     const interval = setInterval(poll, POLL_MS)
 
