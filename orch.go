@@ -847,12 +847,27 @@ func spawnOperator(cfg *Config) {
 }
 
 // ensureOperator checks if the operator session is alive and spawns it if not.
+// If alive but remote-control is not yet active, it enables it.
 func ensureOperator(cfg *Config) {
-	if operatorAlive(cfg) {
+	vm := localVM(cfg)
+	if vm == nil {
 		return
 	}
-	log.Printf("operator: session not found, spawning")
-	go spawnOperator(cfg)
+	_, _, err := sshExec(*vm, fmt.Sprintf("tmux has-session -t %s 2>/dev/null", operatorTmux))
+	if err != nil {
+		log.Printf("operator: session not found, spawning")
+		go spawnOperator(cfg)
+		return
+	}
+	// Session alive — check if remote-control is active; enable if not.
+	out, _, _ := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s", operatorTmux))
+	if strings.Contains(out, "Remote Control active") {
+		return
+	}
+	if strings.Contains(out, "bypass permissions") && !strings.Contains(out, "esc to interrupt") {
+		_ = tmuxPaste(*vm, operatorTmux, "/remote-control\n")
+		log.Printf("operator: enabled remote-control")
+	}
 }
 
 // sessionName picks a tmux session id that reflects the agent running in
