@@ -87,13 +87,10 @@ type VMBlock struct {
 	SessionHome string `hcl:"session_home,optional"` // home dir of user running the session (for trust stamp)
 	BotLogin    string `hcl:"bot_login,optional"`    // overrides orchestrator.bot_login for sessions on this VM
 	BotEmail    string `hcl:"bot_email,optional"`    // overrides orchestrator.bot_email for sessions on this VM
-	Agent       string `hcl:"agent,optional"`        // "claude" (default) or "codex" — drives idle marker, resume cmd, trust setup
-	IdleMarker  string `hcl:"idle_marker,optional"`  // optional override of the agent default idle pane substring
-	BusyMarker  string `hcl:"busy_marker,optional"`  // optional override of the agent default busy pane substring
-	// Per-VM override of the top-level bootstrap_prompt. When set, used for
-	// oneshot sessions spawned on this VM (e.g. codex needs different PR
-	// instructions than claude).
-	BootstrapPrompt string `hcl:"bootstrap_prompt,optional"`
+	Agent           string `hcl:"agent,optional"`            // "claude" (default) or "codex" — drives idle marker, resume cmd, trust setup
+	IdleMarker      string `hcl:"idle_marker,optional"`      // optional override of the agent default idle pane substring
+	BusyMarker      string `hcl:"busy_marker,optional"`      // optional override of the agent default busy pane substring
+	BootstrapPrompt string `hcl:"bootstrap_prompt,optional"` // optional override of orchestrator.bootstrap_prompt for this VM
 }
 
 // Job lifecycle: "oneshot" (default) — issue → session → PR → teardown.
@@ -776,64 +773,15 @@ func detectAgentFromPane(pane string) string {
 	return ""
 }
 
-// pasteSeq counts tmuxPaste invocations so each call gets a unique tmux
-// named-buffer. Previously all callers shared one "orch" buffer; concurrent
-// bootstrap pastes would race on it, causing both prompts to land in both
-// panes (denoland/orchid#101). The buffer name is also pid-scoped so two
-// orch processes pointing at the same tmux server (rare, but possible during
-// a deploy overlap) cannot collide either.
-var pasteSeq uint64
-
-func tmuxPasteBuf() string {
-	n := atomic.AddUint64(&pasteSeq, 1)
-	return fmt.Sprintf("orch-%d-%d", os.Getpid(), n)
-}
-
 func tmuxPaste(vm VMBlock, session, msg string) error {
-	buf := tmuxPasteBuf()
-	if _, errStr, err := sshExecIn(vm, msg, fmt.Sprintf("tmux load-buffer -b %s -", buf)); err != nil {
+	if _, errStr, err := sshExecIn(vm, msg, "tmux load-buffer -b orch -"); err != nil {
 		return fmt.Errorf("load-buffer: %v: %s", err, errStr)
 	}
-	cmd := fmt.Sprintf("tmux paste-buffer -b %s -t %s -d && sleep 1 && tmux send-keys -t %s C-m", buf, session, session)
+	cmd := fmt.Sprintf("tmux paste-buffer -b orch -t %s -d && sleep 1 && tmux send-keys -t %s C-m", session, session)
 	if _, errStr, err := sshExec(vm, cmd); err != nil {
 		return fmt.Errorf("paste-buffer+enter: %v: %s", err, errStr)
 	}
 	return nil
-}
-
-// tmuxConfirmSubmitted waits for <session>'s pane to leave its idle state
-// after a tmuxPaste — i.e. the agent picked up the pasted prompt and started
-// working. If the pane stays idle, it sends additional Enter keystrokes
-// (covering codex's TUI quirk where pasted content is collapsed into a
-// "[Pasted Content N chars]" placeholder and the first Enter only expands
-// the placeholder — a second Enter is required to actually submit).
-//
-// Returns nil once the pane is busy. Returns an error if the deadline
-// elapses without a transition; the caller is expected to capture the pane
-// and surface the tail so a human can see what's stuck.
-func tmuxConfirmSubmitted(vm VMBlock, session string) error {
-	const deadline = 30 * time.Second
-	const maxExtraEnters = 3
-	end := time.Now().Add(deadline)
-	extras := 0
-	for time.Now().Before(end) {
-		time.Sleep(1500 * time.Millisecond)
-		idle, _, err := tmuxIdle(vm, session)
-		if err != nil {
-			continue
-		}
-		if !idle {
-			return nil
-		}
-		if extras >= maxExtraEnters {
-			continue
-		}
-		if _, _, err := sshExec(vm, fmt.Sprintf("tmux send-keys -t %s C-m", session)); err != nil {
-			log.Printf("session %s: extra Enter failed: %v", session, err)
-		}
-		extras++
-	}
-	return fmt.Errorf("pane never transitioned to busy within %s (sent %d extra Enters)", deadline, extras)
 }
 
 const operatorTmux = "operator"
@@ -873,6 +821,14 @@ func spawnOperator(cfg *Config) {
 			break
 		}
 	}
+	// Pre-stamp trust for sessionHome so the TUI never shows the dialog.
+	stampCmd := fmt.Sprintf(
+		`CJSON=/home/orchid/.claude.json; [ -f "$CJSON" ] || echo '{}' > "$CJSON"; `+
+			`jq --arg d %q '.projects[$d].hasTrustDialogAccepted = true' "$CJSON" > "$CJSON.tmp" && mv "$CJSON.tmp" "$CJSON"; `+
+			`chown orchid:orchid "$CJSON" 2>/dev/null || true`,
+		sessionHome,
+	)
+	_, _, _ = sshExec(*vm, stampCmd)
 	cmd := fmt.Sprintf(
 		"tmux new-session -d -s %s -c %s 'runuser -u orchid -- claude --dangerously-skip-permissions'",
 		operatorTmux, sessionHome,
@@ -915,6 +871,12 @@ func ensureOperator(cfg *Config) {
 	// Session alive — check if remote-control is active; enable if not.
 	out, _, _ := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s", operatorTmux))
 	if strings.Contains(out, "Remote Control active") {
+		return
+	}
+	// Dismiss trust dialog if it appeared (e.g. after OOM kill/respawn).
+	if strings.Contains(out, "trust this folder") || strings.Contains(out, "I trust") {
+		_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s '1' C-m", operatorTmux))
+		log.Printf("operator: dismissed trust dialog")
 		return
 	}
 	if strings.Contains(out, "bypass permissions") && !strings.Contains(out, "esc to interrupt") {
@@ -1298,22 +1260,11 @@ func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments 
 	}
 	prev := j.LastCheckConclusions
 	for name, conclusion := range latest {
-		if prev[name] != conclusion && isActionableConclusion(conclusion) {
+		if prev[name] != conclusion {
 			checkChanges = append(checkChanges, fmt.Sprintf("%s: %s", name, conclusion))
 		}
 	}
 	return
-}
-
-// isActionableConclusion reports whether a CI check conclusion needs the
-// worker's attention. Reporting every SUCCESS/SKIPPED transition burns
-// tokens for no benefit — the worker can't act on a passing check.
-func isActionableConclusion(c string) bool {
-	switch c {
-	case "FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE":
-		return true
-	}
-	return false
 }
 
 func ntfyNotify(topic, title, msg, clickURL string) {
@@ -1426,7 +1377,7 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 		return fmt.Errorf("session never reached idle prompt within %s (claude not authenticated?); pane tail:\n%s", idleWaitTimeout, strings.TrimSpace(pane))
 	}
 	tmpl := cfg.BootstrapPrompt
-	if vm.BootstrapPrompt != "" && lifecycle != "cron" {
+	if vm.BootstrapPrompt != "" {
 		tmpl = vm.BootstrapPrompt
 	}
 	if lifecycle == "cron" {
@@ -1437,18 +1388,6 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 	if err := tmuxPaste(*vm, session, msg); err != nil {
 		tmuxKill(*vm, session)
 		return fmt.Errorf("bootstrap paste: %w", err)
-	}
-	// Verify the agent actually picked up the prompt. Without this check
-	// codex sessions can sit idle indefinitely with the prompt parked in
-	// their input buffer (denoland/orchid#101) — codex's TUI collapses
-	// pasted content into a "[Pasted Content N chars]" placeholder where
-	// the first Enter only expands the placeholder, a second is needed to
-	// submit. tmuxConfirmSubmitted will send up to a few extra Enters
-	// until the pane transitions to busy.
-	if err := tmuxConfirmSubmitted(*vm, session); err != nil {
-		pane, _, _ := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s | tail -15", session))
-		tmuxKill(*vm, session)
-		return fmt.Errorf("bootstrap submit confirm: %w; pane tail:\n%s", err, strings.TrimSpace(pane))
 	}
 	return nil
 }
@@ -1541,14 +1480,6 @@ Resume your work — check what is implemented, address any CI failures or revie
 	if err := tmuxPaste(*vm, session, msg); err != nil {
 		tmuxKill(*vm, session)
 		return fmt.Errorf("resume paste: %w", err)
-	}
-	// Same codex double-Enter guard as the fresh-bootstrap path — without
-	// it a respawned codex pane can sit idle with the resume report parked
-	// in its input buffer. Log-only on failure here (no kill) so a slow
-	// resume on a hot worktree doesn't blow away a session that may still
-	// catch up on its own.
-	if err := tmuxConfirmSubmitted(*vm, session); err != nil {
-		log.Printf("issue #%d: resume submit confirm: %v", n, err)
 	}
 	j.Tmux = session
 	log.Printf("issue #%d: resumed on %s/%s, PR #%d", n, vm.Name, session, j.PR)
@@ -2291,10 +2222,18 @@ func tick(cfg *Config, st *State) {
 						// either. Drop the session — keep retrying just
 						// spams the log every tick.
 						if strings.Contains(err.Error(), "already exists") {
-							log.Printf("issue #%d: branch %s already has a PR by another account, tearing down", n, j.Branch)
-							tearDown(cfg, st, n)
-							_ = saveState(cfg.Orch.StateFile, st)
-							continue
+							// PR opened by a different account (e.g. codex/fibibot).
+							// Try to find and adopt it without the author filter.
+							pr2, err2 := ghFindPRByBranch(j.TargetRepo, j.Branch, "")
+							if err2 == nil && pr2 != nil {
+								log.Printf("issue #%d: adopting PR #%d opened by another account on branch %s", n, pr2.Number, j.Branch)
+								pr = pr2
+							} else {
+								log.Printf("issue #%d: branch %s already has a PR by another account, tearing down", n, j.Branch)
+								tearDown(cfg, st, n)
+								_ = saveState(cfg.Orch.StateFile, st)
+								continue
+							}
 						}
 						log.Printf("issue #%d: auto-create PR: %v", n, err)
 					} else if prNum > 0 {
@@ -2691,13 +2630,8 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				http.Error(w, "bad body", http.StatusBadRequest)
 				return
 			}
-			// Per-call buffer name so two dashboard tabs typing into
-			// different panes (or one user paste-bursting into a single
-			// pane) cannot race on a shared "input" buffer the way the
-			// bootstrap path used to (denoland/orchid#101).
-			buf := tmuxPasteBuf()
 			if _, errStr, err := sshExecIn(*vm, string(body),
-				fmt.Sprintf("tmux load-buffer -b %s - && tmux paste-buffer -b %s -t %s -d", buf, buf, session)); err != nil {
+				fmt.Sprintf("tmux load-buffer -b input - && tmux paste-buffer -b input -t %s -d", session)); err != nil {
 				http.Error(w, "send failed: "+errStr, http.StatusBadGateway)
 				return
 			}
