@@ -90,6 +90,10 @@ type VMBlock struct {
 	Agent       string `hcl:"agent,optional"`        // "claude" (default) or "codex" — drives idle marker, resume cmd, trust setup
 	IdleMarker  string `hcl:"idle_marker,optional"`  // optional override of the agent default idle pane substring
 	BusyMarker  string `hcl:"busy_marker,optional"`  // optional override of the agent default busy pane substring
+	// Per-VM override of the top-level bootstrap_prompt. When set, used for
+	// oneshot sessions spawned on this VM (e.g. codex needs different PR
+	// instructions than claude).
+	BootstrapPrompt string `hcl:"bootstrap_prompt,optional"`
 }
 
 // Job lifecycle: "oneshot" (default) — issue → session → PR → teardown.
@@ -1294,11 +1298,22 @@ func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments 
 	}
 	prev := j.LastCheckConclusions
 	for name, conclusion := range latest {
-		if prev[name] != conclusion {
+		if prev[name] != conclusion && isActionableConclusion(conclusion) {
 			checkChanges = append(checkChanges, fmt.Sprintf("%s: %s", name, conclusion))
 		}
 	}
 	return
+}
+
+// isActionableConclusion reports whether a CI check conclusion needs the
+// worker's attention. Reporting every SUCCESS/SKIPPED transition burns
+// tokens for no benefit — the worker can't act on a passing check.
+func isActionableConclusion(c string) bool {
+	switch c {
+	case "FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE":
+		return true
+	}
+	return false
 }
 
 func ntfyNotify(topic, title, msg, clickURL string) {
@@ -1411,6 +1426,9 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 		return fmt.Errorf("session never reached idle prompt within %s (claude not authenticated?); pane tail:\n%s", idleWaitTimeout, strings.TrimSpace(pane))
 	}
 	tmpl := cfg.BootstrapPrompt
+	if vm.BootstrapPrompt != "" && lifecycle != "cron" {
+		tmpl = vm.BootstrapPrompt
+	}
 	if lifecycle == "cron" {
 		tmpl = cfg.CronBootstrapPrompt
 	}
