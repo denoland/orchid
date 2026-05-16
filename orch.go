@@ -855,6 +855,64 @@ func spawnOperator(cfg *Config) {
 	log.Printf("operator: timed out waiting for idle prompt")
 }
 
+// ensureWorkerRemoteControl pastes /remote-control into any live claude
+// worker pane that's missing the footer. Mirrors ensureOperator for the
+// issue-driven worker fleet — covers (a) initial spawns where startSession's
+// remote-control paste raced with claude's idle marker, (b) orchid restarts
+// against tmux sessions that survived, and (c) workers that somehow exited
+// remote-control mode. Codex sessions are skipped — codex has no equivalent
+// slash command.
+func ensureWorkerRemoteControl(cfg *Config, st *State) {
+	type target struct {
+		vm      VMBlock
+		session string
+		issue   int
+	}
+	st.mu.Lock()
+	var targets []target
+	for n, j := range st.Jobs {
+		if j == nil || j.Tmux == "" {
+			continue
+		}
+		// Tmux name is authoritative for what's running in the pane —
+		// detectAgentFromPane keeps it in sync via rename-session in tick().
+		if !strings.HasPrefix(j.Tmux, "claude-") {
+			continue
+		}
+		vm := vmByName(cfg, j.VM)
+		if vm == nil {
+			continue
+		}
+		targets = append(targets, target{vm: *vm, session: j.Tmux, issue: n})
+	}
+	st.mu.Unlock()
+
+	for _, t := range targets {
+		out, _, err := sshExec(t.vm, fmt.Sprintf("tmux capture-pane -p -t %s", t.session))
+		if err != nil {
+			// Session likely gone; tick() handles respawn — nothing to do here.
+			continue
+		}
+		if strings.Contains(out, "Remote Control active") {
+			continue
+		}
+		// Only paste at the idle prompt; pasting under a busy claude would
+		// land the slash command in whatever buffer is currently capturing
+		// input. Matches the ensureOperator heuristic.
+		if !strings.Contains(out, "bypass permissions") {
+			continue
+		}
+		if strings.Contains(out, "esc to interrupt") {
+			continue
+		}
+		if err := tmuxPaste(t.vm, t.session, "/remote-control\n"); err != nil {
+			log.Printf("issue #%d: enable remote-control failed: %v", t.issue, err)
+			continue
+		}
+		log.Printf("issue #%d: enabled remote-control on %s", t.issue, t.session)
+	}
+}
+
 // ensureOperator checks if the operator session is alive and spawns it if not.
 // If alive but remote-control is not yet active, it enables it.
 func ensureOperator(cfg *Config) {
@@ -1376,6 +1434,15 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 		tmuxKill(*vm, session)
 		return fmt.Errorf("session never reached idle prompt within %s (claude not authenticated?); pane tail:\n%s", idleWaitTimeout, strings.TrimSpace(pane))
 	}
+	// Enable /remote-control on claude workers so the orchestrator's
+	// remote-control viewer can surface the pane. Codex has no equivalent
+	// slash command, so this only fires for claude. Best-effort: the
+	// periodic worker-remote-control sweep will retry if this paste fails.
+	if vmAgent(*vm).name == "claude" {
+		if err := tmuxPaste(*vm, session, "/remote-control\n"); err != nil {
+			log.Printf("issue #%d: remote-control enable failed: %v", is.Number, err)
+		}
+	}
 	tmpl := cfg.BootstrapPrompt
 	if vm.BootstrapPrompt != "" {
 		tmpl = vm.BootstrapPrompt
@@ -1453,11 +1520,21 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 	// Same 3-minute window as startSession; claude --resume on a heavy
 	// worktree replays the conversation and can take a while.
 	deadline := time.Now().Add(3 * time.Minute)
+	resumeIdle := false
 	for time.Now().Before(deadline) {
 		if idle, _, err := tmuxIdle(*vm, session); err == nil && idle {
+			resumeIdle = true
 			break
 		}
 		time.Sleep(2 * time.Second)
+	}
+	// Same as the initial spawn path: re-enable /remote-control on claude
+	// resumes. --resume restores conversation context but not pane modes,
+	// so the slash command must be re-issued. Codex skipped (no equivalent).
+	if resumeIdle && vmAgent(*vm).name == "claude" {
+		if err := tmuxPaste(*vm, session, "/remote-control\n"); err != nil {
+			log.Printf("issue #%d: remote-control re-enable failed: %v", n, err)
+		}
 	}
 
 	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
@@ -2782,17 +2859,21 @@ func main() {
 		}
 	}()
 
-	// Operator session watcher: ensure the operator claude session is always alive.
+	// Operator session watcher: ensure the operator claude session is always
+	// alive, and that every claude worker has /remote-control enabled so the
+	// orchestrator's remote-control viewer can drive its pane.
 	go func() {
 		ot := time.NewTicker(30 * time.Second)
 		defer ot.Stop()
 		ensureOperator(&cfg)
+		ensureWorkerRemoteControl(&cfg, st)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ot.C:
 				ensureOperator(&cfg)
+				ensureWorkerRemoteControl(&cfg, st)
 			}
 		}
 	}()
