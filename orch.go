@@ -76,17 +76,17 @@ type MentionsBlock struct {
 }
 
 type VMBlock struct {
-	Name        string `hcl:",label"`
-	Host        string `hcl:"host"`
-	User        string `hcl:"user,optional"`
-	Key         string `hcl:"key,optional"`      // not needed for localhost
-	Capacity    int    `hcl:"capacity,optional"` // 0 = unlimited
-	Sccache     bool   `hcl:"sccache,optional"`
-	SccacheDir  string `hcl:"sccache_dir,optional"`  // default ~/.cache/sccache
-	SessionCmd  string `hcl:"session_cmd,optional"`  // default: clawpatrol run -- claude --dangerously-skip-permissions
-	SessionHome string `hcl:"session_home,optional"` // home dir of user running the session (for trust stamp)
-	BotLogin    string `hcl:"bot_login,optional"`    // overrides orchestrator.bot_login for sessions on this VM
-	BotEmail    string `hcl:"bot_email,optional"`    // overrides orchestrator.bot_email for sessions on this VM
+	Name            string `hcl:",label"`
+	Host            string `hcl:"host"`
+	User            string `hcl:"user,optional"`
+	Key             string `hcl:"key,optional"`      // not needed for localhost
+	Capacity        int    `hcl:"capacity,optional"` // 0 = unlimited
+	Sccache         bool   `hcl:"sccache,optional"`
+	SccacheDir      string `hcl:"sccache_dir,optional"`      // default ~/.cache/sccache
+	SessionCmd      string `hcl:"session_cmd,optional"`      // default: clawpatrol run -- claude --dangerously-skip-permissions
+	SessionHome     string `hcl:"session_home,optional"`     // home dir of user running the session (for trust stamp)
+	BotLogin        string `hcl:"bot_login,optional"`        // overrides orchestrator.bot_login for sessions on this VM
+	BotEmail        string `hcl:"bot_email,optional"`        // overrides orchestrator.bot_email for sessions on this VM
 	Agent           string `hcl:"agent,optional"`            // "claude" (default) or "codex" — drives idle marker, resume cmd, trust setup
 	IdleMarker      string `hcl:"idle_marker,optional"`      // optional override of the agent default idle pane substring
 	BusyMarker      string `hcl:"busy_marker,optional"`      // optional override of the agent default busy pane substring
@@ -101,7 +101,7 @@ type Job struct {
 	Target               string            `json:"target"`      // target block name
 	TargetRepo           string            `json:"target_repo"` // resolved (e.g. denoland/deno)
 	Branch               string            `json:"branch"`
-	IssueTitle           string            `json:"issue_title,omitempty"` // mirrored from inbox issue; refreshed each poll
+	IssueTitle           string            `json:"issue_title,omitempty"`     // mirrored from inbox issue; refreshed each poll
 	Lifecycle            string            `json:"lifecycle,omitempty"`       // "oneshot" (default) or "cron"
 	Schedule             string            `json:"schedule,omitempty"`        // cron only: parseable by time.ParseDuration
 	Timeout              string            `json:"timeout,omitempty"`         // cron only: max runtime per tick before orch kills the pane
@@ -999,8 +999,8 @@ func vmByName(cfg *Config, name string) *VMBlock {
 // and how to transform a fresh start command into a resume command.
 type agentSpec struct {
 	name        string
-	idleMarker  string                    // substring present when the TUI is at its input prompt
-	busyMarker  string                    // substring present when the TUI is processing (empty = "busy iff !idle")
+	idleMarker  string                         // substring present when the TUI is at its input prompt
+	busyMarker  string                         // substring present when the TUI is processing (empty = "busy iff !idle")
 	resumeXform func(sessionCmd string) string // returns a session_cmd that resumes the most recent conversation
 }
 
@@ -2293,24 +2293,17 @@ func tick(cfg *Config, st *State) {
 					prNum, err := ghAutoCreatePR(cfg, n, j, r.is)
 					if err != nil {
 						// Branch already has a PR opened by a different
-						// account (e.g. another orchid instance sharing the
-						// same branch_prefix won the race). Our --author
-						// filter correctly excluded it, but we can't push
-						// either. Drop the session — keep retrying just
-						// spams the log every tick.
+						// account — a peer orchestrator (fibibot etc.)
+						// won the race. Adopting their PR is wrong: our
+						// local worker's tree diverged, we can't push fixes
+						// onto someone else's branch, and relaying their
+						// reviews into our pane is noise. Free the slot and
+						// let them finish.
 						if strings.Contains(err.Error(), "already exists") {
-							// PR opened by a different account (e.g. codex/fibibot).
-							// Try to find and adopt it without the author filter.
-							pr2, err2 := ghFindPRByBranch(j.TargetRepo, j.Branch, "")
-							if err2 == nil && pr2 != nil {
-								log.Printf("issue #%d: adopting PR #%d opened by another account on branch %s", n, pr2.Number, j.Branch)
-								pr = pr2
-							} else {
-								log.Printf("issue #%d: branch %s already has a PR by another account, tearing down", n, j.Branch)
-								tearDown(cfg, st, n)
-								_ = saveState(cfg.Orch.StateFile, st)
-								continue
-							}
+							log.Printf("issue #%d: branch %s already has a PR by another account, tearing down", n, j.Branch)
+							tearDown(cfg, st, n)
+							_ = saveState(cfg.Orch.StateFile, st)
+							continue
 						}
 						log.Printf("issue #%d: auto-create PR: %v", n, err)
 					} else if prNum > 0 {
