@@ -1,6 +1,8 @@
 package main
 
 import (
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -210,6 +212,58 @@ func TestKillBudget(t *testing.T) {
 		b := killBudget{max: 0}
 		if b.tryUse() {
 			t.Fatal("max=0 must refuse all calls")
+		}
+	})
+}
+
+// TestTmuxPasteBufUnique exercises the regression behind denoland/orchid#101:
+// when two concurrent goroutines were bootstrapping codex sessions they
+// raced on the shared "orch" tmux buffer, causing each session to receive
+// both prompts. tmuxPasteBuf must hand out a fresh name for every call so
+// load-buffer can't stomp another in-flight paste.
+func TestTmuxPasteBufUnique(t *testing.T) {
+	t.Run("sequential calls produce distinct names", func(t *testing.T) {
+		seen := map[string]bool{}
+		for i := 0; i < 1000; i++ {
+			b := tmuxPasteBuf()
+			if !strings.HasPrefix(b, "orch-") {
+				t.Fatalf("buffer name %q missing orch- prefix", b)
+			}
+			if seen[b] {
+				t.Fatalf("duplicate buffer name %q at iteration %d", b, i)
+			}
+			seen[b] = true
+		}
+	})
+
+	t.Run("concurrent callers do not collide", func(t *testing.T) {
+		const workers = 16
+		const perWorker = 100
+		var mu sync.Mutex
+		seen := map[string]bool{}
+		var wg sync.WaitGroup
+		dup := ""
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < perWorker; i++ {
+					b := tmuxPasteBuf()
+					mu.Lock()
+					if seen[b] && dup == "" {
+						dup = b
+					}
+					seen[b] = true
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+		if dup != "" {
+			t.Fatalf("concurrent tmuxPasteBuf collided on %q", dup)
+		}
+		if got := len(seen); got != workers*perWorker {
+			t.Fatalf("unique names: got %d, want %d", got, workers*perWorker)
 		}
 	})
 }
