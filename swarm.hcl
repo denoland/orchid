@@ -30,6 +30,21 @@ target "clawpatrol" {
   repo  = "denoland/clawpatrol"
 }
 
+target "sui" {
+  label = "sui"
+  repo  = "denoland/sui"
+}
+
+target "fastwebsockets" {
+  label = "fastwebsockets"
+  repo  = "denoland/fastwebsockets"
+}
+
+target "clawpatrol-deno" {
+  label = "clawpatrol-deno"
+  repo  = "denoland/clawpatrol-deno"
+}
+
 # Placeholders use {{...}} (not ${...}) to avoid HCL interpolation.
 bootstrap_prompt = <<EOT
 You are implementing GitHub issue #{{issue.number}} from {{inbox.repo}}: "{{issue.title}}"
