@@ -773,11 +773,18 @@ func detectAgentFromPane(pane string) string {
 	return ""
 }
 
+var tmuxPasteSeq atomic.Uint64
+
+func tmuxPasteBuf() string {
+	return fmt.Sprintf("orch-%d-%d", time.Now().UnixNano(), tmuxPasteSeq.Add(1))
+}
+
 func tmuxPaste(vm VMBlock, session, msg string) error {
-	if _, errStr, err := sshExecIn(vm, msg, "tmux load-buffer -b orch -"); err != nil {
+	buf := tmuxPasteBuf()
+	if _, errStr, err := sshExecIn(vm, msg, fmt.Sprintf("tmux load-buffer -b %s -", buf)); err != nil {
 		return fmt.Errorf("load-buffer: %v: %s", err, errStr)
 	}
-	cmd := fmt.Sprintf("tmux paste-buffer -b orch -t %s -d && sleep 1 && tmux send-keys -t %s C-m", session, session)
+	cmd := fmt.Sprintf("tmux paste-buffer -b %s -t %s -d; status=$?; tmux delete-buffer -b %s 2>/dev/null || true; [ $status -eq 0 ] || exit $status; sleep 1; tmux send-keys -t %s C-m", buf, session, buf, session)
 	if _, errStr, err := sshExec(vm, cmd); err != nil {
 		return fmt.Errorf("paste-buffer+enter: %v: %s", err, errStr)
 	}
@@ -1434,15 +1441,6 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 		tmuxKill(*vm, session)
 		return fmt.Errorf("session never reached idle prompt within %s (claude not authenticated?); pane tail:\n%s", idleWaitTimeout, strings.TrimSpace(pane))
 	}
-	// Enable /remote-control on claude workers so the orchestrator's
-	// remote-control viewer can surface the pane. Codex has no equivalent
-	// slash command, so this only fires for claude. Best-effort: the
-	// periodic worker-remote-control sweep will retry if this paste fails.
-	if vmAgent(*vm).name == "claude" {
-		if err := tmuxPaste(*vm, session, "/remote-control\n"); err != nil {
-			log.Printf("issue #%d: remote-control enable failed: %v", is.Number, err)
-		}
-	}
 	tmpl := cfg.BootstrapPrompt
 	if vm.BootstrapPrompt != "" {
 		tmpl = vm.BootstrapPrompt
@@ -1456,6 +1454,11 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 		tmuxKill(*vm, session)
 		return fmt.Errorf("bootstrap paste: %w", err)
 	}
+	// Do not paste /remote-control before or immediately after the bootstrap
+	// task. Claude can spend a moment entering remote-control mode; a second
+	// paste during that transition may be dropped while the job still looks
+	// successfully spawned. The periodic remote-control sweep enables it later
+	// once the worker is idle, without racing the initial task.
 	return nil
 }
 
@@ -1528,15 +1531,6 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	// Same as the initial spawn path: re-enable /remote-control on claude
-	// resumes. --resume restores conversation context but not pane modes,
-	// so the slash command must be re-issued. Codex skipped (no equivalent).
-	if resumeIdle && vmAgent(*vm).name == "claude" {
-		if err := tmuxPaste(*vm, session, "/remote-control\n"); err != nil {
-			log.Printf("issue #%d: remote-control re-enable failed: %v", n, err)
-		}
-	}
-
 	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
 	ci := ""
 	for name, status := range j.LastCheckConclusions {
@@ -1558,6 +1552,11 @@ Resume your work — check what is implemented, address any CI failures or revie
 		tmuxKill(*vm, session)
 		return fmt.Errorf("resume paste: %w", err)
 	}
+	if !resumeIdle {
+		log.Printf("issue #%d: resumed before idle prompt was observed; bootstrap poke still pasted best-effort", n)
+	}
+	// As with fresh sessions, leave /remote-control to the periodic idle-only
+	// sweep so it cannot race the resume instructions.
 	j.Tmux = session
 	log.Printf("issue #%d: resumed on %s/%s, PR #%d", n, vm.Name, session, j.PR)
 	return nil
