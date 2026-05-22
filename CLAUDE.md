@@ -87,7 +87,7 @@ Labels: `clawpatrol` → `denoland/clawpatrol`, `orchid` → `denoland/orchid`, 
 - Killing orchid does **not** kill worker tmux sessions — they survive.
 - Closing the work-repo PR does **not** close the orchid inbox issue — must close inbox issue too.
 - `GH_TOKEN=$(gh auth token)` must be in orchid's environment.
-- Workers use `clawpatrol run` (per-process WireGuard, not `wg-quick`).
+- Worker sessions set XDG_RUNTIME_DIR=/run/user/1001 when invoking claude as the orchid user. If the session command is switched back to clawpatrol run, this is required: without it, runuser may inherit root runtime dir /run/user/0, so clawpatrol uses the wrong runtime socket directory and Claude API transport breaks inside panes.
 - Sessions run as `orchid` user (not root — claude blocks `--dangerously-skip-permissions` as root).
 - AppArmor: `apparmor_restrict_unprivileged_userns=0` persisted at `/etc/sysctl.d/99-clawpatrol.conf`.
 - State is written to `state.json` after bootstrap prompt is pasted (up to ~2 min after tmux session appears).
