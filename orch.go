@@ -2138,15 +2138,15 @@ func tick(cfg *Config, st *State) {
 	open := map[int]routed{}
 	issues, err := ghIssueList(cfg.GitHub.InboxRepo, "")
 	if err != nil {
-		log.Printf("list inbox issues: %v", err)
-	} else {
-		for _, is := range issues {
-			allOpen[is.Number] = is
-			for _, t := range cfg.Targets {
-				if is.hasLabel(t.Label) {
-					open[is.Number] = routed{is: is, target: t}
-					break
-				}
+		log.Printf("list inbox issues: %v; preserving tracked jobs until next successful poll", err)
+		return
+	}
+	for _, is := range issues {
+		allOpen[is.Number] = is
+		for _, t := range cfg.Targets {
+			if is.hasLabel(t.Label) {
+				open[is.Number] = routed{is: is, target: t}
+				break
 			}
 		}
 	}
