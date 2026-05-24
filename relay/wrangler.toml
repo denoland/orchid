@@ -1,0 +1,41 @@
+name = "orchid-relay"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+routes = [
+  { pattern = "orchid.littledivy.com", custom_domain = true },
+  # Wildcard route — needs a proxied DNS record for the wildcard hostname
+  # (CF won't auto-create one for routes the way it does for custom_domain).
+  # Add an AAAA record `*.orchid.littledivy.com` → `100::` (orange-cloud).
+  { pattern = "*.orchid.littledivy.com/*", zone_id = "df74ee675cc918596a3b41da42ed0efb" },
+]
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+# Run Worker code on every request so apex / and subdomain routing get
+# evaluated before CF serves a matching static asset. Without this,
+# /index.html beats app.get('/') and the apex serves the dashboard SPA.
+run_worker_first = true
+
+[[durable_objects.bindings]]
+name = "USER"
+class_name = "UserSession"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UserSession"]
+
+[[kv_namespaces]]
+binding = "OAUTH"
+id = "19387da751724796a8b3852f21aae79c"
+
+# Secrets set via `wrangler secret put`:
+#   GH_CLIENT_ID
+#   GH_CLIENT_SECRET
+#   SESSION_KEY      # signs session cookies
+#
+# Plain vars:
+[vars]
+ROOT_DOMAIN = "orchid.littledivy.com"

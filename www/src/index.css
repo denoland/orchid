@@ -1,3 +1,4 @@
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -9,32 +10,127 @@
 }
 
 html,
-body {
+body,
+#root {
   height: 100%;
 }
 
 body {
-  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
   font-size: 13px;
-  background: #fafafa;
-  color: #171717;
+  background: #f7f7f8;
+  color: #18181b;
   -webkit-font-smoothing: antialiased;
+}
+html.dark body {
+  background: #0a0a0b;
+  color: #e4e4e7;
+}
+html.dark .react-flow__background-pattern {
+  fill: #3f3f46;
+}
+html.dark .react-flow .react-flow__panel {
+  background: rgba(24,24,27,0.85);
+  color: #e4e4e7;
+}
+/* Edge color override: inline style on edges sets stroke, but we override
+ * via !important to make arrows pop on dark backgrounds. */
+html.dark .react-flow__edge-path,
+html.dark .react-flow__connection-path {
+  stroke: #f4f4f5 !important;
+  stroke-width: 1.8 !important;
+}
+html.dark .react-flow__edge.selected .react-flow__edge-path,
+html.dark .react-flow__edge:focus .react-flow__edge-path {
+  stroke: #ffffff !important;
+}
+html.dark .react-flow__edge-textbg { fill: rgba(244,244,245,0.15) !important; }
+html.dark .react-flow__edge-text { fill: #f4f4f5 !important; }
+html.dark svg defs marker polyline,
+html.dark svg defs marker path { fill: #f4f4f5 !important; stroke: #f4f4f5 !important; }
+
+.serif {
+  font-family: 'Cormorant Garamond', 'Iowan Old Style', 'Apple Garamond', Georgia, serif;
+  letter-spacing: -0.01em;
+}
+
+/* Pen-layer ink color follows theme via this CSS variable. */
+:root        { --ink: #18181b; }
+html.dark    { --ink: #f4f4f5; }
+
+/* ── Session-card status animations ──────────────────────────────────
+ * Each card carries one of these classes based on attention.level.
+ * Visual language replaces the "CI fail"/"idle"/etc text:
+ *   needs  → urgent red breathing halo
+ *   working → green shimmer underline at the bottom
+ *   watching → static soft amber outer glow
+ *   quiet → nothing
+ */
+.card-status-needs {
+  animation: card-pulse-needs 1.7s ease-in-out infinite;
+}
+@keyframes card-pulse-needs {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(244, 63, 94, 0.55); }
+  50%      { box-shadow: 0 0 0 6px rgba(244, 63, 94, 0); }
+}
+
+.card-status-working {
+  position: relative;
+}
+.card-status-working::after {
+  content: '';
+  position: absolute;
+  left: 10px; right: 10px; bottom: 6px;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg,
+    rgba(16,185,129,0)   0%,
+    rgba(16,185,129,0.85) 50%,
+    rgba(16,185,129,0)   100%);
+  background-size: 200% 100%;
+  animation: card-shimmer 1.6s linear infinite;
+  pointer-events: none;
+}
+@keyframes card-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.card-status-watching {
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.32),
+              0 0 14px 0 rgba(245, 158, 11, 0.12);
+}
+html.dark .card-status-watching {
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.45),
+              0 0 16px 0 rgba(245, 158, 11, 0.18);
 }
 
 ::-webkit-scrollbar {
-  width: 4px;
-  height: 4px;
+  width: 6px;
+  height: 6px;
 }
-
 ::-webkit-scrollbar-thumb {
-  background: #d4d4d4;
-  border-radius: 2px;
+  background: #d4d4d8;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #a1a1aa;
 }
 
-/* xterm overrides */
-.xterm {
-  height: 100%;
+.mono {
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
 }
-.xterm-viewport {
-  overflow-y: hidden !important;
+
+.xterm { height: 100%; }
+.xterm-viewport { overflow-y: hidden !important; }
+
+/* React Flow handles only show on card hover so they don't clutter the
+ * compact card chrome. */
+.react-flow__node-card .react-flow__handle {
+  opacity: 0;
+  transition: opacity .15s ease;
+}
+.react-flow__node-card:hover .react-flow__handle,
+.react-flow__node-card.selected .react-flow__handle {
+  opacity: 1;
 }

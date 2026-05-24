@@ -6,7 +6,7 @@ export interface Job {
   target_repo: string
   branch: string
   issue_title: string
-  lifecycle: string   // "oneshot" | "cron"
+  lifecycle: string
   schedule: string
   pr: number
   next_fire_at: string
@@ -25,5 +25,5 @@ export interface State {
   jobs: Job[]
   vms: VM[]
   inbox: string
-  operator: string // tmux session name if alive, "" if dead
+  operator: string
 }

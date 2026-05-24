@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"embed"
@@ -11,10 +12,13 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -24,16 +28,73 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsimple"
+	"github.com/hashicorp/hcl/v2/hclwrite"
+	"github.com/zclconf/go-cty/cty"
 )
 
+// collabHub broadcasts every message it receives to every other connected
+// client. Used by the canvas dashboard for cursor positions, ink strokes,
+// node moves, etc. Server is dumb — clients converge state themselves.
+type collabHub struct {
+	mu      sync.Mutex
+	clients map[*collabClient]bool
+}
+type collabClient struct {
+	id string
+	ch chan []byte
+}
+
+func newCollabHub() *collabHub { return &collabHub{clients: map[*collabClient]bool{}} }
+
+func (h *collabHub) add(c *collabClient) {
+	h.mu.Lock()
+	h.clients[c] = true
+	h.mu.Unlock()
+}
+func (h *collabHub) remove(c *collabClient) {
+	h.mu.Lock()
+	delete(h.clients, c)
+	close(c.ch)
+	h.mu.Unlock()
+}
+func (h *collabHub) peers(self *collabClient) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, 0, len(h.clients))
+	for c := range h.clients {
+		if c == self {
+			continue
+		}
+		out = append(out, c.id)
+	}
+	return out
+}
+func (h *collabHub) broadcast(from *collabClient, msg []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for c := range h.clients {
+		if c == from {
+			continue
+		}
+		select {
+		case c.ch <- msg:
+		default:
+			// Slow client — drop the message. Cursor updates are
+			// disposable; on reconnect we replay.
+		}
+	}
+}
+
 type Config struct {
-	GitHub              GitHubBlock   `hcl:"github,block"`
-	Orch                OrchBlock     `hcl:"orchestrator,block"`
-	BootstrapPrompt     string        `hcl:"bootstrap_prompt"`
-	CronBootstrapPrompt string        `hcl:"cron_bootstrap_prompt,optional"` // template for cron-lifecycle issues; required if any inbox issue carries the `cron` label
-	Targets             []TargetBlock `hcl:"target,block"`
-	VMs                 []VMBlock     `hcl:"vm,block"`
+	GitHub              GitHubBlock   `hcl:"github,block" json:"github"`
+	Orch                OrchBlock     `hcl:"orchestrator,block" json:"orchestrator"`
+	BootstrapPrompt     string        `hcl:"bootstrap_prompt" json:"bootstrap_prompt"`
+	CronBootstrapPrompt string        `hcl:"cron_bootstrap_prompt,optional" json:"cron_bootstrap_prompt,omitempty"`
+	Targets             []TargetBlock `hcl:"target,block" json:"targets"`
+	VMs                 []VMBlock     `hcl:"vm,block" json:"vms"`
 }
 
 type GitHubBlock struct {
@@ -47,16 +108,31 @@ type TargetBlock struct {
 }
 
 type OrchBlock struct {
-	PollInterval string         `hcl:"poll_interval"`
-	StateFile    string         `hcl:"state_file"`
-	BranchPrefix string         `hcl:"branch_prefix"`
-	WorkdirRoot  string         `hcl:"workdir_root"`
-	HTTPAddr     string         `hcl:"http_addr,optional"`
-	HTTPSecret   string         `hcl:"http_secret,optional"` // bearer token for dashboard; empty = no auth
-	BotLogin     string         `hcl:"bot_login,optional"`   // default git user.name; per-VM override available
-	BotEmail     string         `hcl:"bot_email,optional"`   // default git user.email; falls back to <bot_login>@users.noreply.github.com
-	NtfyTopic    string         `hcl:"ntfy_topic,optional"`
-	Mentions     *MentionsBlock `hcl:"mentions,block"` // optional mention-watcher
+	PollInterval string `hcl:"poll_interval"`
+	StateFile    string `hcl:"state_file"`
+	BranchPrefix string `hcl:"branch_prefix"`
+	WorkdirRoot  string `hcl:"workdir_root"`
+	HTTPAddr     string `hcl:"http_addr,optional"`
+	HTTPSecret   string `hcl:"http_secret,optional"` // bearer token for dashboard; empty = no auth
+	// Extra GitHub logins (besides the subdomain owner) allowed to view
+	// this dashboard via the relay. Pushed to the relay on agent connect.
+	AllowedLogins []string       `hcl:"allowed_logins,optional"`
+	BotLogin      string         `hcl:"bot_login,optional"` // default git user.name; per-VM override available
+	BotEmail      string         `hcl:"bot_email,optional"` // default git user.email; falls back to <bot_login>@users.noreply.github.com
+	NtfyTopic     string         `hcl:"ntfy_topic,optional"`
+	Mentions      *MentionsBlock `hcl:"mentions,block"` // optional mention-watcher
+	Capture       *CaptureBlock  `hcl:"capture,block"`  // optional /api/drafts endpoint for the Orchid Capture apps
+}
+
+// CaptureBlock configures the /api/drafts endpoint that the Orchid Capture
+// macOS / iOS apps post to. When unset, the endpoint is disabled.
+type CaptureBlock struct {
+	AuthToken     string   `hcl:"auth_token"`              // required; clients send as X-Capture-Token
+	AssetsDir     string   `hcl:"assets_dir,optional"`     // where image/voice blobs are written; default <state_file dir>/captures
+	PublicURL     string   `hcl:"public_url,optional"`     // public base URL used to embed assets in issue bodies; default = empty (only the issue body has a local path note)
+	DefaultRepo   string   `hcl:"default_repo,optional"`   // fallback when draft.target.repo is empty; default = github.inbox_repo
+	DefaultLabels []string `hcl:"default_labels,optional"` // fallback when draft.target.labels is empty
+	MaxBodyMB     int      `hcl:"max_body_mb,optional"`    // request size cap, default 12
 }
 
 // MentionsBlock configures the cross-repo mention watcher. When set, orch
@@ -251,6 +327,130 @@ func expand(p string) string {
 	return p
 }
 
+// mustJSON marshals v or returns "null" so format strings always parse.
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "null"
+	}
+	return string(b)
+}
+
+// stampUserID rewrites the incoming JSON message to set/override `userId`
+// to the server-assigned id. Falls back to the raw payload if parsing
+// fails — broadcast still happens, attribution just relies on the client.
+func stampUserID(data []byte, id string) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return data
+	}
+	m["userId"] = id
+	out, err := json.Marshal(m)
+	if err != nil {
+		return data
+	}
+	return out
+}
+
+// isPrivateHost blocks SSRF-prone destinations for the /api/og fetcher.
+// Resolves the host so DNS rebinding tricks land on the same guard.
+func isPrivateHost(host string) bool {
+	if host == "" || host == "localhost" {
+		return true
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		// Be conservative: failing to resolve = treat as suspicious.
+		return true
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	ogTagRE    = regexp.MustCompile(`(?is)<meta\s+[^>]*?(?:property|name)=["']\s*(og:[a-z:]+|twitter:[a-z:]+|description)\s*["'][^>]*?content=["']([^"']*)["']`)
+	ogTagAltRE = regexp.MustCompile(`(?is)<meta\s+[^>]*?content=["']([^"']*)["'][^>]*?(?:property|name)=["']\s*(og:[a-z:]+|twitter:[a-z:]+|description)\s*["']`)
+	titleRE    = regexp.MustCompile(`(?is)<title[^>]*>([^<]+)</title>`)
+)
+
+func parseOG(html, base string) map[string]string {
+	out := map[string]string{}
+	add := func(k, v string) {
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		if _, ok := out[k]; !ok {
+			out[k] = v
+		}
+	}
+	for _, m := range ogTagRE.FindAllStringSubmatch(html, -1) {
+		add(m[1], m[2])
+	}
+	for _, m := range ogTagAltRE.FindAllStringSubmatch(html, -1) {
+		add(m[2], m[1])
+	}
+	if t := titleRE.FindStringSubmatch(html); len(t) > 1 {
+		add("title", strings.TrimSpace(t[1]))
+	}
+	// Promote useful keys to canonical names the frontend looks for.
+	if v, ok := out["og:image"]; ok {
+		out["image"] = absURL(base, v)
+	} else if v, ok := out["twitter:image"]; ok {
+		out["image"] = absURL(base, v)
+	}
+	if v, ok := out["og:title"]; ok {
+		out["title"] = v
+	}
+	if v, ok := out["og:description"]; ok {
+		out["description"] = v
+	} else if v, ok := out["description"]; ok {
+		out["description"] = v
+	}
+	if v, ok := out["og:site_name"]; ok {
+		out["site"] = v
+	}
+	return out
+}
+
+func absURL(base, ref string) string {
+	if ref == "" {
+		return ref
+	}
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		return ref
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return ref
+	}
+	r, err := url.Parse(ref)
+	if err != nil {
+		return ref
+	}
+	return b.ResolveReference(r).String()
+}
+
+// atoiClamp parses s; if invalid returns def. Result is clamped to [lo, hi].
+func atoiClamp(s string, def, lo, hi int) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	if n < lo {
+		return lo
+	}
+	if n > hi {
+		return hi
+	}
+	return n
+}
+
 func sshArgs(vm VMBlock) []string {
 	return []string{
 		"-o", "BatchMode=yes",
@@ -269,15 +469,14 @@ func sshExec(vm VMBlock, remote string) (string, string, error) {
 	return run("ssh", append(sshArgs(vm), remote)...)
 }
 
-// sshExecIn runs a shell command on the VM with stdin. For localhost, skips SSH
-// and runs the command directly (splits remote into argv).
+// sshExecIn runs a shell command on the VM with stdin. For localhost, runs
+// it under `bash -c` so shell operators (&&, |, redirects) work — the
+// previous Fields-split version treated `&&` as a literal argv element and
+// blew up commands like `tmux load-buffer -b X - && tmux paste-buffer ...`
+// with "too many arguments".
 func sshExecIn(vm VMBlock, stdin, remote string) (string, string, error) {
 	if isLocal(vm) {
-		parts := strings.Fields(remote)
-		if len(parts) == 0 {
-			return "", "", fmt.Errorf("empty command")
-		}
-		return runIn(stdin, parts[0], parts[1:]...)
+		return runIn(stdin, "bash", "-c", remote)
 	}
 	return runIn(stdin, "ssh", append(sshArgs(vm), remote)...)
 }
@@ -772,6 +971,158 @@ func detectAgentFromPane(pane string) string {
 	}
 	return ""
 }
+
+// Per-session pane-activity ring. Updated by paneActivityLoop, read by
+// /api/state so the dashboard can colour cards as working / idle without
+// each browser polling tmux directly.
+const paneActivityWindow = 20
+
+type paneActivityRecord struct {
+	prevHash uint64
+	ring     []int // 0/1, oldest first
+}
+
+var (
+	paneActivityMu sync.Mutex
+	paneActivity   = map[string]*paneActivityRecord{}
+)
+
+func paneActivitySnapshot(tmux string) []int {
+	paneActivityMu.Lock()
+	defer paneActivityMu.Unlock()
+	r, ok := paneActivity[tmux]
+	if !ok || len(r.ring) == 0 {
+		return nil
+	}
+	out := make([]int, len(r.ring))
+	copy(out, r.ring)
+	return out
+}
+
+// paneActivityRecordTick records a sample for `tmux` and returns true
+// if this tick saw activity (pane hash changed since the previous sample).
+func paneActivityRecordTick(tmux string, hash uint64) bool {
+	paneActivityMu.Lock()
+	defer paneActivityMu.Unlock()
+	r, ok := paneActivity[tmux]
+	if !ok {
+		paneActivity[tmux] = &paneActivityRecord{prevHash: hash}
+		return false
+	}
+	v := 0
+	if hash != r.prevHash {
+		v = 1
+	}
+	r.prevHash = hash
+	r.ring = append(r.ring, v)
+	if len(r.ring) > paneActivityWindow {
+		r.ring = r.ring[len(r.ring)-paneActivityWindow:]
+	}
+	return v == 1
+}
+
+func paneActivityPrune(live map[string]bool) {
+	paneActivityMu.Lock()
+	defer paneActivityMu.Unlock()
+	for k := range paneActivity {
+		if !live[k] {
+			delete(paneActivity, k)
+		}
+	}
+}
+
+// fnv64 hashes a string without pulling in the hash/fnv package. Cheap
+// non-cryptographic fingerprint — collisions are harmless here, they'd
+// only mask one tick of activity.
+func fnv64(s string) uint64 {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
+}
+
+// patchHCL applies a {block: {field: value}} patch onto an existing HCL
+// source, mutating only the named attributes inside top-level blocks.
+// Block bodies the user didn't touch (and all comments / whitespace
+// outside the changed attributes) are preserved verbatim.
+func patchHCL(src []byte, patch map[string]map[string]any) ([]byte, error) {
+	f, diags := hclwrite.ParseConfig(src, "swarm.hcl", hcl.Pos{Line: 1, Column: 1})
+	if diags.HasErrors() {
+		return nil, fmt.Errorf("parse: %s", diags.Error())
+	}
+	for blockName, fields := range patch {
+		// First top-level block matching the name (we don't support nested
+		// keyed blocks like "vm" "name" here yet — only orchestrator,
+		// github, etc. The dashboard only edits those for now).
+		var target *hclwrite.Block
+		for _, b := range f.Body().Blocks() {
+			if b.Type() == blockName {
+				target = b
+				break
+			}
+		}
+		if target == nil {
+			target = f.Body().AppendNewBlock(blockName, nil)
+		}
+		for k, v := range fields {
+			val, err := hclValueOf(v)
+			if err != nil {
+				return nil, fmt.Errorf("%s.%s: %w", blockName, k, err)
+			}
+			if val.IsNull() {
+				target.Body().RemoveAttribute(k)
+			} else {
+				target.Body().SetAttributeValue(k, val)
+			}
+		}
+	}
+	return f.Bytes(), nil
+}
+
+// hclValueOf converts a JSON-decoded value into a cty value suitable for
+// hclwrite. Handles strings, bools, numbers, and homogeneous string lists
+// — the only shapes the dashboard sends right now.
+func hclValueOf(v any) (cty.Value, error) {
+	switch x := v.(type) {
+	case nil:
+		return cty.NullVal(cty.DynamicPseudoType), nil
+	case string:
+		return cty.StringVal(x), nil
+	case bool:
+		return cty.BoolVal(x), nil
+	case float64:
+		if x == float64(int64(x)) {
+			return cty.NumberIntVal(int64(x)), nil
+		}
+		return cty.NumberFloatVal(x), nil
+	case []any:
+		if len(x) == 0 {
+			return cty.ListValEmpty(cty.String), nil
+		}
+		strs := make([]cty.Value, 0, len(x))
+		for _, e := range x {
+			s, ok := e.(string)
+			if !ok {
+				return cty.NilVal, fmt.Errorf("list element not a string")
+			}
+			strs = append(strs, cty.StringVal(s))
+		}
+		return cty.ListVal(strs), nil
+	}
+	return cty.NilVal, fmt.Errorf("unsupported type %T", v)
+}
+
+// Package-level hub so the pane-activity sampler (running outside the
+// HTTP handler closure) can push events to dashboard subscribers.
+var globalCollabHub = newCollabHub()
+
+// Path to the HCL config file this process was started with. Read once
+// in main() before any state loads; the /api/config endpoint reads/writes
+// here so the dashboard's Settings page edits the same file the operator
+// would edit by hand.
+var globalConfigPath string
 
 var tmuxPasteSeq atomic.Uint64
 
@@ -2417,6 +2768,10 @@ var wwwFS embed.FS
 type apiJobEntry struct {
 	Issue int `json:"issue"`
 	Job
+	// Activity is a 0/1 ring of recent activity ticks (1 = pane changed
+	// since the previous tick). The dashboard uses the last N values to
+	// drive the "working / idle / needs-you" attention indicators.
+	Activity []int `json:"activity,omitempty"`
 }
 
 type apiVMEntry struct {
@@ -2619,7 +2974,11 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		load := map[string]int{}
 		jobs := make([]apiJobEntry, 0, len(snap))
 		for issue, j := range snap {
-			jobs = append(jobs, apiJobEntry{Issue: issue, Job: j})
+			jobs = append(jobs, apiJobEntry{
+				Issue:    issue,
+				Job:      j,
+				Activity: paneActivitySnapshot(j.Tmux),
+			})
 			load[j.VM]++
 		}
 		sort.Slice(jobs, func(a, b int) bool { return jobs[a].Tmux < jobs[b].Tmux })
@@ -2651,7 +3010,6 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		})
 	}))
 
-	// /api/pane?s=<session> — returns tmux capture-pane snapshot as text/plain.
 	// paneVM resolves a tmux session to its VM. Checks active jobs first,
 	// then falls back to scanning localhost VMs (for operator sessions not
 	// tracked in state).
@@ -2674,8 +3032,8 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		return nil
 	}
 
-	// GET  /api/pane?s=<session> — snapshot of pane content (ANSI)
-	// POST /api/pane?s=<session> — forward body bytes as tmux input
+	// POST /api/pane?s=<session> — forward body bytes as tmux input.
+	// Snapshots stream over /api/pane/stream below.
 	mux.HandleFunc("/api/pane", auth(func(w http.ResponseWriter, r *http.Request) {
 		session := r.URL.Query().Get("s")
 		for _, c := range session {
@@ -2693,28 +3051,397 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			http.Error(w, "session not found", http.StatusNotFound)
 			return
 		}
-		if r.Method == http.MethodPost {
-			body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
-			if err != nil || len(body) == 0 {
-				http.Error(w, "bad body", http.StatusBadRequest)
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only — use /api/pane/stream for snapshots", http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+		if err != nil || len(body) == 0 {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		// Unique buffer name per request — the previous shared `input`
+		// buffer raced when two keystrokes arrived close together (second
+		// load clobbered first, first paste then found buffer empty and
+		// returned non-zero).
+		buf := tmuxPasteBuf()
+		cmd := fmt.Sprintf(
+			"tmux load-buffer -b %s - && tmux paste-buffer -b %s -t %s -d",
+			buf, buf, session,
+		)
+		if _, errStr, err := sshExecIn(*vm, string(body), cmd); err != nil {
+			http.Error(w, "send failed: "+errStr, http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	// POST /api/pane/resize?s=<session>&cols=N&rows=M — resize the tmux
+	// window to match the client's xterm so claude's TUI lays out cleanly.
+	mux.HandleFunc("/api/pane/resize", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		session := r.URL.Query().Get("s")
+		for _, c := range session {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+				http.Error(w, "invalid session", http.StatusBadRequest)
 				return
 			}
-			if _, errStr, err := sshExecIn(*vm, string(body),
-				fmt.Sprintf("tmux load-buffer -b input - && tmux paste-buffer -b input -t %s -d", session)); err != nil {
-				http.Error(w, "send failed: "+errStr, http.StatusBadGateway)
+		}
+		vm := paneVM(session)
+		if vm == nil {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		cols := atoiClamp(r.URL.Query().Get("cols"), 80, 40, 300)
+		rows := atoiClamp(r.URL.Query().Get("rows"), 24, 10, 200)
+		_, _, _ = sshExec(*vm, fmt.Sprintf(
+			"tmux resize-window -t %s -x %d -y %d 2>/dev/null", session, cols, rows,
+		))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	// GET /api/pane/stream?s=<session> — server-sent events stream of pane
+	// snapshots. One persistent SSH session per viewer runs a tight loop on
+	// the VM emitting `tmux capture-pane` output separated by 0x1E. The
+	// server diffs against the last snapshot it sent and only forwards
+	// changes, base64-encoded inside an SSE `data:` line.
+	mux.HandleFunc("/api/pane/stream", auth(func(w http.ResponseWriter, r *http.Request) {
+		session := r.URL.Query().Get("s")
+		for _, c := range session {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+				http.Error(w, "invalid session", http.StatusBadRequest)
+				return
+			}
+		}
+		if session == "" {
+			http.Error(w, "s required", http.StatusBadRequest)
+			return
+		}
+		vm := paneVM(session)
+		if vm == nil {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Set("Connection", "keep-alive")
+		fl.Flush()
+
+		// Resize the tmux window to match the client's xterm dimensions
+		// so claude's TUI lays out exactly to the visible pane. Defaults
+		// generous so a connect without cols/rows still shows something
+		// useful. Best-effort — failures here don't block the stream.
+		cols := atoiClamp(r.URL.Query().Get("cols"), 80, 40, 300)
+		rows := atoiClamp(r.URL.Query().Get("rows"), 24, 10, 200)
+		_, _, _ = sshExec(*vm, fmt.Sprintf(
+			"tmux resize-window -t %s -x %d -y %d 2>/dev/null", session, cols, rows,
+		))
+
+		remote := fmt.Sprintf(
+			`while :; do tmux capture-pane -p -e -t %s -S -200 2>&1; printf '\x1e'; sleep 0.2; done`,
+			session,
+		)
+		var cmd *exec.Cmd
+		if isLocal(*vm) {
+			cmd = exec.CommandContext(r.Context(), "bash", "-c", remote)
+		} else {
+			cmd = exec.CommandContext(r.Context(), "ssh", append(sshArgs(*vm), remote)...)
+		}
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+			fl.Flush()
+			return
+		}
+		if err := cmd.Start(); err != nil {
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+			fl.Flush()
+			return
+		}
+		defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+
+		snapCh := make(chan string, 1)
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			rd := bufio.NewReader(stdout)
+			var buf strings.Builder
+			for {
+				b, err := rd.ReadByte()
+				if err != nil {
+					return
+				}
+				if b == 0x1e {
+					snap := buf.String()
+					buf.Reset()
+					select {
+					case snapCh <- snap:
+					default:
+						// Drop snapshots when the client is slower than the
+						// VM loop — last writer wins.
+					}
+				} else {
+					buf.WriteByte(b)
+				}
+			}
+		}()
+
+		keepalive := time.NewTicker(20 * time.Second)
+		defer keepalive.Stop()
+		var last string
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-readDone:
+				return
+			case snap := <-snapCh:
+				if snap == last {
+					continue
+				}
+				last = snap
+				enc := base64.StdEncoding.EncodeToString([]byte(snap))
+				if _, err := fmt.Fprintf(w, "data: %s\n\n", enc); err != nil {
+					return
+				}
+				fl.Flush()
+			case <-keepalive.C:
+				if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+					return
+				}
+				fl.Flush()
+			}
+		}
+	}))
+
+	// GET /api/og?url=... — fetch a remote page and pull its OpenGraph
+	// metadata (og:image, og:title, og:description). Used by the canvas to
+	// render rich link cards. Has a hard 6s timeout + 1MB read limit + an
+	// SSRF guard that blocks loopback / RFC1918 / link-local destinations.
+	mux.HandleFunc("/api/og", auth(func(w http.ResponseWriter, r *http.Request) {
+		raw := r.URL.Query().Get("url")
+		if raw == "" {
+			http.Error(w, "url required", http.StatusBadRequest)
+			return
+		}
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			http.Error(w, "bad url", http.StatusBadRequest)
+			return
+		}
+		if isPrivateHost(u.Hostname()) {
+			http.Error(w, "host blocked", http.StatusForbidden)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, "GET", raw, nil)
+		req.Header.Set("User-Agent", "OrchidLinkBot/1.0 (+orchid)")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml")
+		client := &http.Client{
+			Timeout: 6 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) > 5 {
+					return fmt.Errorf("too many redirects")
+				}
+				if isPrivateHost(req.URL.Hostname()) {
+					return fmt.Errorf("redirect to private host blocked")
+				}
+				return nil
+			},
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "fetch failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		out := parseOG(string(body), raw)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "public, max-age=600")
+		_ = json.NewEncoder(w).Encode(out)
+	}))
+
+	// GET /api/canvas/ws — websocket that relays canvas events between
+	// dashboard tabs for realtime collab (cursors, ink, node moves). Server
+	// is a dumb hub: each client sends JSON messages and receives every
+	// other client's. Clients converge state on their own.
+	hub := globalCollabHub
+	mux.HandleFunc("/api/canvas/ws", auth(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true, // same-origin is already enforced by auth
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		client := &collabClient{id: tmuxPasteBuf(), ch: make(chan []byte, 64)}
+		hub.add(client)
+		defer hub.remove(client)
+
+		hello := fmt.Sprintf(`{"type":"hello","userId":%q,"peers":%s}`,
+			client.id, mustJSON(hub.peers(client)))
+		_ = conn.Write(ctx, websocket.MessageText, []byte(hello))
+		hub.broadcast(client, []byte(fmt.Sprintf(`{"type":"join","userId":%q}`, client.id)))
+
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			for {
+				_, data, err := conn.Read(ctx)
+				if err != nil {
+					return
+				}
+				// Stamp the originating userId so clients can attribute
+				// messages without trusting the payload itself.
+				stamped := stampUserID(data, client.id)
+				hub.broadcast(client, stamped)
+			}
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				_ = conn.Close(websocket.StatusNormalClosure, "context done")
+				return
+			case <-readDone:
+				_ = conn.Close(websocket.StatusNormalClosure, "client closed")
+				hub.broadcast(client, []byte(fmt.Sprintf(`{"type":"leave","userId":%q}`, client.id)))
+				return
+			case msg, ok := <-client.ch:
+				if !ok {
+					return
+				}
+				if err := conn.Write(ctx, websocket.MessageText, msg); err != nil {
+					return
+				}
+			}
+		}
+	}))
+
+	// GET/PUT /api/snap — opaque dashboard layout state (card positions,
+	// notes, links, strokes). Persisted alongside state.json so the canvas
+	// survives across browsers; replaces the localStorage scheme.
+	snapPath := filepath.Join(filepath.Dir(cfg.Orch.StateFile), "snap.json")
+	mux.HandleFunc("/api/snap", auth(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Cache-Control", "no-store")
+			b, err := os.ReadFile(snapPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte("{}"))
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(b)
+		case http.MethodPut, http.MethodPost:
+			body, err := io.ReadAll(io.LimitReader(r.Body, 4*1024*1024))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !json.Valid(body) {
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+			tmp := snapPath + ".tmp"
+			if err := os.WriteFile(tmp, body, 0o644); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := os.Rename(tmp, snapPath); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "GET/PUT/POST only", http.StatusMethodNotAllowed)
+		}
+	}))
+
+	// GET/PUT /api/config — structured view of the operator's swarm.hcl.
+	// GET parses the file fresh (not the in-memory cfg, so it reflects
+	// out-of-band edits too) and returns it as JSON. PUT accepts a partial
+	// JSON object {section: {field: value}, …} and uses hclwrite to patch
+	// only the touched attributes — comments and whitespace in the rest
+	// of the file are preserved. Apply on next orchid restart.
+	mux.HandleFunc("/api/config", auth(func(w http.ResponseWriter, r *http.Request) {
+		path := globalConfigPath
+		if path == "" {
+			http.Error(w, "config path unknown", http.StatusInternalServerError)
 			return
 		}
-		out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -e -S -200 2>&1", session))
-		if err != nil {
-			http.Error(w, "capture failed", http.StatusBadGateway)
-			return
+		switch r.Method {
+		case http.MethodGet:
+			b, err := os.ReadFile(path)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			var current Config
+			if err := hclsimple.Decode(filepath.Base(path), b, nil, &current); err != nil {
+				http.Error(w, "parse: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(current)
+		case http.MethodPut, http.MethodPost:
+			body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			var patch map[string]map[string]any
+			if err := json.Unmarshal(body, &patch); err != nil {
+				http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			src, err := os.ReadFile(path)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			out, perr := patchHCL(src, patch)
+			if perr != nil {
+				http.Error(w, "patch: "+perr.Error(), http.StatusBadRequest)
+				return
+			}
+			tmp := path + ".tmp"
+			if err := os.WriteFile(tmp, out, 0o644); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			var trial Config
+			if err := hclsimple.DecodeFile(tmp, nil, &trial); err != nil {
+				_ = os.Remove(tmp)
+				http.Error(w, "invalid hcl after patch: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := os.Rename(tmp, path); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "GET/PUT/POST only", http.StatusMethodNotAllowed)
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write([]byte(out))
 	}))
 
 	// POST /api/operator — spawn (or respawn) the operator claude session.
@@ -2730,6 +3457,13 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		go spawnOperator(cfg)
 		w.WriteHeader(http.StatusAccepted)
 	}))
+
+	// /api/drafts and /captures/* — Orchid Capture intake. Only registered
+	// when the operator opted in via the `capture` config block; otherwise
+	// these routes 404 like any other unconfigured endpoint.
+	if cfg.Orch.Capture != nil {
+		registerCaptureRoutes(mux, cfg)
+	}
 
 	// SPA static files — all other routes serve www/dist with index.html fallback
 	spaFS, _ := fs.Sub(wwwFS, "www/dist")
@@ -2748,10 +3482,60 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 	return mux
 }
 
+// runJoin writes the relay URL + agent token into the operator's env
+// file and restarts the systemd unit so the daemon picks them up.
+// Invoked as: `orch join <relay-url> <relay-token>`.
+func runJoin(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: orch join <relay-url> <relay-token>")
+		os.Exit(2)
+	}
+	url, token := args[0], args[1]
+	envPath := os.Getenv("ORCHID_ENV_FILE")
+	if envPath == "" {
+		envPath = "/root/orch/env"
+	}
+	// Read existing env, drop any old RELAY_* lines, append new ones.
+	var keep []string
+	if b, err := os.ReadFile(envPath); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(line, "RELAY_URL=") || strings.HasPrefix(line, "RELAY_TOKEN=") {
+				continue
+			}
+			if line != "" {
+				keep = append(keep, line)
+			}
+		}
+	}
+	keep = append(keep, "RELAY_URL="+url, "RELAY_TOKEN="+token)
+	if err := os.WriteFile(envPath, []byte(strings.Join(keep, "\n")+"\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "write %s: %v\n", envPath, err)
+		os.Exit(1)
+	}
+	// Systemd will expand the new RELAY_URL/RELAY_TOKEN values on the
+	// next restart. The ExecStart line installed by install.sh already
+	// uses -relay=${RELAY_URL} -relay-token=${RELAY_TOKEN}, so no unit
+	// rewrite is needed — daemon-reload + restart is enough.
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+	if err := exec.Command("systemctl", "restart", "orchid").Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "systemctl restart: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("orch: joined " + url)
+}
+
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "join" {
+		runJoin(os.Args[2:])
+		return
+	}
 	cfgPath := flag.String("config", "swarm.hcl", "path to HCL config")
 	describeFlag := flag.Bool("describe", false, "print a CLAUDE.md-shaped description of this instance and exit")
+	captureOnly := flag.Bool("capture-only", false, "run only the /api/drafts capture HTTP server (no swarm polling, no VM bootstrap); requires a capture block in the config")
+	relayURL := flag.String("relay", "", "outbound relay URL (e.g. wss://orchid.com/agent) — dashboard is reachable at <sub>.orchid.com without exposing this port")
+	relayToken := flag.String("relay-token", "", "agent token issued by the relay on signup")
 	flag.Parse()
+	globalConfigPath = *cfgPath
 
 	var cfg Config
 	if err := hclsimple.DecodeFile(*cfgPath, nil, &cfg); err != nil {
@@ -2760,6 +3544,20 @@ func main() {
 	st, err := loadState(cfg.Orch.StateFile)
 	if err != nil {
 		log.Fatalf("state: %v", err)
+	}
+	if *captureOnly {
+		if cfg.Orch.Capture == nil {
+			log.Fatalf("-capture-only requires a `capture { ... }` block in the config")
+		}
+		if cfg.Orch.HTTPAddr == "" {
+			log.Fatalf("-capture-only requires orchestrator.http_addr to be set")
+		}
+		log.Printf("orchid capture: listening on http://%s/, assets under %s",
+			cfg.Orch.HTTPAddr, captureAssetsDirOrPlaceholder(&cfg))
+		if err := http.ListenAndServe(cfg.Orch.HTTPAddr, httpHandler(&cfg, st)); err != nil {
+			log.Fatalf("http: %v", err)
+		}
+		return
 	}
 	if *describeFlag {
 		// Mirror the runtime publish so describe sees a non-nil snapshot.
@@ -2794,6 +3592,55 @@ func main() {
 				log.Printf("http server: %v", err)
 			}
 		}()
+	}
+
+	// Background pane-activity sampler. Captures each live session's pane
+	// every second, hashes it, and records a 0/1 tick into the per-session
+	// ring buffer. The dashboard reads this via /api/state for initial
+	// state and gets push notifications via the canvas WS for real-time
+	// updates so the working/idle indicators don't lag a poll cycle behind.
+	go func() {
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			var snap map[int]Job
+			if v := st.httpSnap.Load(); v != nil {
+				snap = v.(map[int]Job)
+			}
+			live := map[string]bool{}
+			for _, j := range snap {
+				if j.Tmux == "" {
+					continue
+				}
+				live[j.Tmux] = true
+				vm := vmByName(&cfg, j.VM)
+				if vm == nil {
+					continue
+				}
+				out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s 2>/dev/null | tail -8", j.Tmux))
+				if err != nil {
+					continue
+				}
+				h := fnv64(out)
+				changed := paneActivityRecordTick(j.Tmux, h)
+				if changed {
+					msg, _ := json.Marshal(map[string]any{
+						"type": "activity",
+						"tmux": j.Tmux,
+						"ts":   time.Now().UnixMilli(),
+					})
+					globalCollabHub.broadcast(nil, msg)
+				}
+			}
+			paneActivityPrune(live)
+		}
+	}()
+
+	if *relayURL != "" {
+		if *relayToken == "" {
+			log.Fatalf("-relay requires -relay-token (issued by the relay on signup)")
+		}
+		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st))
 	}
 
 	for i := range cfg.VMs {
