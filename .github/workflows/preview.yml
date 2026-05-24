@@ -1,0 +1,80 @@
+name: PR Preview
+
+on:
+  pull_request:
+    paths:
+      - 'relay/**'
+      - 'www/**'
+      - '.github/workflows/preview.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # One preview deploy in flight per PR — newer pushes cancel older ones.
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build dashboard
+        run: |
+          cd www
+          npm ci
+          npm run build
+
+      - name: Stage relay public/
+        run: |
+          rm -rf relay/public/_a relay/public/index.html
+          cp www/dist/index.html relay/public/
+          cp -r www/dist/_a relay/public/
+
+      - name: Install relay deps
+        run: cd relay && npm ci
+
+      - name: Install wrangler
+        run: npm i -g wrangler@4
+
+      # Deploy each PR as its own Worker (`orchid-relay-pr-<n>`). Lives
+      # at <name>.<account>.workers.dev — gets its own DO/KV instances
+      # so production routes + state stay untouched. Stripped of the
+      # custom_domain/wildcard routes via --routes "" so it doesn't try
+      # to grab the prod hostnames.
+      - name: Deploy PR preview worker
+        id: upload
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        working-directory: relay
+        run: |
+          name="orchid-relay-pr-${{ github.event.pull_request.number }}"
+          # Wrangler doesn't have --routes "" — instead remove the routes
+          # array via env override. Cleanest path: a sed-stripped copy of
+          # wrangler.toml just for this run.
+          sed -e '/^routes = \[/,/^]/d' wrangler.toml > wrangler.preview.toml
+          wrangler deploy \
+            --config wrangler.preview.toml \
+            --name "$name" \
+            --message "PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}"
+          CF_SUBDOMAIN="${CF_SUBDOMAIN:-divy-023}"
+          echo "preview_url=https://${name}.${CF_SUBDOMAIN}.workers.dev" >> "$GITHUB_OUTPUT"
+
+      - name: Comment preview link on PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: orchid-preview
+          message: |
+            ### 🌸 Orchid preview ready
+
+            **Dashboard:** ${{ steps.upload.outputs.preview_url }}
+
+            <sub>Deployed from `${{ github.event.pull_request.head.sha }}` via Cloudflare Workers Versions. Production unaffected. Sign in with GitHub to access your subdomain.</sub>

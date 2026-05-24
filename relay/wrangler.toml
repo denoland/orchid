@@ -2,6 +2,11 @@ name = "orchid-relay"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
+# Enables the workers.dev subdomain so `wrangler versions upload
+# --preview-alias <name>` lands at <name>-orchid-relay.<sub>.workers.dev.
+# Production traffic still flows through the custom_domain + wildcard
+# routes below; this just unlocks preview URLs for PRs.
+workers_dev = true
 
 routes = [
   { pattern = "orchid.littledivy.com", custom_domain = true },
