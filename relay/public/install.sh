@@ -48,15 +48,37 @@ if ! command -v go >/dev/null || [ "$(go env GOVERSION 2>/dev/null | sed 's/go//
 fi
 
 say "fetching orchid source"
+# Prompt for the token now so the clone can authenticate (the repo is
+# currently private). It's also used below as the daemon's GH_TOKEN.
+if [ -z "${GH_TOKEN:-}" ]; then
+  echo
+  read -rsp "GitHub Personal Access Token (repo + issues scope on the inbox repo): " GH_TOKEN
+  echo
+fi
+[ -n "$GH_TOKEN" ] || die "GH_TOKEN required"
+
+CLONE_URL="https://x-access-token:${GH_TOKEN}@github.com/${ORCHID_REPO:-denoland/orchid}.git"
 if [ -d "$SRC_DIR/.git" ]; then
+  git -C "$SRC_DIR" remote set-url origin "$CLONE_URL"
   git -C "$SRC_DIR" fetch --quiet origin
   git -C "$SRC_DIR" reset --hard --quiet origin/main
+  # Strip the token back out so it doesn't sit in the working copy's
+  # .git/config.
+  git -C "$SRC_DIR" remote set-url origin "https://github.com/${ORCHID_REPO:-denoland/orchid}.git"
 else
   rm -rf "$SRC_DIR"
-  git clone --quiet --depth 1 https://github.com/denoland/orchid "$SRC_DIR"
+  git clone --quiet --depth 1 "$CLONE_URL" "$SRC_DIR"
+  git -C "$SRC_DIR" remote set-url origin "https://github.com/${ORCHID_REPO:-denoland/orchid}.git"
 fi
 
 say "building orch binary"
+# orch.go embeds www/dist for the self-hosted dashboard. We don't ship a
+# bundled build with the clone (it's gitignored), so seed a placeholder
+# file the //go:embed directive can pick up. Relay-served deploys serve
+# the SPA from the worker's ASSETS binding, so the embedded copy is
+# unused in that path.
+mkdir -p "$SRC_DIR/www/dist"
+[ -e "$SRC_DIR/www/dist/.placeholder" ] || echo "served via relay" > "$SRC_DIR/www/dist/.placeholder"
 ( cd "$SRC_DIR" && CGO_ENABLED=0 go build -o /tmp/orch.new . )
 
 say "preparing service user $SERVICE_USER"
@@ -71,13 +93,6 @@ chmod +x "$INSTALL_DIR/orch"
 # Expose the binary on PATH so `orch join <url> <token>` works from any
 # shell after install.
 ln -sf "$INSTALL_DIR/orch" /usr/local/bin/orch
-
-if [ -z "${GH_TOKEN:-}" ]; then
-  echo
-  read -rsp "GitHub Personal Access Token (repo + issues scope on the inbox repo): " GH_TOKEN
-  echo
-fi
-[ -n "$GH_TOKEN" ] || die "GH_TOKEN required"
 
 if [ -z "${INBOX_REPO:-}" ]; then
   read -rp "Inbox repo [denoland/orchid]: " INBOX_REPO
