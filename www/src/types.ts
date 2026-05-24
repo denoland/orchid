@@ -19,6 +19,8 @@ export interface VM {
   host: string
   capacity: number
   used: number
+  bot?: string
+  agent?: string
 }
 
 export interface State {

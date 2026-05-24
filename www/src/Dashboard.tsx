@@ -1,3 +1,4 @@
+
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactFlow,
@@ -28,34 +29,25 @@ import type { Job, State } from './types'
 import { attention, ciStatus, LEVEL_COLOR, type AttentionLevel } from './attention'
 import { Pane } from './Pane'
 import { Composer } from './Composer'
-import { useCollabSocket, type Cursor } from './collab'
+import {
+  NoteNode, LinkNode, TextNode, StrokeNode,
+  PenLayer, CollabLayer, useCollabSocket,
+  detectVariant, fetchGitHubSnippet, fetchOG, pointsToPath,
+  type Cursor, type Stroke, type UserNode,
+  type NoteData, type TextData, type LinkData, type StrokeData, type LinkVariant,
+  NOTE_W, NOTE_H, LINK_W, LINK_H,
+} from '@orchid/whiteboard'
 
 interface Props { state: State }
 
 const CARD_W = 220
 const CARD_H = 96
-const NOTE_W = 220
-const NOTE_H = 140
 const COLS = 4
 const GAP = 18
 const HEADER_OFFSET = 220
 const STORAGE_KEY = 'orchid.canvas.v12'
 
 type Tool = 'select' | 'box' | 'pen' | 'eraser' | 'note' | 'text'
-
-/// A persisted ink stroke. The path is stored in local coords (its bbox
-/// starts at 0,0); the node's `x,y` is the absolute canvas position.
-interface Stroke {
-  id: string
-  x: number
-  y: number
-  w: number
-  h: number
-  d: string
-  width: number
-}
-
-interface UserNode { type: 'note' | 'link' | 'text'; id: string; x: number; y: number; data: Record<string, unknown> }
 
 interface Snap {
   cards: Record<string, { x: number; y: number }>
@@ -201,275 +193,9 @@ function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
   )
 }
 
-// ─── note node ────────────────────────────────────────────────────────
-
-type NoteData = { text: string; onChange: (t: string) => void; onDelete: () => void }
-
-function NoteNode({ data }: NodeProps<Node<NoteData, 'note'>>) {
-  const [editing, setEditing] = useState(false)
-  return (
-    <div
-      className="bg-amber-100/95 dark:bg-amber-300/15 ring-1 ring-amber-200/80 dark:ring-amber-500/30 rounded-md shadow-sm hover:shadow-md p-2 group"
-      style={{ width: NOTE_W, height: NOTE_H }}
-      onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
-    >
-      <button
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => { e.stopPropagation(); data.onDelete() }}
-        className="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-white ring-1 ring-zinc-300 text-zinc-500 hover:text-rose-600 hover:ring-rose-300 text-[10px] opacity-0 group-hover:opacity-100 transition-opacity"
-        title="delete note"
-      >×</button>
-      {editing ? (
-        <textarea
-          autoFocus
-          value={data.text}
-          onChange={(e) => data.onChange(e.target.value)}
-          onBlur={() => setEditing(false)}
-          onPointerDown={(e) => e.stopPropagation()}
-          className="w-full h-full bg-transparent resize-none outline-none text-[13px] text-amber-900 dark:text-amber-100"
-        />
-      ) : (
-        <div className="w-full h-full text-[13px] text-amber-900 dark:text-amber-100 whitespace-pre-wrap overflow-hidden">
-          {data.text || <span className="text-amber-500 dark:text-amber-400 italic">double-click to edit</span>}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ─── text node ───
-
-type TextData = {
-  text: string
-  onChange: (t: string) => void
-  onDelete: () => void
-  startEditing?: boolean
-}
-
-function TextNode({ data }: NodeProps<Node<TextData, 'text'>>) {
-  const [editing, setEditing] = useState(!!data.startEditing)
-  const ref = useRef<HTMLTextAreaElement | null>(null)
-  useEffect(() => {
-    if (editing) requestAnimationFrame(() => ref.current?.focus())
-  }, [editing])
-  return (
-    <div
-      className="relative group min-w-[60px]"
-      onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
-    >
-      <button
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => { e.stopPropagation(); data.onDelete() }}
-        className="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-white dark:bg-zinc-900 ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-500 hover:text-rose-600 hover:ring-rose-300 text-[10px] opacity-0 group-hover:opacity-100 transition-opacity"
-        title="delete"
-      >×</button>
-      {editing ? (
-        <textarea
-          ref={ref}
-          value={data.text}
-          onChange={(e) => data.onChange(e.target.value)}
-          onBlur={() => setEditing(false)}
-          onPointerDown={(e) => e.stopPropagation()}
-          rows={Math.max(1, data.text.split('\n').length)}
-          className="bg-transparent resize-none outline-none text-[15px] text-zinc-900 dark:text-zinc-100 leading-tight min-w-[160px]"
-          autoFocus
-          placeholder="text"
-        />
-      ) : (
-        <div className="text-[15px] text-zinc-900 dark:text-zinc-100 leading-tight whitespace-pre-wrap select-none">
-          {data.text || <span className="text-zinc-400 dark:text-zinc-500 italic">text</span>}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ─── link node ────────────────────────────────────────────────────────
-
-type LinkVariant = 'youtube' | 'github-code' | 'gist' | 'docs' | 'meet' | 'pr' | 'issue' | 'generic'
-type LinkData = {
-  url: string
-  title: string
-  variant: LinkVariant
-  image?: string
-  description?: string
-  site?: string
-  snippet?: string
-  onDelete: () => void
-}
-
-function detectVariant(url: string): { variant: LinkVariant; title: string; image?: string } {
-  try {
-    const u = new URL(url)
-    const host = u.hostname.replace(/^www\./, '')
-    if (host === 'github.com') {
-      const m = u.pathname.match(/^\/([^/]+)\/([^/]+)\/(pull|issues)\/(\d+)/)
-      if (m) return { variant: m[3] === 'pull' ? 'pr' : 'issue', title: `${m[1]}/${m[2]} #${m[4]}` }
-      const f = u.pathname.match(/^\/([^/]+)\/([^/]+)\/(blob|tree)\/([^/]+)\/(.+)/)
-      if (f) return { variant: 'github-code', title: `${f[1]}/${f[2]} · ${f[5]}` }
-      return { variant: 'github-code', title: host + u.pathname }
-    }
-    if (host === 'gist.github.com') return { variant: 'gist', title: 'gist ' + u.pathname.replace(/^\//, '') }
-    if (host.endsWith('youtube.com') || host === 'youtu.be') {
-      const id = u.searchParams.get('v') ?? u.pathname.replace(/^\//, '').split('/').pop() ?? ''
-      return {
-        variant: 'youtube',
-        title: 'youtube · ' + id,
-        image: id ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : undefined,
-      }
-    }
-    if (host === 'docs.google.com') return { variant: 'docs', title: 'google docs' }
-    if (host === 'meet.google.com') return { variant: 'meet', title: 'google meet ' + u.pathname.replace(/^\//, '') }
-    return { variant: 'generic', title: host + u.pathname }
-  } catch { return { variant: 'generic', title: url } }
-}
-
-async function fetchGitHubSnippet(url: string): Promise<string | undefined> {
-  // github.com/{owner}/{repo}/blob/{ref}/{path} → raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}
-  const m = url.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+?)(?:#.*)?$/)
-  if (!m) return undefined
-  const raw = `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}/${m[4]}`
-  try {
-    const res = await fetch(raw, { mode: 'cors' })
-    if (!res.ok) return undefined
-    const text = await res.text()
-    return text.split('\n').slice(0, 8).join('\n')
-  } catch { return undefined }
-}
-
-async function fetchOG(url: string): Promise<Partial<LinkData>> {
-  try {
-    const res = await fetch(`/api/og?url=${encodeURIComponent(url)}`)
-    if (!res.ok) return {}
-    const j = await res.json() as Record<string, string>
-    return {
-      image: j['image'] || undefined,
-      title: j['title'] || undefined,
-      description: j['description'] || undefined,
-      site: j['site'] || undefined,
-    }
-  } catch { return {} }
-}
-
-const VARIANT_STYLE: Record<LinkVariant, { icon: string; bg: string; ring: string; text: string }> = {
-  youtube:       { icon: '▶',  bg: 'bg-red-50 dark:bg-red-900/20',           ring: 'ring-red-200 dark:ring-red-700/40',         text: 'text-red-700 dark:text-red-300' },
-  'github-code': { icon: '<>', bg: 'bg-zinc-100 dark:bg-zinc-800',           ring: 'ring-zinc-300 dark:ring-zinc-700',          text: 'text-zinc-700 dark:text-zinc-200' },
-  gist:          { icon: '✎',  bg: 'bg-zinc-100 dark:bg-zinc-800',           ring: 'ring-zinc-300 dark:ring-zinc-700',          text: 'text-zinc-700 dark:text-zinc-200' },
-  docs:          { icon: '📄', bg: 'bg-blue-50 dark:bg-blue-900/20',         ring: 'ring-blue-200 dark:ring-blue-700/40',       text: 'text-blue-700 dark:text-blue-300' },
-  meet:          { icon: '📞', bg: 'bg-emerald-50 dark:bg-emerald-900/20',   ring: 'ring-emerald-200 dark:ring-emerald-700/40', text: 'text-emerald-700 dark:text-emerald-300' },
-  pr:            { icon: '⤴',  bg: 'bg-violet-50 dark:bg-violet-900/20',     ring: 'ring-violet-200 dark:ring-violet-700/40',   text: 'text-violet-700 dark:text-violet-300' },
-  issue:         { icon: '○',  bg: 'bg-amber-50 dark:bg-amber-900/20',       ring: 'ring-amber-200 dark:ring-amber-700/40',     text: 'text-amber-700 dark:text-amber-300' },
-  generic:       { icon: '🔗', bg: 'bg-white dark:bg-zinc-900',              ring: 'ring-zinc-200 dark:ring-zinc-700',          text: 'text-zinc-700 dark:text-zinc-200' },
-}
-
-const LINK_W = 280
-const LINK_H = 230
-
-function LinkNode({ data }: NodeProps<Node<LinkData, 'link'>>) {
-  const s = VARIANT_STYLE[data.variant]
-  const host = (() => { try { return new URL(data.url).hostname.replace(/^www\./, '') } catch { return data.url } })()
-
-  return (
-    <div
-      className={`${s.bg} ring-1 ${s.ring} rounded-xl shadow-sm hover:shadow-md overflow-hidden flex flex-col group`}
-      style={{ width: LINK_W, height: LINK_H }}
-    >
-      <button
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => { e.stopPropagation(); data.onDelete() }}
-        className="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-white ring-1 ring-zinc-300 text-zinc-500 hover:text-rose-600 hover:ring-rose-300 text-[10px] opacity-0 group-hover:opacity-100 transition-opacity z-10"
-      >×</button>
-
-      {data.snippet ? (
-        <div className="h-[110px] bg-zinc-900 dark:bg-zinc-950 text-zinc-100 p-2 overflow-hidden">
-          <pre className="mono text-[9px] leading-tight whitespace-pre overflow-hidden">{data.snippet}</pre>
-        </div>
-      ) : data.image ? (
-        <div className="h-[110px] bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
-          <img
-            src={data.image}
-            alt=""
-            className="w-full h-full object-cover"
-            onPointerDown={(e) => e.stopPropagation()}
-          />
-        </div>
-      ) : (
-        <div className="h-[110px] bg-gradient-to-br from-zinc-100 to-zinc-200 dark:from-zinc-800 dark:to-zinc-900 flex items-center justify-center">
-          <span className={`text-3xl ${s.text}`}>{s.icon}</span>
-        </div>
-      )}
-
-      <div className="p-3 flex flex-col gap-1 flex-1 min-h-0">
-        <div className={`mono text-[10px] ${s.text} flex items-center gap-1.5`}>
-          <span>{s.icon}</span>
-          <span className="uppercase tracking-wide">{data.variant}</span>
-          <span className="text-zinc-400 dark:text-zinc-500">·</span>
-          <span className="text-zinc-500 dark:text-zinc-400 truncate">{data.site || host}</span>
-        </div>
-        <div className="text-[13px] font-medium text-zinc-900 dark:text-zinc-100 line-clamp-2 leading-snug">
-          {data.title}
-        </div>
-        {data.description && (
-          <div className="text-[11px] text-zinc-500 dark:text-zinc-400 line-clamp-2 leading-snug">
-            {data.description}
-          </div>
-        )}
-        <div className="flex-1" />
-        <a
-          href={data.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          onPointerDown={(e) => e.stopPropagation()}
-          className="mono text-[10px] text-zinc-400 dark:text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 truncate"
-        >
-          {data.url}
-        </a>
-      </div>
-    </div>
-  )
-}
-
-// ─── stroke node ───
-
-type StrokeData = { d: string; w: number; h: number; sw: number; onErase?: (id: string) => void; erasing?: boolean }
-
-function StrokeNode({ id, data, selected }: NodeProps<Node<StrokeData, 'stroke'>>) {
-  return (
-    <svg
-      width={data.w + data.sw * 2}
-      height={data.h + data.sw * 2}
-      viewBox={`${-data.sw} ${-data.sw} ${data.w + data.sw * 2} ${data.h + data.sw * 2}`}
-      style={{ overflow: 'visible', cursor: data.erasing ? 'pointer' : 'move' }}
-      onClick={(e) => {
-        if (!data.erasing) return
-        e.stopPropagation()
-        data.onErase?.(id)
-      }}
-    >
-      <path
-        d={data.d}
-        fill="none"
-        strokeWidth={data.sw}
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        style={{ stroke: 'var(--ink)' }}
-      />
-      {selected && (
-        <rect
-          x={-2}
-          y={-2}
-          width={data.w + 4}
-          height={data.h + 4}
-          fill="none"
-          stroke="#a78bfa"
-          strokeDasharray="3 2"
-          strokeWidth={0.8}
-        />
-      )}
-    </svg>
-  )
-}
+// Whiteboard primitives (note / text / link / stroke nodes, pen overlay,
+// collab WS) live in @orchid/whiteboard. Orchid-only nodes (CardNode
+// above, PaneWindowNode below) stay here.
 
 // ─── pane window node ───
 
@@ -562,103 +288,6 @@ function PRIcon({ variant }: { variant: 'open' | 'closed' | 'pending' }) {
 }
 
 const nodeTypes: NodeTypes = { card: CardNode, note: NoteNode, link: LinkNode, text: TextNode, stroke: StrokeNode, pane: PaneWindowNode }
-
-// ─── pen overlay ──────────────────────────────────────────────────────
-
-function PenLayer({
-  active,
-  containerRef,
-  onStroke,
-}: {
-  active: boolean
-  containerRef: React.RefObject<HTMLDivElement>
-  onStroke: (s: Stroke) => void
-}) {
-  const viewport = useViewport()
-  const [current, setCurrent] = useState<{ x: number; y: number }[]>([])
-  const drawingRef = useRef(false)
-
-  const toWorld = (clientX: number, clientY: number) => {
-    const r = containerRef.current?.getBoundingClientRect()
-    if (!r) return { x: 0, y: 0 }
-    return {
-      x: (clientX - r.left - viewport.x) / viewport.zoom,
-      y: (clientY - r.top - viewport.y) / viewport.zoom,
-    }
-  }
-
-  const onPointerDown = (e: React.PointerEvent) => {
-    if (!active) return
-    e.preventDefault()
-    drawingRef.current = true
-    setCurrent([toWorld(e.clientX, e.clientY)])
-    ;(e.target as Element).setPointerCapture(e.pointerId)
-  }
-  const onPointerMove = (e: React.PointerEvent) => {
-    if (!drawingRef.current) return
-    setCurrent((c) => [...c, toWorld(e.clientX, e.clientY)])
-  }
-  const onPointerUp = (e: React.PointerEvent) => {
-    if (!drawingRef.current) return
-    drawingRef.current = false
-    ;(e.target as Element).releasePointerCapture(e.pointerId)
-    if (current.length > 1) {
-      const xs = current.map((p) => p.x)
-      const ys = current.map((p) => p.y)
-      const minX = Math.min(...xs), minY = Math.min(...ys)
-      const maxX = Math.max(...xs), maxY = Math.max(...ys)
-      const local = current.map((p) => ({ x: p.x - minX, y: p.y - minY }))
-      onStroke({
-        id: newId(),
-        x: minX,
-        y: minY,
-        w: maxX - minX,
-        h: maxY - minY,
-        d: pointsToPath(local),
-        width: 1.8,
-      })
-    }
-    setCurrent([])
-  }
-
-  return (
-    <svg
-      className="absolute inset-0"
-      style={{
-        width: '100%', height: '100%',
-        pointerEvents: active ? 'auto' : 'none',
-        zIndex: active ? 30 : 1,
-        cursor: active ? 'crosshair' : 'default',
-      }}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
-    >
-      <g transform={`translate(${viewport.x},${viewport.y}) scale(${viewport.zoom})`}>
-        {current.length > 1 && (
-          <path
-            d={pointsToPath(current)}
-            strokeWidth={1.8}
-            fill="none"
-            strokeLinejoin="round"
-            strokeLinecap="round"
-            style={{ stroke: 'var(--ink)' }}
-          />
-        )}
-      </g>
-    </svg>
-  )
-}
-
-function pointsToPath(points: { x: number; y: number }[]): string {
-  if (points.length === 0) return ''
-  let d = `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`
-  for (let i = 1; i < points.length; i++) {
-    d += ` L ${points[i].x.toFixed(1)} ${points[i].y.toFixed(1)}`
-  }
-  return d
-}
 
 function makeCardNode(
   job: Job,
@@ -856,7 +485,8 @@ function DashboardInner({ state }: Props) {
   // reverted card positions to their pre-drag values.
   const draggingRef = useRef(false)
   const [view, setView] = useState<'canvas' | 'list'>('canvas')
-  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+  const [showCapture, setShowCapture] = useState(false)
   // In list view, clicking a row opens this pane modal instead of a
   // canvas node (which doesn't render in list mode).
   const [listExpanded, setListExpanded] = useState<string | null>(null)
@@ -1353,23 +983,27 @@ function DashboardInner({ state }: Props) {
   return (
     <ActivityContext.Provider value={activityCtx}>
     <div ref={containerRef} className="relative h-screen w-screen">
-      <Header
-        inbox={inbox}
-        count={jobs.length}
-        showComposer={!headerComposerDismissed && jobs.length === 0}
-        view={view}
-        setView={(v) => {
-          setView(v)
-          snapRef.current.view = v
-          persist()
-        }}
-        onOpenSettings={() => setSettingsOpen(true)}
-      />
-      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
-      {view === 'canvas' && (
+      {!showSettings && !showCapture && (
+        <Header
+          inbox={inbox}
+          count={jobs.length}
+          showComposer={!headerComposerDismissed && jobs.length === 0}
+          view={view}
+          setView={(v) => {
+            setView(v)
+            snapRef.current.view = v
+            persist()
+          }}
+          onOpenSettings={() => setShowSettings(true)}
+          onOpenCapture={() => setShowCapture(true)}
+        />
+      )}
+      {showSettings && <SettingsPage jobs={jobs} state={state} onClose={() => setShowSettings(false)} />}
+      {showCapture && <CapturePage jobs={jobs} onClose={() => setShowCapture(false)} />}
+      {view === 'canvas' && !showSettings && !showCapture && (
         <FloatingToolbar tool={tool} setTool={setTool} addNote={addNote} />
       )}
-      {view === 'canvas' && (
+      {view === 'canvas' && !showSettings && !showCapture && (
         <CollabLayer cursors={cursors} sendCursor={sendCursor} containerRef={containerRef} />
       )}
       {view === 'list' && (
@@ -1453,6 +1087,7 @@ function DashboardInner({ state }: Props) {
           active={tool === 'pen'}
           containerRef={containerRef}
           onStroke={addStroke}
+          newId={newId}
         />
       )}
       {composerAt && (
@@ -1467,11 +1102,12 @@ function DashboardInner({ state }: Props) {
 }
 
 function Header({
-  count, showComposer, view, setView, onOpenSettings,
+  count, showComposer, view, setView, onOpenSettings, onOpenCapture,
 }: {
   inbox: string; count: number; showComposer: boolean
   view: 'canvas' | 'list'; setView: (v: 'canvas' | 'list') => void
   onOpenSettings: () => void
+  onOpenCapture: () => void
 }) {
   // Stop pointer events on the entire header row so clicks on the title /
   // toggle / link don't bubble through to the ReactFlow pane behind it.
@@ -1489,6 +1125,7 @@ function Header({
           <span className="mono text-[12px] text-zinc-400 dark:text-zinc-500">{count}</span>
           <div className="flex-1" />
           <HeaderBtnBar>
+            <CaptureButton onClick={onOpenCapture} />
             <ViewToggle view={view} setView={setView} />
             <SettingsButton onClick={onOpenSettings} />
             <ThemeToggle />
@@ -1519,6 +1156,107 @@ function HeaderBtnBar({ children }: { children: React.ReactNode }) {
   )
 }
 
+function CaptureButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      title="Capture (file a new issue)"
+      className="w-9 h-9 rounded-lg flex items-center justify-center transition-colors text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+    >
+      <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+        <line x1="12" y1="5" x2="12" y2="19" />
+        <line x1="5" y1="12" x2="19" y2="12" />
+      </svg>
+    </button>
+  )
+}
+
+function CapturePage({ jobs, onClose }: { jobs: Job[]; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  // Most-recent inbox-driven jobs. Captures land here once orch picks
+  // them up and labels them; until then the user sees their own
+  // composed item bubble to the top on the next /api/state poll.
+  const recent = useMemo(
+    () => [...jobs].sort((a, b) => b.issue - a.issue).slice(0, 12),
+    [jobs],
+  )
+
+  return (
+    <div className="absolute inset-0 z-30 bg-white dark:bg-zinc-950 flex flex-col">
+      <div className="px-8 h-14 flex items-center gap-3 border-b border-zinc-200 dark:border-zinc-800 flex-shrink-0">
+        <button
+          onClick={onClose}
+          className="text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 flex items-center gap-1 text-[13px]"
+          title="Back (esc)"
+        >
+          <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+        </button>
+        <span className="serif italic text-[24px] text-zinc-900 dark:text-zinc-100 ml-2">Capture</span>
+        <span className="mono text-[12px] text-zinc-400 dark:text-zinc-500">spawn an idea</span>
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-auto">
+        <div className="max-w-[720px] mx-auto px-8 py-12 space-y-10">
+          <Composer autoFocus />
+
+          <div>
+            <div className="serif italic text-[18px] text-zinc-900 dark:text-zinc-100 mb-3 px-1">Recent</div>
+            {recent.length === 0 && (
+              <p className="text-[13px] text-zinc-500 dark:text-zinc-400 px-1">
+                Nothing here yet. Type above to file your first capture.
+              </p>
+            )}
+            <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+              {recent.map((j) => (
+                <RecentCaptureRow key={j.issue} job={j} />
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function RecentCaptureRow({ job }: { job: Job }) {
+  const attn = attention(job)
+  const color = LEVEL_COLOR[attn.level]
+  const repo = job.target_repo ? job.target_repo.split('/')[1] : job.target || '—'
+  const inboxRepo = 'denoland/orchid' // best-effort hint; real value is in state.inbox
+  const issueURL = `https://github.com/${inboxRepo}/issues/${job.issue}`
+  return (
+    <a
+      href={issueURL}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="group flex items-center gap-4 px-1 py-3 hover:bg-zinc-50/80 dark:hover:bg-zinc-900/40 transition-colors"
+    >
+      <span className={`w-2 h-2 rounded-full ${color.bar} flex-shrink-0`} />
+      <div className="flex-1 min-w-0">
+        <div className="text-[14px] text-zinc-900 dark:text-zinc-100 truncate">
+          {job.issue_title || job.tmux || `#${job.issue}`}
+        </div>
+        <div className="mt-0.5 mono text-[11px] text-zinc-400 dark:text-zinc-500 truncate">
+          #{job.issue} · {repo}{job.pr ? ` · PR #${job.pr}` : ''}
+        </div>
+      </div>
+      <span className="text-zinc-300 dark:text-zinc-600 opacity-0 group-hover:opacity-100 transition-opacity">
+        <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+          <line x1="7" y1="17" x2="17" y2="7" />
+          <polyline points="7 7 17 7 17 17" />
+        </svg>
+      </span>
+    </a>
+  )
+}
+
 function SettingsButton({ onClick }: { onClick: () => void }) {
   return (
     <button
@@ -1534,6 +1272,11 @@ function SettingsButton({ onClick }: { onClick: () => void }) {
   )
 }
 
+interface CaptureCfg {
+  auth_token?: string
+  assets_dir?: string
+  public_url?: string
+}
 interface OrchestratorCfg {
   poll_interval?: string
   state_file?: string
@@ -1545,16 +1288,241 @@ interface OrchestratorCfg {
   bot_email?: string
   ntfy_topic?: string
   allowed_logins?: string[]
+  capture?: CaptureCfg
+}
+type GhCfg = { inbox_repo?: string }
+interface VMCfg {
+  name: string
+  host?: string
+  user?: string
+  key?: string
+  capacity?: number
+  bot_login?: string
+  agent?: string
+}
+interface TargetCfg {
+  name: string
+  repo?: string
 }
 interface ConfigShape {
   orchestrator?: OrchestratorCfg
+  github?: GhCfg
+  vms?: VMCfg[]
+  targets?: TargetCfg[]
   [k: string]: any
 }
 
-function SettingsPanel({ onClose }: { onClose: () => void }) {
+interface RepoOption {
+  full_name: string
+  private: boolean
+  description?: string | null
+  pushed_at?: string | null
+  avatar?: string
+}
+
+function cryptoToken(): string {
+  // 16 random bytes as hex — same shape as the install.sh-generated
+  // capture token, suitable for X-Capture-Token.
+  const buf = new Uint8Array(16)
+  crypto.getRandomValues(buf)
+  return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+function useRepos(enabled: boolean) {
+  const [repos, setRepos] = useState<RepoOption[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    if (!enabled || repos !== null) return
+    let alive = true
+    fetch('/api/_relay/repos', { credentials: 'include' })
+      .then(async (r) => {
+        if (r.status === 412) {
+          // No GH access_token on file — user signed in before we
+          // started capturing it. Surface a clear reconnect prompt.
+          throw new Error('reauth')
+        }
+        if (!r.ok) throw new Error(r.statusText || String(r.status))
+        return r.json()
+      })
+      .then((j: { repos?: RepoOption[]; error?: string }) => {
+        if (!alive) return
+        if (j.error) setError(j.error)
+        setRepos(j.repos ?? [])
+      })
+      .catch((e) => { if (alive) setError(String(e.message ?? e)) })
+    return () => { alive = false }
+  }, [enabled, repos])
+  return { repos, error }
+}
+
+function RepoPicker({ value, onChange, placeholder, repos, error }: {
+  value: string
+  onChange: (v: string) => void
+  placeholder?: string
+  repos: RepoOption[] | null
+  error?: string | null
+}) {
+  const [open, setOpen] = useState(false)
+  const [filter, setFilter] = useState('')
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      if (ref.current && !ref.current.contains(e.target as globalThis.Node)) setOpen(false)
+    }
+    window.addEventListener('pointerdown', onDown)
+    return () => window.removeEventListener('pointerdown', onDown)
+  }, [])
+  const filtered = useMemo(() => {
+    if (!repos) return []
+    const f = filter.toLowerCase()
+    return f ? repos.filter((r) => r.full_name.toLowerCase().includes(f)).slice(0, 50) : repos.slice(0, 50)
+  }, [repos, filter])
+  const selected = repos?.find((r) => r.full_name === value)
+  const [owner, name] = (value || '').split('/')
+  const avatar = selected?.avatar ?? (owner ? `https://github.com/${owner}.png?size=80` : undefined)
+  return (
+    <div ref={ref} className="relative">
+      <div
+        onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-3 bg-zinc-50 dark:bg-zinc-950 ring-1 ring-zinc-200 dark:ring-zinc-800 rounded-lg px-3 py-2.5 cursor-pointer hover:ring-zinc-400 dark:hover:ring-zinc-600 transition-colors"
+      >
+        {value ? (
+          <>
+            {avatar && <img src={avatar} alt="" className="w-7 h-7 rounded-md ring-1 ring-zinc-200 dark:ring-zinc-800 flex-shrink-0" />}
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-1.5 text-[13px] text-zinc-900 dark:text-zinc-100 truncate">
+                <span className="text-zinc-500 dark:text-zinc-400">{owner}</span>
+                <span className="text-zinc-300 dark:text-zinc-600">/</span>
+                <span className="font-medium mono">{name}</span>
+                {selected?.private && <span className="text-[10.5px] text-zinc-400 dark:text-zinc-500">private</span>}
+              </div>
+              {selected?.description && (
+                <div className="text-[11.5px] text-zinc-500 dark:text-zinc-400 truncate">
+                  {selected.description}
+                </div>
+              )}
+            </div>
+          </>
+        ) : (
+          <span className="flex-1 text-[12.5px] text-zinc-400 dark:text-zinc-500">
+            {placeholder || 'pick a repo or type owner/repo'}
+          </span>
+        )}
+        <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className={`text-zinc-400 transition-transform ${open ? 'rotate-180' : ''}`}>
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </div>
+      {open && (
+        <div className="absolute z-20 mt-1.5 w-full bg-white dark:bg-zinc-900 ring-1 ring-zinc-200 dark:ring-zinc-700 rounded-lg shadow-xl shadow-zinc-300/40 dark:shadow-black/40 overflow-hidden">
+          <div className="flex items-center gap-2 px-3 py-2.5 border-b border-zinc-200 dark:border-zinc-800">
+            <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} className="text-zinc-400">
+              <circle cx="11" cy="11" r="7" />
+              <line x1="20" y1="20" x2="16.5" y2="16.5" />
+            </svg>
+            <input
+              autoFocus
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="search your repos…"
+              className="w-full text-[13px] outline-none bg-transparent text-zinc-900 dark:text-zinc-100"
+            />
+          </div>
+          <div className="max-h-[320px] overflow-auto">
+            {error === 'reauth' && (
+              <div className="px-3 py-3 flex items-start gap-3 bg-amber-50/60 dark:bg-amber-900/20 border-b border-amber-200 dark:border-amber-900/50">
+                <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} className="text-amber-600 mt-0.5 flex-shrink-0">
+                  <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+                </svg>
+                <div className="flex-1">
+                  <div className="text-[12.5px] text-amber-900 dark:text-amber-200">Reconnect GitHub to load your repos</div>
+                  <div className="text-[11px] text-amber-700 dark:text-amber-300/80 mt-0.5">
+                    Sign in again so orchid can read your repo list — old sessions don't carry the token.
+                  </div>
+                  <a
+                    href="/login"
+                    className="mono inline-block mt-1.5 text-[11px] px-2 py-0.5 rounded bg-amber-900 text-amber-50 dark:bg-amber-100 dark:text-amber-900 hover:opacity-90"
+                  >Reconnect</a>
+                </div>
+              </div>
+            )}
+            {!repos && !error && (
+              <div className="px-3 py-4 text-[12.5px] text-zinc-400 dark:text-zinc-500 italic">loading repos…</div>
+            )}
+            {repos && filtered.length === 0 && (
+              <div className="px-3 py-4 text-[12.5px] text-zinc-400 dark:text-zinc-500">
+                no matches — paste owner/repo below
+              </div>
+            )}
+            {filtered.map((r) => (
+              <button
+                key={r.full_name}
+                onClick={() => { onChange(r.full_name); setOpen(false); setFilter('') }}
+                className="w-full text-left px-3 py-2 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 flex items-center gap-3 transition-colors group"
+              >
+                <img src={r.avatar} alt="" className="w-7 h-7 rounded-md ring-1 ring-zinc-200 dark:ring-zinc-800 flex-shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5 text-[13px]">
+                    <span className="text-zinc-500 dark:text-zinc-400 truncate">{r.full_name.split('/')[0]}</span>
+                    <span className="text-zinc-300 dark:text-zinc-600">/</span>
+                    <span className="font-medium text-zinc-900 dark:text-zinc-100 mono truncate">{r.full_name.split('/')[1]}</span>
+                    {r.private && <span className="text-[10.5px] text-zinc-400 dark:text-zinc-500">private</span>}
+                  </div>
+                  {r.description && (
+                    <div className="text-[11.5px] text-zinc-500 dark:text-zinc-400 truncate">{r.description}</div>
+                  )}
+                </div>
+                <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
+                  {timeAgo(r.pushed_at)}
+                </span>
+              </button>
+            ))}
+          </div>
+          <div className="border-t border-zinc-200 dark:border-zinc-800 px-3 py-2 bg-zinc-50 dark:bg-zinc-950">
+            <input
+              value={value}
+              onChange={(e) => onChange(e.target.value)}
+              placeholder="…or paste owner/repo"
+              className="mono w-full text-[11.5px] outline-none bg-transparent text-zinc-700 dark:text-zinc-300 placeholder:text-zinc-400 dark:placeholder:text-zinc-500"
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function timeAgo(iso?: string | null): string {
+  if (!iso) return ''
+  const ms = Date.now() - new Date(iso).getTime()
+  const m = Math.floor(ms / 60000)
+  if (m < 1) return 'now'
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h`
+  const d = Math.floor(h / 24)
+  if (d < 30) return `${d}d`
+  const mo = Math.floor(d / 30)
+  if (mo < 12) return `${mo}mo`
+  return `${Math.floor(mo / 12)}y`
+}
+
+type SectionId = 'orch' | 'access' | 'capture' | 'vms' | 'targets' | 'danger'
+
+function SettingsPage({ jobs, state, onClose }: {
+  jobs: Job[]
+  state: State
+  onClose: () => void
+}) {
   const [cfg, setCfg] = useState<OrchestratorCfg | null>(null)
-  const [original, setOriginal] = useState<OrchestratorCfg | null>(null)
+  const [gh, setGh] = useState<GhCfg | null>(null)
+  const [vms, setVms] = useState<VMCfg[]>([])
+  const [targets, setTargets] = useState<TargetCfg[]>([])
+  const [original, setOriginal] = useState<{
+    cfg: OrchestratorCfg; gh: GhCfg; vms: VMCfg[]; targets: TargetCfg[]
+  } | null>(null)
   const [status, setStatus] = useState<string>('')
+  const [section, setSection] = useState<SectionId>('orch')
+  const { repos, error: reposError } = useRepos(true)
 
   useEffect(() => {
     let alive = true
@@ -1563,8 +1531,11 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
       .then((j: ConfigShape) => {
         if (!alive) return
         const o = (j.orchestrator ?? {}) as OrchestratorCfg
-        setCfg({ ...o })
-        setOriginal({ ...o })
+        const g = (j.github ?? {}) as GhCfg
+        const v = (j.vms ?? []) as VMCfg[]
+        const t = (j.targets ?? []) as TargetCfg[]
+        setCfg({ ...o }); setGh({ ...g }); setVms([...v]); setTargets([...t])
+        setOriginal({ cfg: { ...o }, gh: { ...g }, vms: [...v], targets: [...t] })
       })
       .catch((e) => setStatus('load failed: ' + String(e)))
     return () => { alive = false }
@@ -1577,14 +1548,43 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
   }, [onClose])
 
   const dirty = useMemo(() => {
-    if (!cfg || !original) return false
-    return JSON.stringify(cfg) !== JSON.stringify(original)
-  }, [cfg, original])
+    if (!cfg || !gh || !original) return false
+    return JSON.stringify(cfg) !== JSON.stringify(original.cfg) ||
+      JSON.stringify(gh) !== JSON.stringify(original.gh) ||
+      JSON.stringify(vms) !== JSON.stringify(original.vms) ||
+      JSON.stringify(targets) !== JSON.stringify(original.targets)
+  }, [cfg, gh, vms, targets, original])
 
   const save = async () => {
-    if (!cfg) return
+    if (!cfg || !gh || !original) return
     setStatus('saving')
-    const patch = { orchestrator: cfg }
+    const patch: Record<string, any> = {}
+
+    // Singletons. Strip the nested `capture` so it doesn't accidentally
+    // try to serialise as an attribute — capture lives under its own
+    // `orchestrator.capture` patch key.
+    const orchTop: any = { ...cfg }
+    const capture = orchTop.capture
+    delete orchTop.capture
+    patch.orchestrator = orchTop
+    patch.github = gh
+    if (capture) patch['orchestrator.capture'] = capture
+
+    // VMs / targets — keyed-block patches. Diff against original.
+    const byNameOrig = (arr: { name: string }[]) => Object.fromEntries(arr.map((x) => [x.name, x]))
+    const vmOrig = byNameOrig(original.vms), vmCur = byNameOrig(vms)
+    for (const name of new Set([...Object.keys(vmOrig), ...Object.keys(vmCur)])) {
+      if (!vmCur[name]) { patch[`vm.${name}`] = { __delete: true }; continue }
+      const { name: _n, ...body } = vmCur[name] as any
+      patch[`vm.${name}`] = body
+    }
+    const tgOrig = byNameOrig(original.targets), tgCur = byNameOrig(targets)
+    for (const name of new Set([...Object.keys(tgOrig), ...Object.keys(tgCur)])) {
+      if (!tgCur[name]) { patch[`target.${name}`] = { __delete: true }; continue }
+      const { name: _n, ...body } = tgCur[name] as any
+      patch[`target.${name}`] = body
+    }
+
     const r = await fetch('/api/config', {
       method: 'PUT',
       credentials: 'include',
@@ -1595,7 +1595,7 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
       setStatus('error: ' + (await r.text()))
       return
     }
-    setOriginal({ ...cfg })
+    setOriginal({ cfg: { ...cfg }, gh: { ...gh }, vms: [...vms], targets: [...targets] })
     setStatus('saved — restart orchid to apply')
     setTimeout(() => setStatus(''), 4000)
   }
@@ -1603,86 +1603,250 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
   const setField = <K extends keyof OrchestratorCfg>(k: K, v: OrchestratorCfg[K]) => {
     setCfg((c) => c ? { ...c, [k]: v } : c)
   }
+  const setGhField = <K extends keyof GhCfg>(k: K, v: GhCfg[K]) => {
+    setGh((g) => g ? { ...g, [k]: v } : g)
+  }
+  const setCaptureField = <K extends keyof CaptureCfg>(k: K, v: CaptureCfg[K]) => {
+    setCfg((c) => c ? { ...c, capture: { ...(c.capture ?? {}), [k]: v } } : c)
+  }
+
+  // Aggregate "live" tmux sessions per VM from the polled job list.
+  const sessionsByVM = useMemo(() => {
+    const m = new Map<string, Job[]>()
+    for (const j of jobs) {
+      if (!j.tmux) continue
+      const arr = m.get(j.vm) ?? []
+      arr.push(j)
+      m.set(j.vm, arr)
+    }
+    return m
+  }, [jobs])
+
+  const navItems: { id: SectionId; label: string }[] = [
+    { id: 'orch',    label: 'Orchestrator' },
+    { id: 'access',  label: 'Access' },
+    { id: 'capture', label: 'Capture' },
+    { id: 'vms',     label: 'VMs' },
+    { id: 'targets', label: 'Targets' },
+    { id: 'danger',  label: 'Danger zone' },
+  ]
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-6" onClick={onClose}>
-      <div
-        className="relative w-full max-w-[760px] max-h-[88vh] bg-white dark:bg-zinc-900 rounded-2xl ring-1 ring-zinc-200 dark:ring-zinc-800 shadow-2xl overflow-hidden flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-6 h-14 flex items-center gap-3 border-b border-zinc-200 dark:border-zinc-800 flex-shrink-0">
-          <span className="serif italic text-[22px] text-zinc-900 dark:text-zinc-100">Settings</span>
-          <div className="flex-1" />
-          {status && <span className="text-[12px] text-zinc-500 dark:text-zinc-400">{status}</span>}
-          <button
-            onClick={save}
-            disabled={!dirty || status === 'saving'}
-            className="text-[12px] px-3 py-1.5 rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90"
-          >Save</button>
-          <button
-            onClick={onClose}
-            className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 rounded p-1"
-            title="Close (esc)"
-          >
-            <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-              <line x1="18" y1="6" x2="6" y2="18" />
-              <line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
-          </button>
-        </div>
+    <div className="absolute inset-0 z-30 bg-white dark:bg-zinc-950 flex flex-col">
+      <div className="px-8 h-14 flex items-center gap-3 border-b border-zinc-200 dark:border-zinc-800 flex-shrink-0">
+        <button
+          onClick={onClose}
+          className="text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 flex items-center gap-1 text-[13px]"
+          title="Back (esc)"
+        >
+          <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+        </button>
+        <span className="serif italic text-[24px] text-zinc-900 dark:text-zinc-100 ml-2">Settings</span>
+        <div className="flex-1" />
+        {status && <span className="text-[12px] text-zinc-500 dark:text-zinc-400">{status}</span>}
+        <button
+          onClick={save}
+          disabled={!dirty || status === 'saving'}
+          className="text-[12px] px-3 py-1.5 rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90"
+        >Save</button>
+      </div>
 
-        <div className="flex-1 min-h-0 overflow-auto px-6 py-6 space-y-8">
-          <Section title="Orchestrator" subtitle="Core swarm settings — applied on next restart.">
-            <Field label="Poll interval" hint="How often to scan the inbox repo (e.g. 20s).">
-              <Input value={cfg?.poll_interval ?? ''} onChange={(v) => setField('poll_interval', v)} placeholder="20s" />
-            </Field>
-            <Field label="Branch prefix" hint="Prefix used for orchid-created branches.">
-              <Input value={cfg?.branch_prefix ?? ''} onChange={(v) => setField('branch_prefix', v)} placeholder="orch/divybot-" />
-            </Field>
-            <Field label="HTTP address" hint="Where orch's dashboard server listens. Leave blank to disable.">
-              <Input value={cfg?.http_addr ?? ''} onChange={(v) => setField('http_addr', v)} placeholder=":8000" />
-            </Field>
-            <Field label="HTTP secret" hint="Bearer token gating the local dashboard. Required for relay tunneling.">
-              <Input value={cfg?.http_secret ?? ''} onChange={(v) => setField('http_secret', v)} placeholder="…" secret />
-            </Field>
-            <Field label="Bot login" hint="Git author for orchid-created commits.">
-              <Input value={cfg?.bot_login ?? ''} onChange={(v) => setField('bot_login', v)} placeholder="divybot" />
-            </Field>
-            <Field label="Bot email" hint="Author email. Falls back to <login>@users.noreply.github.com.">
-              <Input value={cfg?.bot_email ?? ''} onChange={(v) => setField('bot_email', v)} placeholder="divybot@users.noreply.github.com" />
-            </Field>
-            <Field label="ntfy topic" hint="Push notifications for orchid events.">
-              <Input value={cfg?.ntfy_topic ?? ''} onChange={(v) => setField('ntfy_topic', v)} placeholder="orchid-divy-…" />
-            </Field>
-          </Section>
+      <div className="flex-1 min-h-0 flex">
+        <aside className="w-48 flex-shrink-0 border-r border-zinc-200 dark:border-zinc-800 py-6 px-3 overflow-auto">
+          <nav className="flex flex-col gap-0.5">
+            {navItems.map((it) => (
+              <button
+                key={it.id}
+                onClick={() => setSection(it.id)}
+                className={
+                  'text-left px-3 py-1.5 rounded-md text-[13px] transition-colors ' +
+                  (section === it.id
+                    ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100'
+                    : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100')
+                }
+              >{it.label}</button>
+            ))}
+          </nav>
+        </aside>
 
-          <Section
-            title="Allowed GitHub logins"
-            subtitle="Besides you, these GitHub users can sign in via OAuth and view this dashboard."
-          >
-            <ChipList
-              values={cfg?.allowed_logins ?? []}
-              onChange={(v) => setField('allowed_logins', v)}
-              placeholder="github-login"
-            />
-          </Section>
+        <main className="flex-1 min-w-0 overflow-auto">
+          <div className="max-w-[820px] mx-auto px-10 py-10 space-y-8">
+            {section === 'orch' && (
+              <>
+                <Section title="GitHub">
+                  <Field label="Inbox repo" hint="Issues filed here drive orchid. Labels map to targets.">
+                    <RepoPicker
+                      value={gh?.inbox_repo ?? ''}
+                      onChange={(v) => setGhField('inbox_repo', v)}
+                      repos={repos}
+                      error={reposError}
+                      placeholder="pick or type owner/repo"
+                    />
+                  </Field>
+                </Section>
+                <Section title="Orchestrator" subtitle="Core swarm settings — applied on next restart.">
+                  <Field label="Poll interval" hint="How often to scan the inbox (e.g. 20s).">
+                    <Input value={cfg?.poll_interval ?? ''} onChange={(v) => setField('poll_interval', v)} placeholder="20s" />
+                  </Field>
+                  <Field label="Branch prefix">
+                    <Input value={cfg?.branch_prefix ?? ''} onChange={(v) => setField('branch_prefix', v)} placeholder="orch/" />
+                  </Field>
+                  <Field label="HTTP address" hint="Where orch's dashboard server listens.">
+                    <Input value={cfg?.http_addr ?? ''} onChange={(v) => setField('http_addr', v)} placeholder=":8000" />
+                  </Field>
+                  <Field label="HTTP secret" hint="Bearer token gating the local dashboard.">
+                    <Input value={cfg?.http_secret ?? ''} onChange={(v) => setField('http_secret', v)} placeholder="…" secret />
+                  </Field>
+                  <Field label="Bot login">
+                    <Input value={cfg?.bot_login ?? ''} onChange={(v) => setField('bot_login', v)} placeholder="yourbot" />
+                  </Field>
+                  <Field label="Bot email">
+                    <Input value={cfg?.bot_email ?? ''} onChange={(v) => setField('bot_email', v)} placeholder="yourbot@users.noreply.github.com" />
+                  </Field>
+                  <Field label="ntfy topic">
+                    <Input value={cfg?.ntfy_topic ?? ''} onChange={(v) => setField('ntfy_topic', v)} placeholder="orchid-…" />
+                  </Field>
+                </Section>
+              </>
+            )}
 
-          <div className="text-[11.5px] text-zinc-400 dark:text-zinc-500">
-            Other blocks (targets, vms, capture) are still HCL-only for now — edit
-            <code className="mono mx-1">{cfg ? 'swarm.hcl' : ''}</code> on the box directly.
+            {section === 'access' && (
+              <Section
+                title="Access"
+                subtitle="You always have access. Add GitHub users you want to share this dashboard with — they sign in via OAuth and only see your subdomain."
+              >
+                <AllowedUsers
+                  values={cfg?.allowed_logins ?? []}
+                  onChange={(v) => setField('allowed_logins', v)}
+                />
+              </Section>
+            )}
+
+            {section === 'capture' && (
+              <>
+                <Section
+                  title="Connect Orchid Capture"
+                  subtitle="One-click handoff to the macOS app — or copy the values into the iOS app's Settings."
+                >
+                  {cfg?.capture?.auth_token && (
+                    <div className="mb-4">
+                      <a
+                        href={`orchid://configure?endpoint=${encodeURIComponent(`https://${location.host}/api/drafts`)}&token=${encodeURIComponent(cfg.capture.auth_token)}`}
+                        className="inline-flex items-center gap-2 text-[12.5px] mono px-3 py-2 rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 hover:opacity-90"
+                      >
+                        <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="15 3 21 3 21 9" />
+                          <line x1="10" y1="14" x2="21" y2="3" />
+                          <path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5" />
+                        </svg>
+                        Open in macOS app
+                      </a>
+                    </div>
+                  )}
+                  <Field label="Endpoint">
+                    <CopyValue value={`https://${location.host}/api/drafts`} />
+                  </Field>
+                  <Field label="Auth token" hint="X-Capture-Token. Rotate any time — clients pick up the new value on next request.">
+                    <div className="flex items-center gap-2">
+                      <div className="flex-1">
+                        <Input
+                          value={cfg?.capture?.auth_token ?? ''}
+                          onChange={(v) => setCaptureField('auth_token', v)}
+                          placeholder="…"
+                          secret
+                        />
+                      </div>
+                      <button
+                        onClick={() => setCaptureField('auth_token', cryptoToken())}
+                        className="mono text-[11px] px-3 py-2 rounded-md ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                      >regenerate</button>
+                    </div>
+                  </Field>
+                  <Field label="Assets dir" hint="Where uploaded screenshots / clips are stored.">
+                    <Input
+                      value={cfg?.capture?.assets_dir ?? ''}
+                      onChange={(v) => setCaptureField('assets_dir', v)}
+                      placeholder="/root/orch/captures"
+                    />
+                  </Field>
+                  <Field label="Public URL" hint="Base URL used to embed images in issue bodies. Leave blank if you don't have one.">
+                    <Input
+                      value={cfg?.capture?.public_url ?? ''}
+                      onChange={(v) => setCaptureField('public_url', v)}
+                      placeholder={`https://${location.host}`}
+                    />
+                  </Field>
+                </Section>
+              </>
+            )}
+
+            {section === 'vms' && (
+              <Section
+                title="VMs"
+                subtitle="Where worker sessions run. Local = same box orchid runs on. Remote = SSH into another host."
+              >
+                <VMsList vms={vms} setVms={setVms} sessionsByVM={sessionsByVM} />
+              </Section>
+            )}
+
+            {section === 'targets' && (
+              <Section
+                title="Targets"
+                subtitle="Inbox labels → work repos. Add a repo and the label defaults to its name (override if you want)."
+              >
+                <TargetsList targets={targets} setTargets={setTargets} repos={repos} reposError={reposError} />
+              </Section>
+            )}
+
+            {section === 'danger' && (
+              <Section
+                title="Danger zone"
+                subtitle="These actions can't be undone from the dashboard."
+              >
+                <div className="rounded-xl ring-1 ring-rose-200 dark:ring-rose-900/50 p-5 flex items-start gap-5">
+                  <div className="flex-1">
+                    <div className="text-[14px] text-zinc-900 dark:text-zinc-100 font-medium">Revoke agent token</div>
+                    <div className="text-[12px] text-zinc-500 dark:text-zinc-400 mt-1">
+                      Disconnects the current orch instance. Sign in again to mint a fresh token,
+                      then run <code className="mono">orch join</code> with the new credentials.
+                    </div>
+                  </div>
+                  <button
+                    onClick={async () => {
+                      if (!confirm('Revoke the current agent token? Your orch will disconnect.')) return
+                      const r = await fetch('/api/_relay/revoke', { method: 'POST', credentials: 'include' })
+                      if (r.ok) alert('Token revoked. Sign in again to mint a new one.')
+                      else alert('Revoke failed: ' + (await r.text()))
+                    }}
+                    className="mono text-[12px] px-3 py-1.5 rounded-md ring-1 ring-rose-300 dark:ring-rose-700 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950"
+                  >
+                    Revoke
+                  </button>
+                </div>
+              </Section>
+            )}
           </div>
-        </div>
+        </main>
       </div>
     </div>
   )
 }
 
+function Th({ children, align }: { children: React.ReactNode; align?: 'right' | 'left' }) {
+  return <th className={`px-4 py-2 font-medium ${align === 'right' ? 'text-right' : 'text-left'}`}>{children}</th>
+}
+function Td({ children, align }: { children: React.ReactNode; align?: 'right' | 'left' }) {
+  return <td className={`px-4 py-2.5 ${align === 'right' ? 'text-right' : 'text-left'} text-zinc-900 dark:text-zinc-100`}>{children}</td>
+}
+
 function Section({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
   return (
     <section>
-      <div className="mb-4">
-        <h3 className="serif italic text-[18px] text-zinc-900 dark:text-zinc-100">{title}</h3>
-        {subtitle && <p className="text-[12px] text-zinc-500 dark:text-zinc-400 mt-0.5">{subtitle}</p>}
+      <div className="mb-5">
+        <h3 className="serif italic text-[28px] leading-none text-zinc-900 dark:text-zinc-100">{title}</h3>
+        {subtitle && <p className="text-[13px] text-zinc-500 dark:text-zinc-400 mt-2 max-w-[640px]">{subtitle}</p>}
       </div>
       <div className="space-y-4">{children}</div>
     </section>
@@ -1712,6 +1876,364 @@ function Input({ value, onChange, placeholder, secret }: { value: string; onChan
     />
   )
 }
+function CopyValue({ value, secret }: { value: string; secret?: boolean }) {
+  const [revealed, setRevealed] = useState(!secret)
+  const [copied, setCopied] = useState(false)
+  const display = revealed ? value : value.replace(/./g, '•')
+  return (
+    <div className="flex items-center gap-2 bg-zinc-50 dark:bg-zinc-950 ring-1 ring-zinc-200 dark:ring-zinc-800 rounded-md px-3 py-2">
+      <code className="mono flex-1 text-[12px] text-zinc-900 dark:text-zinc-100 truncate select-all">{display}</code>
+      {secret && (
+        <button
+          onClick={() => setRevealed((v) => !v)}
+          className="text-[11px] mono text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+        >{revealed ? 'hide' : 'show'}</button>
+      )}
+      <button
+        onClick={() => {
+          navigator.clipboard.writeText(value).catch(() => {})
+          setCopied(true)
+          setTimeout(() => setCopied(false), 1200)
+        }}
+        className="text-[11px] mono px-2 py-0.5 rounded bg-zinc-200 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-300 dark:hover:bg-zinc-700"
+      >{copied ? 'copied' : 'copy'}</button>
+    </div>
+  )
+}
+
+interface GhProfile { login: string; name?: string; bio?: string; avatar_url?: string }
+
+function useGhProfiles(logins: string[]): Map<string, GhProfile | 'loading' | 'missing'> {
+  // Public unauth lookup of /users/<login>. Cached in a module-level
+  // map so flipping sections doesn't refetch. Errors swallowed — we
+  // fall back to a generic avatar placeholder.
+  const [, force] = useState(0)
+  useEffect(() => {
+    for (const login of logins) {
+      const key = login.toLowerCase()
+      if (!key || profileCache.has(key)) continue
+      profileCache.set(key, 'loading')
+      fetch(`https://api.github.com/users/${encodeURIComponent(login)}`)
+        .then((r) => r.ok ? r.json() : Promise.reject(r.statusText))
+        .then((j: any) => {
+          profileCache.set(key, { login: j.login, name: j.name ?? undefined, bio: j.bio ?? undefined, avatar_url: j.avatar_url })
+          force((n) => n + 1)
+        })
+        .catch(() => {
+          profileCache.set(key, 'missing')
+          force((n) => n + 1)
+        })
+    }
+  }, [logins.join(',')])
+  const m = new Map<string, GhProfile | 'loading' | 'missing'>()
+  for (const login of logins) m.set(login.toLowerCase(), profileCache.get(login.toLowerCase()) ?? 'loading')
+  return m
+}
+const profileCache = new Map<string, GhProfile | 'loading' | 'missing'>()
+
+function VMsList({ vms, setVms, sessionsByVM }: {
+  vms: VMCfg[]
+  setVms: React.Dispatch<React.SetStateAction<VMCfg[]>>
+  sessionsByVM: Map<string, Job[]>
+}) {
+  const update = (i: number, patch: Partial<VMCfg>) =>
+    setVms((arr) => arr.map((x, j) => j === i ? { ...x, ...patch } : x))
+  // Treat empty host as Remote-in-progress so a freshly-added Remote
+  // card stays on the Remote tab until the user actually fills in the
+  // host (otherwise it'd flip to Local the moment they cleared the
+  // field).
+  const isLocal = (vm: VMCfg) =>
+    vm.host === 'localhost' || vm.host === '127.0.0.1' || vm.host === '::1'
+
+  return (
+    <div>
+      <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800/70 overflow-hidden">
+        {vms.length === 0 && (
+          <div className="px-4 py-5 text-[13px] text-zinc-500 dark:text-zinc-400 text-center">
+            No VMs yet. Add Local for this box, Remote for an SSH host.
+          </div>
+        )}
+        {vms.map((vm, i) => {
+          const live = sessionsByVM.get(vm.name)?.length ?? 0
+          const local = isLocal(vm)
+          return (
+            <details key={vm.name + i} className="group">
+              <summary className="flex items-center gap-3 px-4 py-3 cursor-pointer list-none hover:bg-zinc-50/80 dark:hover:bg-zinc-900/40">
+                <span className="w-8 h-8 rounded-md flex items-center justify-center flex-shrink-0 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">
+                  {local ? (
+                    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="4" width="18" height="12" rx="2" />
+                      <line x1="8" y1="20" x2="16" y2="20" />
+                      <line x1="12" y1="16" x2="12" y2="20" />
+                    </svg>
+                  ) : (
+                    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="12" cy="12" r="9" />
+                      <line x1="3" y1="12" x2="21" y2="12" />
+                      <path d="M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18" />
+                    </svg>
+                  )}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="mono text-[13.5px] font-medium text-zinc-900 dark:text-zinc-100 truncate">
+                    {vm.name || '(unnamed)'}
+                  </div>
+                  <div className="text-[11.5px] text-zinc-500 dark:text-zinc-400 mono truncate">
+                    {local ? 'localhost' : `${vm.user ?? 'root'}@${vm.host ?? '?'}`} · {vm.agent || 'claude'}
+                  </div>
+                </div>
+                <span className="mono text-[11px] text-zinc-400 dark:text-zinc-500 flex-shrink-0">
+                  {live} / {vm.capacity ?? '∞'}
+                </span>
+                <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="text-zinc-400 group-open:rotate-180 transition-transform">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </summary>
+              <div className="px-4 pb-4 pt-1 space-y-3 bg-zinc-50/60 dark:bg-zinc-900/40">
+                <div className="flex gap-2 mb-1">
+                  <button
+                    onClick={() => update(i, { host: 'localhost', user: 'orchid', key: undefined })}
+                    className={`mono text-[11px] px-2.5 py-1 rounded ring-1 transition-colors ${local ? 'bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 ring-transparent' : 'ring-zinc-200 dark:ring-zinc-700 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800'}`}
+                  >Local</button>
+                  <button
+                    onClick={() => update(i, { host: vm.host && !isLocal(vm) ? vm.host : '', user: vm.user || 'root' })}
+                    className={`mono text-[11px] px-2.5 py-1 rounded ring-1 transition-colors ${!local ? 'bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 ring-transparent' : 'ring-zinc-200 dark:ring-zinc-700 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800'}`}
+                  >Remote (SSH)</button>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <Input value={vm.name} onChange={(v) => update(i, { name: v })} placeholder="name (e.g. local)" />
+                  <Input value={String(vm.capacity ?? '')} onChange={(v) => update(i, { capacity: v ? Number(v) : undefined })} placeholder="capacity" />
+                  {!local && (
+                    <>
+                      <Input value={vm.host ?? ''} onChange={(v) => update(i, { host: v })} placeholder="host (1.2.3.4 or example.com)" />
+                      <Input value={vm.user ?? ''} onChange={(v) => update(i, { user: v })} placeholder="ssh user (e.g. root)" />
+                      <div className="col-span-2">
+                        <Input value={vm.key ?? ''} onChange={(v) => update(i, { key: v })} placeholder="path to ssh key (optional — uses agent / default key)" />
+                      </div>
+                    </>
+                  )}
+                  <select
+                    value={vm.agent ?? ''}
+                    onChange={(e) => update(i, { agent: e.target.value || undefined })}
+                    className="mono w-full text-[12.5px] bg-zinc-50 dark:bg-zinc-950 ring-1 ring-zinc-200 dark:ring-zinc-800 rounded-md px-3 py-2 outline-none text-zinc-900 dark:text-zinc-100"
+                  >
+                    <option value="">agent (default: claude)</option>
+                    <option value="claude">claude</option>
+                    <option value="codex">codex</option>
+                  </select>
+                  <Input value={vm.bot_login ?? ''} onChange={(v) => update(i, { bot_login: v })} placeholder="bot login override (optional)" />
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => setVms((arr) => arr.filter((_, j) => j !== i))}
+                    className="mono text-[11px] px-2.5 py-1 rounded ring-1 ring-rose-200 dark:ring-rose-800 text-rose-600 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950"
+                  >remove VM</button>
+                </div>
+              </div>
+            </details>
+          )
+        })}
+      </div>
+      <div className="mt-3 flex gap-2">
+        <button
+          onClick={() => setVms((arr) => [...arr, { name: arr.some((x) => x.name === 'local') ? `local-${arr.length}` : 'local', host: 'localhost', user: 'orchid', capacity: 4 }])}
+          className="mono text-[12px] px-3 py-1.5 rounded-md ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+        >+ Local</button>
+        <button
+          onClick={() => setVms((arr) => [...arr, { name: '', host: '', user: 'root', capacity: 4 }])}
+          className="mono text-[12px] px-3 py-1.5 rounded-md ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+        >+ Remote</button>
+      </div>
+    </div>
+  )
+}
+
+function TargetsList({ targets, setTargets, repos, reposError }: {
+  targets: TargetCfg[]
+  setTargets: React.Dispatch<React.SetStateAction<TargetCfg[]>>
+  repos: RepoOption[] | null
+  reposError?: string | null
+}) {
+  const [adding, setAdding] = useState(false)
+  const repoBy = useMemo(() => {
+    const m = new Map<string, RepoOption>()
+    for (const r of repos ?? []) m.set(r.full_name, r)
+    return m
+  }, [repos])
+
+  return (
+    <div>
+      <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800/70 overflow-hidden">
+        {targets.length === 0 && !adding && (
+          <div className="px-4 py-5 text-[13px] text-zinc-500 dark:text-zinc-400 text-center">
+            No targets yet. Add a repo below to wire one up.
+          </div>
+        )}
+        {targets.map((t, i) => {
+          const repo = t.repo ? repoBy.get(t.repo) : undefined
+          const [owner, name] = (t.repo ?? '').split('/')
+          const avatar = repo?.avatar ?? (owner ? `https://github.com/${owner}.png?size=80` : undefined)
+          return (
+            <div key={t.name + i} className="flex items-center gap-3 px-4 py-3 group">
+              {avatar ? (
+                <img src={avatar} alt="" className="w-8 h-8 rounded-md ring-1 ring-zinc-200 dark:ring-zinc-800 flex-shrink-0" />
+              ) : (
+                <div className="w-8 h-8 rounded-md bg-zinc-100 dark:bg-zinc-800 flex-shrink-0" />
+              )}
+              <div className="text-[13.5px] truncate flex-1 min-w-0">
+                <span className="text-zinc-400 dark:text-zinc-500">{owner || '—'}</span>
+                <span className="text-zinc-300 dark:text-zinc-600 mx-0.5">/</span>
+                <span className="mono text-zinc-900 dark:text-zinc-100">{name || '—'}</span>
+              </div>
+              <input
+                value={t.name}
+                onChange={(e) => setTargets((arr) => arr.map((x, j) => j === i ? { ...x, name: e.target.value } : x))}
+                placeholder="label"
+                className="mono text-[12px] w-24 px-2 py-1 rounded bg-transparent outline-none text-zinc-500 dark:text-zinc-400 focus:bg-zinc-50 dark:focus:bg-zinc-900 focus:text-zinc-900 dark:focus:text-zinc-100 text-right"
+                title="Label used in the inbox to route to this target"
+              />
+              <button
+                onClick={() => setTargets((arr) => arr.filter((_, j) => j !== i))}
+                className="text-[14px] text-zinc-400 hover:text-rose-600 opacity-0 group-hover:opacity-100 transition-opacity"
+                title="remove"
+              >×</button>
+            </div>
+          )
+        })}
+        {adding && (
+          <div className="px-4 py-3 bg-zinc-50 dark:bg-zinc-950">
+            <RepoPicker
+              value=""
+              onChange={(repo) => {
+                if (!repo) return
+                const label = (repo.split('/').pop() ?? '').toLowerCase().replace(/[^a-z0-9-_]/g, '-')
+                setTargets((arr) => [...arr, { name: label, repo }])
+                setAdding(false)
+              }}
+              repos={repos}
+              error={reposError}
+              placeholder="pick a repo to add as a target"
+            />
+          </div>
+        )}
+      </div>
+      <button
+        onClick={() => setAdding((a) => !a)}
+        className="mt-3 mono text-[12px] px-3 py-1.5 rounded-md ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+      >{adding ? 'cancel' : '+ add target'}</button>
+    </div>
+  )
+}
+
+function AllowedUsers({ values, onChange }: { values: string[]; onChange: (v: string[]) => void }) {
+  const [owner, setOwner] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    fetch('/api/_relay/info', { credentials: 'include' })
+      .then((r) => r.ok ? r.json() : null)
+      .then((j) => { if (alive && j?.login) setOwner(j.login) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [])
+  // De-dupe: if the owner was also added to allowed_logins by hand,
+  // don't render them twice. Owner always pinned at the top.
+  const collaborators = useMemo(() => {
+    if (!owner) return values
+    return values.filter((v) => v.toLowerCase() !== owner.toLowerCase())
+  }, [values, owner])
+  const profiles = useGhProfiles([owner, ...collaborators].filter(Boolean) as string[])
+  const [draft, setDraft] = useState('')
+  const add = () => {
+    const v = draft.trim().replace(/^@/, '')
+    if (!v || values.includes(v)) { setDraft(''); return }
+    onChange([...values, v])
+    setDraft('')
+  }
+  return (
+    <div className="space-y-3">
+      <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800/70 overflow-hidden">
+        {owner && (
+          <UserRow login={owner} profile={profiles.get(owner.toLowerCase())} owner />
+        )}
+        {collaborators.length === 0 && (
+          <div className="px-4 py-5 text-[13px] text-zinc-500 dark:text-zinc-400 text-center">
+            No collaborators yet. Add a GitHub login below to share access.
+          </div>
+        )}
+        {collaborators.map((login) => (
+          <UserRow
+            key={login}
+            login={login}
+            profile={profiles.get(login.toLowerCase())}
+            onRemove={() => onChange(values.filter((v) => v !== login))}
+          />
+        ))}
+      </div>
+      <div className="flex items-center gap-2 bg-zinc-50 dark:bg-zinc-950 ring-1 ring-zinc-200 dark:ring-zinc-800 rounded-lg px-3 py-2">
+        <span className="text-zinc-400 dark:text-zinc-500 text-[14px]">@</span>
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); add() }
+          }}
+          onBlur={add}
+          placeholder="github-login"
+          spellCheck={false}
+          autoComplete="off"
+          className="mono flex-1 bg-transparent outline-none text-[13px] text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500"
+        />
+        <button
+          onClick={add}
+          disabled={!draft.trim()}
+          className="mono text-[11.5px] px-3 py-1 rounded bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 disabled:opacity-30 disabled:cursor-not-allowed hover:opacity-90"
+        >add</button>
+      </div>
+    </div>
+  )
+}
+
+function UserRow({ login, profile, owner, onRemove }: {
+  login: string
+  profile?: GhProfile | 'loading' | 'missing'
+  owner?: boolean
+  onRemove?: () => void
+}) {
+  const p: GhProfile | null = profile && typeof profile === 'object' ? profile : null
+  return (
+    <div className="flex items-center gap-3 px-4 py-3 group">
+      <img
+        src={p?.avatar_url ?? `https://github.com/${login}.png?size=80`}
+        alt=""
+        className="w-8 h-8 rounded-full ring-1 ring-zinc-200 dark:ring-zinc-800 flex-shrink-0"
+        onError={(e) => { (e.currentTarget as HTMLImageElement).src = `https://github.com/identicons/${encodeURIComponent(login)}.png` }}
+      />
+      <a
+        href={`https://github.com/${login}`}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="mono text-[13.5px] text-zinc-900 dark:text-zinc-100 hover:underline truncate flex-1"
+      >@{login}</a>
+      {p?.name && (
+        <span className="text-[12px] text-zinc-400 dark:text-zinc-500 truncate hidden sm:inline">{p.name}</span>
+      )}
+      {owner && (
+        <span className="text-[11px] text-zinc-400 dark:text-zinc-500">you</span>
+      )}
+      {profile === 'missing' && (
+        <span className="text-[11px] text-rose-500 dark:text-rose-400">not found</span>
+      )}
+      {onRemove && (
+        <button
+          onClick={onRemove}
+          className="text-[14px] text-zinc-400 hover:text-rose-600 opacity-0 group-hover:opacity-100 transition-opacity"
+          title="remove"
+        >×</button>
+      )}
+    </div>
+  )
+}
+
 function ChipList({ values, onChange, placeholder }: { values: string[]; onChange: (v: string[]) => void; placeholder?: string }) {
   const [draft, setDraft] = useState('')
   const add = () => {
@@ -1901,18 +2423,28 @@ function PaneModal({ tmux, jobsByTmuxRef, onClose }: {
   jobsByTmuxRef: React.MutableRefObject<Map<string, Job>>
   onClose: () => void
 }) {
+  const [zoom, setZoom] = useState(false)
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { if (zoom) setZoom(false); else onClose() }
+    }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  }, [onClose, zoom])
   const job = jobsByTmuxRef.current.get(tmux)
   const ci = job ? ciStatus(job.last_check_conclusions ?? {}) : 'pending'
   const title = job?.issue_title || tmux
   return (
-    <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-6" onClick={onClose}>
+    <div
+      className={`fixed inset-0 z-50 bg-black/40 backdrop-blur-sm ${zoom ? '' : 'flex items-center justify-center p-6'}`}
+      onClick={zoom ? undefined : onClose}
+    >
       <div
-        className="relative w-full max-w-[1200px] h-[80vh] rounded-lg overflow-hidden shadow-2xl ring-1 ring-black/40 flex flex-col bg-[#0b0b0e]"
+        className={
+          zoom
+            ? 'absolute inset-0 overflow-hidden shadow-2xl flex flex-col bg-[#0b0b0e]'
+            : 'relative w-full max-w-[1200px] h-[80vh] rounded-lg overflow-hidden shadow-2xl ring-1 ring-black/40 flex flex-col bg-[#0b0b0e]'
+        }
         onClick={(e) => e.stopPropagation()}
       >
         <div className="h-8 bg-zinc-800/95 flex items-center px-3 gap-3 select-none flex-shrink-0">
@@ -1923,14 +2455,18 @@ function PaneModal({ tmux, jobsByTmuxRef, onClose }: {
               title="close (esc)"
             />
             <span className="w-3 h-3 rounded-full bg-amber-400" />
-            <span className="w-3 h-3 rounded-full bg-emerald-500" />
+            <button
+              onClick={() => setZoom((z) => !z)}
+              className="w-3 h-3 rounded-full bg-emerald-500 hover:bg-emerald-400 transition-colors"
+              title={zoom ? 'restore' : 'fullscreen'}
+            />
           </div>
           <div className="flex-1 min-w-0 text-center text-[12px] text-zinc-300 truncate">
             {title}
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
             {job?.pr && job?.target_repo && (
-              <ModalPRBadge repo={job.target_repo} pr={job.pr} ci={ci} />
+              <PRBadge repo={job.target_repo} pr={job.pr} ci={ci} />
             )}
           </div>
         </div>
@@ -1942,26 +2478,6 @@ function PaneModal({ tmux, jobsByTmuxRef, onClose }: {
   )
 }
 
-function ModalPRBadge({ repo, pr, ci }: { repo: string; pr: number; ci: 'fail' | 'pass' | 'pending' }) {
-  const variant: 'open' | 'closed' | 'pending' =
-    ci === 'fail' ? 'closed' : ci === 'pass' ? 'open' : 'pending'
-  const color =
-    variant === 'closed' ? 'text-rose-400 bg-rose-500/15 ring-rose-500/30'
-    : variant === 'open' ? 'text-emerald-400 bg-emerald-500/15 ring-emerald-500/30'
-    : 'text-amber-400 bg-amber-500/15 ring-amber-500/30'
-  return (
-    <a
-      href={`https://github.com/${repo}/pull/${pr}`}
-      target="_blank"
-      rel="noopener noreferrer"
-      onClick={(e) => e.stopPropagation()}
-      className={`mono inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded ring-1 ring-inset ${color}`}
-      title={`PR #${pr} · ${variant}`}
-    >
-      #{pr}
-    </a>
-  )
-}
 
 function LogoutButton() {
   return (
@@ -2045,74 +2561,6 @@ function ThemeToggle() {
 
 // Bottom-center floating toolbar in the tldraw style: a pill of icon
 // buttons with the active tool highlighted.
-// Renders other users' cursors at their world-coord positions. Cursors are
-// driven by the parent (which owns the WS connection). Also forwards local
-// pointer moves to the parent's sendCursor.
-function CollabLayer({
-  cursors,
-  sendCursor,
-  containerRef,
-}: {
-  cursors: Map<string, Cursor>
-  sendCursor: (x: number, y: number) => void
-  containerRef: React.RefObject<HTMLDivElement>
-}) {
-  const viewport = useViewport()
-
-  useEffect(() => {
-    const onMove = (e: PointerEvent) => {
-      const r = containerRef.current?.getBoundingClientRect()
-      if (!r) return
-      const worldX = (e.clientX - r.left - viewport.x) / viewport.zoom
-      const worldY = (e.clientY - r.top - viewport.y) / viewport.zoom
-      sendCursor(worldX, worldY)
-    }
-    window.addEventListener('pointermove', onMove)
-    return () => window.removeEventListener('pointermove', onMove)
-  }, [containerRef, viewport.x, viewport.y, viewport.zoom, sendCursor])
-
-  return (
-    <div
-      className="absolute inset-0 pointer-events-none overflow-hidden"
-      style={{ zIndex: 50 }}
-    >
-      {Array.from(cursors.entries()).map(([id, c]) => (
-        <CursorView key={id} cursor={c} viewport={viewport} />
-      ))}
-    </div>
-  )
-}
-
-function CursorView({
-  cursor,
-  viewport,
-}: {
-  cursor: Cursor
-  viewport: { x: number; y: number; zoom: number }
-}) {
-  const screenX = cursor.x * viewport.zoom + viewport.x
-  const screenY = cursor.y * viewport.zoom + viewport.y
-  return (
-    <div
-      className="absolute"
-      style={{
-        transform: `translate3d(${screenX}px, ${screenY}px, 0)`,
-        transition: 'transform 90ms linear',
-      }}
-    >
-      <svg width={18} height={20} viewBox="0 0 18 20" fill="none" style={{ filter: 'drop-shadow(0 1px 2px rgba(0,0,0,.2))' }}>
-        <path d="M3 2l13 8-5 1-1 6-7-15z" fill={cursor.color} stroke="white" strokeWidth={1.2} strokeLinejoin="round" />
-      </svg>
-      <span
-        className="mono text-[10px] px-1.5 py-0.5 rounded text-white shadow"
-        style={{ background: cursor.color, transform: 'translate(14px, -4px)', display: 'inline-block' }}
-      >
-        {cursor.name}
-      </span>
-    </div>
-  )
-}
-
 function FloatingToolbar({
   tool, setTool, addNote,
 }: { tool: Tool; setTool: (t: Tool) => void; addNote: () => void }) {

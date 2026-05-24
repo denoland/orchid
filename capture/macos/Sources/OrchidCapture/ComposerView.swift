@@ -25,6 +25,7 @@ struct ComposerView: View {
     @State private var manualSlot: ArtifactSlot? = nil
     @State private var preferDesktopScreenshot = false
     @FocusState private var noteFocused: Bool
+    @Environment(\.openSettings) private var openSettings
 
     private var route: CaptureRoute {
         CaptureRoute(rawValue: routeRaw) ?? .clawpatrol
@@ -128,7 +129,16 @@ struct ComposerView: View {
                     Divider()
                     Button("Settings…") {
                         NSApp.activate(ignoringOtherApps: true)
-                        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                        // SwiftUI's openSettings is the supported path on
+                        // macOS 14+. Fall back to the AppKit selectors
+                        // (renamed between 13 → 14) so older systems still
+                        // hit the same Settings scene.
+                        openSettings()
+                        if NSApp.windows.first(where: { $0.identifier?.rawValue.contains("Settings") == true }) == nil {
+                            if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+                                NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+                            }
+                        }
                     }
                     Divider()
                     Button("Quit") { NSApp.terminate(nil) }

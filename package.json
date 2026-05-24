@@ -1,0 +1,9 @@
+{
+  "name": "orchid-monorepo",
+  "private": true,
+  "workspaces": [
+    "www",
+    "lib/whiteboard",
+    "relay"
+  ]
+}

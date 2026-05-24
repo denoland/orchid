@@ -82,9 +82,17 @@ export async function handleOAuthCallback(env: Env, req: Request): Promise<Respo
     subdomain: userSubdomain(gh.login),
   }
 
-  // Ensure the user's DO has an agent token minted on first login.
+  // Ensure the user's DO has an agent token minted on first login,
+  // and persist the just-issued GH access token so settings can fetch
+  // the user's repo list later without re-running OAuth.
   const do_ = env.USER.get(env.USER.idFromName(session.subdomain))
   await mintAgentToken(do_, session.uid, session.login)
+  if (token.access_token) {
+    await do_.fetch(new Request('https://internal/_set_gh_token', {
+      method: 'POST',
+      body: JSON.stringify({ token: token.access_token }),
+    }))
+  }
 
   const cookie = await signSession(env.SESSION_KEY, session)
   const headers = new Headers()

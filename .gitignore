@@ -52,3 +52,4 @@ capture/ios/build/
 # Misc tooling
 *.swp
 *.swo
+node_modules/

@@ -115,7 +115,21 @@ export default defineConfig({
       },
     },
   ].filter(Boolean) as any,
-  build: { outDir: 'dist', assetsDir: '_a' },
+  build: {
+    outDir: 'dist',
+    assetsDir: '_a',
+    chunkSizeWarningLimit: 800,
+    rollupOptions: {
+      output: {
+        // Pull the two heaviest deps (react-flow, xterm) into their own
+        // chunks so the initial paint doesn't have to parse them.
+        manualChunks: {
+          'reactflow': ['@xyflow/react'],
+          'xterm': ['@xterm/xterm', '@xterm/addon-fit'],
+        },
+      },
+    },
+  },
   server: {
     proxy: USE_MOCK ? undefined : {
       '/api': 'http://localhost:8000',

@@ -63,6 +63,7 @@ struct OrchidCaptureApp: App {
     var body: some Scene {
         MenuBarExtra {
             env.composerHost(floating: false, showsMenu: true)
+                .onOpenURL(perform: handleConfigureURL)
         } label: {
             Image(systemName: env.drafts.pending > 0 ? "circle.fill" : "circle")
         }
@@ -72,7 +73,32 @@ struct OrchidCaptureApp: App {
             SettingsView()
                 .environmentObject(env.drafts)
                 .environmentObject(env.selection)
+                .onOpenURL(perform: handleConfigureURL)
         }
+    }
+
+    /// Handle `orchid://configure?endpoint=<url>&token=<token>` deep
+    /// links from the dashboard. Writes both values into the same
+    /// @AppStorage keys the Settings UI uses, so the next composer
+    /// submit goes to the right endpoint.
+    private func handleConfigureURL(_ url: URL) {
+        guard url.scheme == "orchid", url.host == "configure" else { return }
+        let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let items = comps?.queryItems ?? []
+        for item in items {
+            guard let value = item.value, !value.isEmpty else { continue }
+            switch item.name {
+            case "endpoint":
+                UserDefaults.standard.set(value, forKey: "orchid.endpoint")
+                if let u = URL(string: value) { env.drafts.updateEndpoint(u) }
+            case "token":
+                UserDefaults.standard.set(value, forKey: "orchid.token")
+                env.drafts.updateToken(value)
+            default:
+                continue
+            }
+        }
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 

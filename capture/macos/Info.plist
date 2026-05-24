@@ -26,5 +26,18 @@
     <true/>
     <key>NSAppleEventsUsageDescription</key>
     <string>Used to summon the composer from any app.</string>
+    <!-- Custom URL scheme so the dashboard's "Open in macOS app" handoff
+         can deep-link in to configure endpoint + capture token. -->
+    <key>CFBundleURLTypes</key>
+    <array>
+      <dict>
+        <key>CFBundleURLName</key>
+        <string>land.deno.orchid.capture</string>
+        <key>CFBundleURLSchemes</key>
+        <array>
+          <string>orchid</string>
+        </array>
+      </dict>
+    </array>
 </dict>
 </plist>

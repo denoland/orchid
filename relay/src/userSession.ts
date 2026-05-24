@@ -1,7 +1,28 @@
 /// Per-user Durable Object. Holds the agent's outbound WebSocket and routes
-/// requests/responses across it.
-import type { Frame } from './frames'
-import { decodeBinary, encodeBinary } from './frames'
+/// requests/responses across it. Frame protocol is inlined below — every
+/// frame either carries JSON (control) or a 4-byte big-endian stream-id
+/// prefix followed by a raw body chunk (binary).
+type Frame =
+  | { t: 'req'; id: number; method: string; path: string; headers: [string, string][]; hasBody: boolean }
+  | { t: 'req-end'; id: number }
+  | { t: 'res-head'; id: number; status: number; headers: [string, string][]; streaming: boolean }
+  | { t: 'res-end'; id: number }
+  | { t: 'cancel'; id: number }
+  | { t: 'hello'; userId: number; login: string }
+  | { t: 'pong' }
+  | { t: 'ws-open'; id: number; path: string; headers: [string, string][] }
+  | { t: 'ws-text'; id: number; data: string }
+  | { t: 'ws-close'; id: number; code?: number; reason?: string }
+
+function encodeBinary(streamId: number, chunk: Uint8Array): Uint8Array {
+  const out = new Uint8Array(4 + chunk.byteLength)
+  new DataView(out.buffer).setUint32(0, streamId, false)
+  out.set(chunk, 4)
+  return out
+}
+function decodeBinary(buf: ArrayBuffer): { streamId: number; chunk: Uint8Array } {
+  return { streamId: new DataView(buf).getUint32(0, false), chunk: new Uint8Array(buf, 4) }
+}
 
 interface Env {
   USER: DurableObjectNamespace
@@ -27,6 +48,7 @@ export class UserSession {
   agentToken: string | null = null
   uid: number | null = null
   login: string | null = null
+  ghToken: string | null = null  // user's GitHub OAuth access token; lets the dashboard fetch their repo list
   // Lowercased GitHub logins the orch operator allows in addition to the
   // owner. Pushed by the agent on connect via the "config" frame so the
   // source of truth stays in the operator's swarm.hcl. Not persisted —
@@ -42,6 +64,7 @@ export class UserSession {
       this.agentToken = (await state.storage.get('token')) ?? null
       this.uid = (await state.storage.get('uid')) ?? null
       this.login = (await state.storage.get('login')) ?? null
+      this.ghToken = (await state.storage.get('ghToken')) ?? null
     })
   }
 
@@ -53,7 +76,73 @@ export class UserSession {
     if (url.pathname === '/_proxy_ws') return this.handleProxyWS(req)
     if (url.pathname === '/_info') return this.handleInfo()
     if (url.pathname === '/_check_access') return this.handleCheckAccess(req)
+    if (url.pathname === '/_revoke') return this.handleRevoke()
+    if (url.pathname === '/_set_gh_token') return this.handleSetGhToken(req)
+    if (url.pathname === '/_gh_repos') return this.handleGhRepos(req)
     return new Response('not found', { status: 404 })
+  }
+
+  // Stash the just-completed-OAuth user's access token. Used later by
+  // the Settings page to list their repos for the inbox / target
+  // pickers without re-running the OAuth dance.
+  private async handleSetGhToken(req: Request): Promise<Response> {
+    const body = (await req.json()) as { token?: string }
+    if (!body.token) return new Response('missing token', { status: 400 })
+    this.ghToken = body.token
+    await this.state.storage.put('ghToken', body.token)
+    return Response.json({ ok: true })
+  }
+
+  // Owner-only repo browser. Hits the live GH API on each call —
+  // results are cached at the worker edge via response Cache-Control.
+  // `q` filters client-side; full list is paginated up to ~300 repos.
+  private async handleGhRepos(req: Request): Promise<Response> {
+    if (!this.ghToken) return new Response('no gh token', { status: 412 })
+    type Repo = {
+      full_name: string
+      private: boolean
+      description: string | null
+      pushed_at: string | null
+      owner: { avatar_url: string }
+    }
+    const out: Array<{ full_name: string; private: boolean; description: string | null; pushed_at: string | null; avatar: string }> = []
+    for (let page = 1; page <= 3; page++) {
+      const r = await fetch(`https://api.github.com/user/repos?per_page=100&sort=pushed&page=${page}`, {
+        headers: {
+          authorization: `Bearer ${this.ghToken}`,
+          accept: 'application/vnd.github+json',
+          'user-agent': 'orchid-relay/1.0',
+        },
+      })
+      if (!r.ok) {
+        return Response.json({ error: 'gh ' + r.status, repos: out }, { status: 200 })
+      }
+      const page_data = (await r.json()) as Repo[]
+      for (const repo of page_data) {
+        out.push({
+          full_name: repo.full_name,
+          private: repo.private,
+          description: repo.description,
+          pushed_at: repo.pushed_at,
+          avatar: repo.owner.avatar_url,
+        })
+      }
+      if (page_data.length < 100) break
+    }
+    return Response.json({ repos: out })
+  }
+
+  // Owner-only: wipe the current agent token and force a fresh mint on
+  // the next OAuth sign-in. Closes any live agent connection so the old
+  // token can't reconnect even if it stayed in someone's clipboard.
+  private async handleRevoke(): Promise<Response> {
+    this.agentToken = null
+    await this.state.storage.delete('token')
+    if (this.agentWS) {
+      try { this.agentWS.close(4001, 'token revoked') } catch {}
+      this.agentWS = null
+    }
+    return Response.json({ ok: true })
   }
 
   // Owner-or-allowed check. Called from the relay middleware before
