@@ -1295,8 +1295,9 @@ func spawnOperator(cfg *Config) {
 			continue
 		}
 		if strings.Contains(out, "bypass permissions") {
-			_ = tmuxPaste(*vm, operatorTmux, "/remote-control\n")
-			log.Printf("operator: ready, remote-control enabled")
+			// /remote-control disabled — current claude builds don't ship it.
+			// _ = tmuxPaste(*vm, operatorTmux, "/remote-control\n")
+			log.Printf("operator: ready")
 			return
 		}
 	}
@@ -1341,23 +1342,18 @@ func ensureWorkerRemoteControl(cfg *Config, st *State) {
 			// Session likely gone; tick() handles respawn — nothing to do here.
 			continue
 		}
-		if strings.Contains(out, "Remote Control active") {
-			continue
-		}
-		// Only paste at the idle prompt; pasting under a busy claude would
-		// land the slash command in whatever buffer is currently capturing
-		// input. Matches the ensureOperator heuristic.
-		if !strings.Contains(out, "bypass permissions") {
-			continue
-		}
-		if strings.Contains(out, "esc to interrupt") {
-			continue
-		}
-		if err := tmuxPaste(t.vm, t.session, "/remote-control\n"); err != nil {
-			log.Printf("issue #%d: enable remote-control failed: %v", t.issue, err)
-			continue
-		}
-		log.Printf("issue #%d: enabled remote-control on %s", t.issue, t.session)
+		_ = out
+		// /remote-control disabled — current claude builds don't ship it
+		// and the paste only fills panes with "Unknown command" noise.
+		// Restore by uncommenting if a future build brings it back.
+		// if strings.Contains(out, "Remote Control active") { continue }
+		// if !strings.Contains(out, "bypass permissions") { continue }
+		// if strings.Contains(out, "esc to interrupt") { continue }
+		// if err := tmuxPaste(t.vm, t.session, "/remote-control\n"); err != nil {
+		//     log.Printf("issue #%d: enable remote-control failed: %v", t.issue, err)
+		//     continue
+		// }
+		// log.Printf("issue #%d: enabled remote-control on %s", t.issue, t.session)
 	}
 }
 
