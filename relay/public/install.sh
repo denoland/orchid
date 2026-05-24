@@ -86,6 +86,21 @@ id -u "$SERVICE_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$SERVICE_USER"
 loginctl enable-linger "$SERVICE_USER" >/dev/null 2>&1 || true
 runuser -u "$SERVICE_USER" -- mkdir -p "/home/$SERVICE_USER/orch-work"
 
+# Worker sessions clone work repos over SSH — without github.com's host
+# key trusted, every spawn dies at the first `git clone`. Trust the
+# key for both root (orch's identity) and the service user (claude's).
+say "trusting github.com SSH host keys"
+for u in root "$SERVICE_USER"; do
+  home=$(getent passwd "$u" | cut -d: -f6)
+  [ -n "$home" ] || continue
+  runuser -u "$u" -- mkdir -p "$home/.ssh"
+  runuser -u "$u" -- bash -c "touch '$home/.ssh/known_hosts' && chmod 600 '$home/.ssh/known_hosts'"
+  if ! runuser -u "$u" -- ssh-keygen -F github.com -f "$home/.ssh/known_hosts" >/dev/null 2>&1; then
+    ssh-keyscan -t rsa,ed25519 github.com 2>/dev/null >> "$home/.ssh/known_hosts"
+    chown "$u:" "$home/.ssh/known_hosts"
+  fi
+done
+
 say "writing $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/captures"
 mv /tmp/orch.new "$INSTALL_DIR/orch"

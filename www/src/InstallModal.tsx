@@ -17,17 +17,24 @@ export function InstallModal() {
 
   useEffect(() => {
     let cancelled = false
+    let id: ReturnType<typeof setInterval> | undefined
     async function poll() {
       try {
         const res = await fetch('/api/_relay/info', { credentials: 'same-origin' })
-        if (!res.ok) return // 404 = not behind the relay (self-hosted); never show
+        if (!res.ok) { if (id) clearInterval(id); return }
         const j = (await res.json()) as RelayInfo
-        if (!cancelled) setInfo(j)
+        if (cancelled) return
+        setInfo(j)
+        // Once the agent is connected we don't need to keep polling —
+        // the install modal only exists to surface the join command
+        // while orch is offline. If it later goes down, /api/state's
+        // 503 + browser refresh will bring this back.
+        if (j.connected && id) { clearInterval(id); id = undefined }
       } catch { /* swallow */ }
     }
     poll()
-    const id = setInterval(poll, 3000)
-    return () => { cancelled = true; clearInterval(id) }
+    id = setInterval(poll, 10000)
+    return () => { cancelled = true; if (id) clearInterval(id) }
   }, [])
 
   if (!info || info.connected || hidden) return null

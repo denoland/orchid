@@ -98,41 +98,39 @@ type Config struct {
 }
 
 type GitHubBlock struct {
-	InboxRepo string `hcl:"inbox_repo"`
+	InboxRepo string `hcl:"inbox_repo" json:"inbox_repo"`
 }
 
 type TargetBlock struct {
-	Name  string `hcl:",label"`
-	Label string `hcl:"label"`
-	Repo  string `hcl:"repo"`
+	Name  string `hcl:",label" json:"name"`
+	Label string `hcl:"label" json:"label,omitempty"`
+	Repo  string `hcl:"repo" json:"repo"`
 }
 
 type OrchBlock struct {
-	PollInterval string `hcl:"poll_interval"`
-	StateFile    string `hcl:"state_file"`
-	BranchPrefix string `hcl:"branch_prefix"`
-	WorkdirRoot  string `hcl:"workdir_root"`
-	HTTPAddr     string `hcl:"http_addr,optional"`
-	HTTPSecret   string `hcl:"http_secret,optional"` // bearer token for dashboard; empty = no auth
-	// Extra GitHub logins (besides the subdomain owner) allowed to view
-	// this dashboard via the relay. Pushed to the relay on agent connect.
-	AllowedLogins []string       `hcl:"allowed_logins,optional"`
-	BotLogin      string         `hcl:"bot_login,optional"` // default git user.name; per-VM override available
-	BotEmail      string         `hcl:"bot_email,optional"` // default git user.email; falls back to <bot_login>@users.noreply.github.com
-	NtfyTopic     string         `hcl:"ntfy_topic,optional"`
-	Mentions      *MentionsBlock `hcl:"mentions,block"` // optional mention-watcher
-	Capture       *CaptureBlock  `hcl:"capture,block"`  // optional /api/drafts endpoint for the Orchid Capture apps
+	PollInterval  string         `hcl:"poll_interval" json:"poll_interval"`
+	StateFile     string         `hcl:"state_file" json:"state_file"`
+	BranchPrefix  string         `hcl:"branch_prefix" json:"branch_prefix"`
+	WorkdirRoot   string         `hcl:"workdir_root" json:"workdir_root"`
+	HTTPAddr      string         `hcl:"http_addr,optional" json:"http_addr,omitempty"`
+	HTTPSecret    string         `hcl:"http_secret,optional" json:"http_secret,omitempty"`
+	AllowedLogins []string       `hcl:"allowed_logins,optional" json:"allowed_logins,omitempty"`
+	BotLogin      string         `hcl:"bot_login,optional" json:"bot_login,omitempty"`
+	BotEmail      string         `hcl:"bot_email,optional" json:"bot_email,omitempty"`
+	NtfyTopic     string         `hcl:"ntfy_topic,optional" json:"ntfy_topic,omitempty"`
+	Mentions      *MentionsBlock `hcl:"mentions,block" json:"mentions,omitempty"`
+	Capture       *CaptureBlock  `hcl:"capture,block" json:"capture,omitempty"`
 }
 
 // CaptureBlock configures the /api/drafts endpoint that the Orchid Capture
 // macOS / iOS apps post to. When unset, the endpoint is disabled.
 type CaptureBlock struct {
-	AuthToken     string   `hcl:"auth_token"`              // required; clients send as X-Capture-Token
-	AssetsDir     string   `hcl:"assets_dir,optional"`     // where image/voice blobs are written; default <state_file dir>/captures
-	PublicURL     string   `hcl:"public_url,optional"`     // public base URL used to embed assets in issue bodies; default = empty (only the issue body has a local path note)
-	DefaultRepo   string   `hcl:"default_repo,optional"`   // fallback when draft.target.repo is empty; default = github.inbox_repo
-	DefaultLabels []string `hcl:"default_labels,optional"` // fallback when draft.target.labels is empty
-	MaxBodyMB     int      `hcl:"max_body_mb,optional"`    // request size cap, default 12
+	AuthToken     string   `hcl:"auth_token" json:"auth_token"`
+	AssetsDir     string   `hcl:"assets_dir,optional" json:"assets_dir,omitempty"`
+	PublicURL     string   `hcl:"public_url,optional" json:"public_url,omitempty"`
+	DefaultRepo   string   `hcl:"default_repo,optional" json:"default_repo,omitempty"`
+	DefaultLabels []string `hcl:"default_labels,optional" json:"default_labels,omitempty"`
+	MaxBodyMB     int      `hcl:"max_body_mb,optional" json:"max_body_mb,omitempty"`
 }
 
 // MentionsBlock configures the cross-repo mention watcher. When set, orch
@@ -152,21 +150,21 @@ type MentionsBlock struct {
 }
 
 type VMBlock struct {
-	Name            string `hcl:",label"`
-	Host            string `hcl:"host"`
-	User            string `hcl:"user,optional"`
-	Key             string `hcl:"key,optional"`      // not needed for localhost
-	Capacity        int    `hcl:"capacity,optional"` // 0 = unlimited
-	Sccache         bool   `hcl:"sccache,optional"`
-	SccacheDir      string `hcl:"sccache_dir,optional"`      // default ~/.cache/sccache
-	SessionCmd      string `hcl:"session_cmd,optional"`      // default: clawpatrol run -- claude --dangerously-skip-permissions
-	SessionHome     string `hcl:"session_home,optional"`     // home dir of user running the session (for trust stamp)
-	BotLogin        string `hcl:"bot_login,optional"`        // overrides orchestrator.bot_login for sessions on this VM
-	BotEmail        string `hcl:"bot_email,optional"`        // overrides orchestrator.bot_email for sessions on this VM
-	Agent           string `hcl:"agent,optional"`            // "claude" (default) or "codex" — drives idle marker, resume cmd, trust setup
-	IdleMarker      string `hcl:"idle_marker,optional"`      // optional override of the agent default idle pane substring
-	BusyMarker      string `hcl:"busy_marker,optional"`      // optional override of the agent default busy pane substring
-	BootstrapPrompt string `hcl:"bootstrap_prompt,optional"` // optional override of orchestrator.bootstrap_prompt for this VM
+	Name            string `hcl:",label" json:"name"`
+	Host            string `hcl:"host" json:"host"`
+	User            string `hcl:"user,optional" json:"user,omitempty"`
+	Key             string `hcl:"key,optional" json:"key,omitempty"`           // not needed for localhost
+	Capacity        int    `hcl:"capacity,optional" json:"capacity,omitempty"` // 0 = unlimited
+	Sccache         bool   `hcl:"sccache,optional" json:"sccache,omitempty"`
+	SccacheDir      string `hcl:"sccache_dir,optional" json:"sccache_dir,omitempty"`           // default ~/.cache/sccache
+	SessionCmd      string `hcl:"session_cmd,optional" json:"session_cmd,omitempty"`           // default: clawpatrol run -- claude --dangerously-skip-permissions
+	SessionHome     string `hcl:"session_home,optional" json:"session_home,omitempty"`         // home dir of user running the session (for trust stamp)
+	BotLogin        string `hcl:"bot_login,optional" json:"bot_login,omitempty"`               // overrides orchestrator.bot_login for sessions on this VM
+	BotEmail        string `hcl:"bot_email,optional" json:"bot_email,omitempty"`               // overrides orchestrator.bot_email for sessions on this VM
+	Agent           string `hcl:"agent,optional" json:"agent,omitempty"`                       // "claude" (default) or "codex"
+	IdleMarker      string `hcl:"idle_marker,optional" json:"idle_marker,omitempty"`           // optional override of the agent default idle pane substring
+	BusyMarker      string `hcl:"busy_marker,optional" json:"busy_marker,omitempty"`           // optional override of the agent default busy pane substring
+	BootstrapPrompt string `hcl:"bootstrap_prompt,optional" json:"bootstrap_prompt,omitempty"` // optional override of orchestrator.bootstrap_prompt for this VM
 }
 
 // Job lifecycle: "oneshot" (default) — issue → session → PR → teardown.
@@ -1043,42 +1041,134 @@ func fnv64(s string) uint64 {
 	return h
 }
 
-// patchHCL applies a {block: {field: value}} patch onto an existing HCL
-// source, mutating only the named attributes inside top-level blocks.
-// Block bodies the user didn't touch (and all comments / whitespace
-// outside the changed attributes) are preserved verbatim.
+// patchableBlocks lists top-level HCL block names the dashboard is
+// allowed to mutate. `singleton` blocks have one body keyed only by
+// name; `keyed` blocks are addressed by an additional label (vm
+// "name" {}).
+type blockKind int
+
+const (
+	blockSingleton blockKind = iota
+	blockKeyed
+)
+
+var patchableBlocks = map[string]blockKind{
+	"github":       blockSingleton,
+	"orchestrator": blockSingleton,
+	"vm":           blockKeyed,
+	"target":       blockKeyed,
+}
+
+// patchHCL applies a patch onto an existing HCL source while preserving
+// comments and whitespace in the rest of the file.
+//
+// Singleton block patches: `{ orchestrator: { http_addr: ":8000" } }`.
+// Keyed block patches: `{ "vm.local": { host: "localhost" } }` — the
+// part before the dot is the block type, after is the label. Setting
+// the entire keyed value to nil deletes that block. Capture lives
+// inside orchestrator and is reached via dot notation:
+// `{ "orchestrator.capture": { auth_token: "…" } }`.
 func patchHCL(src []byte, patch map[string]map[string]any) ([]byte, error) {
 	f, diags := hclwrite.ParseConfig(src, "swarm.hcl", hcl.Pos{Line: 1, Column: 1})
 	if diags.HasErrors() {
 		return nil, fmt.Errorf("parse: %s", diags.Error())
 	}
 	for blockName, fields := range patch {
-		// First top-level block matching the name (we don't support nested
-		// keyed blocks like "vm" "name" here yet — only orchestrator,
-		// github, etc. The dashboard only edits those for now).
+		parts := strings.SplitN(blockName, ".", 2)
+		head := parts[0]
+		kind, ok := patchableBlocks[head]
+		if !ok {
+			return nil, fmt.Errorf("block %q is not editable via the dashboard", blockName)
+		}
+
+		// "orchestrator.capture" → nested block inside orchestrator.
+		if head == "orchestrator" && len(parts) == 2 && parts[1] == "capture" {
+			var orch *hclwrite.Block
+			for _, b := range f.Body().Blocks() {
+				if b.Type() == "orchestrator" {
+					orch = b
+					break
+				}
+			}
+			if orch == nil {
+				orch = f.Body().AppendNewBlock("orchestrator", nil)
+			}
+			var cap *hclwrite.Block
+			for _, b := range orch.Body().Blocks() {
+				if b.Type() == "capture" {
+					cap = b
+					break
+				}
+			}
+			if cap == nil {
+				cap = orch.Body().AppendNewBlock("capture", nil)
+			}
+			if err := writeAttrs(cap.Body(), fields, blockName); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		if kind == blockKeyed {
+			if len(parts) != 2 {
+				return nil, fmt.Errorf("%q requires a label (e.g. %q)", head, head+".name")
+			}
+			label := parts[1]
+			var existing *hclwrite.Block
+			for _, b := range f.Body().Blocks() {
+				if b.Type() == head && len(b.Labels()) == 1 && b.Labels()[0] == label {
+					existing = b
+					break
+				}
+			}
+			// `{ "vm.foo": null }` (encoded as an empty map with a single
+			// "__delete" sentinel from the dashboard) removes the block.
+			if _, del := fields["__delete"]; del {
+				if existing != nil {
+					f.Body().RemoveBlock(existing)
+				}
+				continue
+			}
+			if existing == nil {
+				existing = f.Body().AppendNewBlock(head, []string{label})
+			}
+			if err := writeAttrs(existing.Body(), fields, blockName); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		// Singleton.
 		var target *hclwrite.Block
 		for _, b := range f.Body().Blocks() {
-			if b.Type() == blockName {
+			if b.Type() == head {
 				target = b
 				break
 			}
 		}
 		if target == nil {
-			target = f.Body().AppendNewBlock(blockName, nil)
+			target = f.Body().AppendNewBlock(head, nil)
 		}
-		for k, v := range fields {
-			val, err := hclValueOf(v)
-			if err != nil {
-				return nil, fmt.Errorf("%s.%s: %w", blockName, k, err)
-			}
-			if val.IsNull() {
-				target.Body().RemoveAttribute(k)
-			} else {
-				target.Body().SetAttributeValue(k, val)
-			}
+		if err := writeAttrs(target.Body(), fields, blockName); err != nil {
+			return nil, err
 		}
 	}
 	return f.Bytes(), nil
+}
+
+func writeAttrs(body *hclwrite.Body, fields map[string]any, blockName string) error {
+	for k, v := range fields {
+		val, err := hclValueOf(v)
+		if err != nil {
+			return fmt.Errorf("%s.%s: %w", blockName, k, err)
+		}
+		if val.IsNull() {
+			body.RemoveAttribute(k)
+		} else {
+			body.SetAttributeValue(k, val)
+		}
+	}
+	return nil
 }
 
 // hclValueOf converts a JSON-decoded value into a cty value suitable for
@@ -2996,18 +3086,31 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			})
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
 		op := ""
 		if operatorAlive(cfg) {
 			op = operatorTmux
 		}
-		_ = json.NewEncoder(w).Encode(apiStateResp{
+		// Marshal once so we can hash for the ETag short-circuit before
+		// committing to writing the body. Dashboard polls /api/state
+		// every second; the response rarely changes between ticks, so
+		// 304ing the unchanged ones cuts a lot of egress.
+		body, _ := json.Marshal(apiStateResp{
 			Jobs:     jobs,
 			VMs:      vms,
 			Inbox:    cfg.GitHub.InboxRepo,
 			Operator: op,
 		})
+		etag := fmt.Sprintf(`W/"%x"`, fnv64(string(body)))
+		w.Header().Set("ETag", etag)
+		// no-cache (not no-store) so the browser revalidates with
+		// If-None-Match on every poll and 304s cost nothing.
+		w.Header().Set("Cache-Control", "no-cache")
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
 	}))
 
 	// paneVM resolves a tmux session to its VM. Checks active jobs first,

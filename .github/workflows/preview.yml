@@ -2,6 +2,7 @@ name: PR Preview
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, closed]
     paths:
       - 'relay/**'
       - 'www/**'
@@ -17,7 +18,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cleanup:
+    # On PR close (merged or not), delete the per-PR worker so stale
+    # previews don't accumulate.
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install wrangler
+        run: npm i -g wrangler@4
+      - name: Delete preview worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          name="orchid-relay-pr-${{ github.event.pull_request.number }}"
+          wrangler delete --name "$name" --force || echo "no preview to delete"
+      - uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: orchid-preview
+          message: |
+            ### 🌸 Orchid preview torn down
+            <sub>Per-PR worker `orchid-relay-pr-${{ github.event.pull_request.number }}` deleted.</sub>
+
   deploy:
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

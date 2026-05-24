@@ -11,12 +11,9 @@
 ///
 /// Each user owns a Durable Object whose name is the lowercased GitHub
 /// login. The DO holds the agent's WebSocket. HTTP/SSE proxying multiplexes
-/// frames over that socket — see frames.ts.
+/// frames over that socket — see userSession.ts for the frame protocol.
 import { Hono } from 'hono'
 import { handleLogin, handleOAuthCallback, currentUser } from './oauth'
-import { proxyToAgent } from './proxy'
-export { } /* hush ts about empty deps */
-
 export { UserSession } from './userSession'
 
 interface Env {
@@ -30,6 +27,52 @@ interface Env {
 }
 
 const app = new Hono<{ Bindings: Env }>()
+
+// Per-isolate cache for non-owner access checks. Cuts the DO round-trip
+// to one per (sub, login) per 60s — the operator-defined allowlist
+// changes rarely (when the agent reconnects with a fresh
+// `allowed_logins` frame) and a brief lag is fine.
+const accessCache = new Map<string, { ok: boolean; expires: number }>()
+async function checkAllowed(env: Env, sub: string, login: string): Promise<boolean> {
+  const key = sub + '|' + login.toLowerCase()
+  const hit = accessCache.get(key)
+  if (hit && hit.expires > Date.now()) return hit.ok
+  try {
+    const do_ = env.USER.get(env.USER.idFromName(sub))
+    const r = await do_.fetch(new Request(
+      'https://internal/_check_access?login=' + encodeURIComponent(login),
+    ))
+    const j = (await r.json()) as { ok: boolean }
+    accessCache.set(key, { ok: !!j.ok, expires: Date.now() + 60_000 })
+    return !!j.ok
+  } catch {
+    return false
+  }
+}
+
+// HTTP proxy → user's Durable Object → out across the agent WS. The DO
+// is the only thing that knows the shape of the agent connection; here
+// we just buffer the request body (streaming across `do_.fetch` is
+// unreliable in Workers) and pack the original URL + headers into
+// sidecar headers so the DO can reconstruct an inner Request.
+async function proxyToAgent(env: Env, subdomain: string, req: Request): Promise<Response> {
+  const do_ = env.USER.get(env.USER.idFromName(subdomain))
+  const url = new URL(req.url)
+  const innerHeaders: [string, string][] = []
+  req.headers.forEach((v, k) => {
+    if (!k.toLowerCase().startsWith('x-orchid-inner-')) innerHeaders.push([k, v])
+  })
+  const body = ['GET', 'HEAD'].includes(req.method) ? null : await req.arrayBuffer()
+  return do_.fetch(new Request('https://internal/_proxy', {
+    method: req.method,
+    headers: {
+      'x-orchid-inner-url': url.pathname + url.search,
+      'x-orchid-inner-method': req.method,
+      'x-orchid-inner-headers': btoa(JSON.stringify(innerHeaders)),
+    },
+    body,
+  }))
+}
 
 // Subdomain detection. Anything that isn't the apex is a user subdomain.
 function subOf(host: string, root: string): string | null {
@@ -64,6 +107,13 @@ app.use('*', async (c, next) => {
     return do_.fetch(c.req.raw)
   }
 
+  // Capture intake bypasses the session-cookie gate — orch's own
+  // X-Capture-Token header is the actual auth for these requests, and
+  // the macOS / iOS apps don't carry a relay session cookie. Anything
+  // unauthenticated still has to satisfy orch's per-endpoint check.
+  const isCapture = c.req.raw.method === 'POST' &&
+    (url.pathname === '/api/drafts' || url.pathname.startsWith('/captures/'))
+
   // Everything else on a subdomain is private. Two ways in:
   //   1. Owner (cookie.subdomain === host's subdomain).
   //   2. Allowed login (operator-defined list pushed by the agent from
@@ -72,20 +122,9 @@ app.use('*', async (c, next) => {
   // The relay injects an Authorization header onto tunneled requests so
   // orch's own auth would let them through unconditionally — gate here.
   const user = await currentUser(c.env, c.req.raw)
-  let allowed = false
-  if (user) {
-    if (user.subdomain === sub) {
-      allowed = true
-    } else {
-      const do_ = c.env.USER.get(c.env.USER.idFromName(sub))
-      try {
-        const r = await do_.fetch(new Request(
-          'https://internal/_check_access?login=' + encodeURIComponent(user.login),
-        ))
-        const j = (await r.json()) as { ok: boolean }
-        allowed = !!j.ok
-      } catch { /* deny on failure */ }
-    }
+  let allowed = isCapture
+  if (!allowed && user) {
+    allowed = user.subdomain === sub || await checkAllowed(c.env, sub, user.login)
   }
   if (!allowed) {
     const loginURL = `https://${c.env.ROOT_DOMAIN}/login?next=` +
@@ -100,6 +139,27 @@ app.use('*', async (c, next) => {
   if (url.pathname === '/api/_relay/info') {
     const do_ = c.env.USER.get(c.env.USER.idFromName(sub))
     return do_.fetch(new Request('https://internal/_info'))
+  }
+
+  // Owner-initiated agent-token reset. Wipes the DO-side token and
+  // boots the live agent — operator gets a fresh token to wire into
+  // `orch join` on the next sign-in.
+  if (url.pathname === '/api/_relay/revoke' && c.req.raw.method === 'POST') {
+    if (!user || user.subdomain !== sub) {
+      return new Response('owner only', { status: 403 })
+    }
+    const do_ = c.env.USER.get(c.env.USER.idFromName(sub))
+    return do_.fetch(new Request('https://internal/_revoke', { method: 'POST' }))
+  }
+
+  // Owner-only repo list, sourced from the user's GitHub OAuth token.
+  // Drives the inbox + target repo pickers in Settings.
+  if (url.pathname === '/api/_relay/repos') {
+    if (!user || user.subdomain !== sub) {
+      return new Response('owner only', { status: 403 })
+    }
+    const do_ = c.env.USER.get(c.env.USER.idFromName(sub))
+    return do_.fetch(new Request('https://internal/_gh_repos'))
   }
 
   // Proxy /api/* and /captures/ to the agent. WS upgrades go through a
