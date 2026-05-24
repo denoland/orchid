@@ -1,0 +1,50 @@
+# XcodeGen spec for the production build of Orchid Capture iOS, including
+# both the main app target and the Share Extension target. The .swiftpm
+# format under OrchidCaptureSources/ only supports a single target, so
+# this file is the canonical path to building the full app + extension
+# package.
+#
+# Install xcodegen with `brew install xcodegen`, then:
+#
+#     cd capture/ios
+#     xcodegen generate
+#     open OrchidCapture.xcodeproj
+#
+# Then either run the OrchidCapture scheme (main app on Simulator/device)
+# or the OrchidCaptureShareExtension scheme (launches a host app like
+# Safari to test the share sheet flow).
+#
+# Bundle identifiers and the team identifier need adjusting for your dev
+# account before signing. The free Personal Team works for Simulator.
+
+name: OrchidCapture
+options:
+  bundleIdPrefix: land.deno.orchid.capture
+  deploymentTarget:
+    iOS: 16.0
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: "V83ZRZT2HR"
+    CODE_SIGN_STYLE: Automatic
+    GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  OrchidCapture:
+    type: application
+    platform: iOS
+    sources:
+      - path: OrchidCaptureSources
+        excludes:
+          - Package.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: land.deno.orchid.capture
+        INFOPLIST_FILE: SupportingFiles/AppInfo.plist
+        CODE_SIGN_ENTITLEMENTS: SupportingFiles/OrchidCapture.entitlements
+    # Share extension disabled for the personal-team dev build — its app
+    # group identifier requires explicit App Groups registration on the
+    # team. Re-enable by adding back the dependency once a unique group ID
+    # is registered (or switch DEVELOPMENT_TEAM to one that owns the
+    # `group.land.deno.orchid.capture` identifier).
