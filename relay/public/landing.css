@@ -616,6 +616,7 @@ footer a:hover { color: var(--ink); }
   }
   .feature-text h2 { font-size: clamp(28px, 7vw, 40px); }
 
+  .canvas-art { margin: 0; }
   .canvas-art .frame { height: 260px; }
   .canv-card { font-size: 10px; width: 38%; min-height: 50px; padding: 6px 8px; }
   .canv-card .cb { font-size: 10px; }
@@ -631,6 +632,16 @@ footer a:hover { color: var(--ink); }
   .mac-popover { width: 220px; right: 8px; top: 50px; }
   .pop-input { font-size: 12px; min-height: 48px; padding: 8px; }
 
+  /* Cancel the desktop -10%/+10% margin/padding trick — on narrow
+     viewports it punches the iPhone art past the right edge and adds
+     a horizontal scroll. */
+  .ios-art {
+    margin: 0;
+    padding: 0;
+    max-width: 100%;
+    overflow: hidden;
+    min-height: 380px;
+  }
   .ios-art .device-iphone-14-pro {
     transform: scale(0.38);
     margin-bottom: -540px;
