@@ -701,6 +701,95 @@ func TestDiffPRMergeable(t *testing.T) {
 	})
 }
 
+// TestIsActionableCheck pins down which CI conclusions are worth waking
+// the worker for. The whole point of denoland/orchid#224 is that a green
+// check is not an interrupt-worthy event — the worker has nothing to do
+// about it, and the round-trip ("nothing to address, stopping") burns a
+// session turn. Unknown conclusions are deliberately treated as
+// actionable: better to over-notify on a new GitHub value than swallow
+// what might be a real failure mode.
+func TestIsActionableCheck(t *testing.T) {
+	silent := []string{"SUCCESS", "NEUTRAL", "SKIPPED", "STALE"}
+	actionable := []string{
+		"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
+		"STARTUP_FAILURE",
+		"", // empty conclusion shouldn't reach here, but if it does, surface it
+		"SOMETHING_NEW", // forward-compat: unknown values are loud, not silent
+	}
+	for _, c := range silent {
+		if isActionableCheck(c) {
+			t.Errorf("isActionableCheck(%q) = true, want false (no fix for the worker to push)", c)
+		}
+	}
+	for _, c := range actionable {
+		if !isActionableCheck(c) {
+			t.Errorf("isActionableCheck(%q) = false, want true (worker may need to react)", c)
+		}
+	}
+}
+
+// TestDiffPRChecksFilterSuccess locks in the wake-up gate: a tick in
+// which every CI transition is green must not register as a check change
+// at all, so the poll loop's "no diff → silent" branch takes effect and
+// the worker isn't poked.
+func TestDiffPRChecksFilterSuccess(t *testing.T) {
+	t.Run("all-SUCCESS tick is silent", func(t *testing.T) {
+		j := &Job{LastCheckConclusions: map[string]string{}}
+		v := &PRView{StatusCheckRollup: []StatusCheck{
+			{Name: "test linux", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-05-25T00:00:00Z"},
+			{Name: "test mac", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-05-25T00:00:00Z"},
+			{Name: "lint", Status: "COMPLETED", Conclusion: "NEUTRAL", CompletedAt: "2026-05-25T00:00:00Z"},
+			{Name: "docs only", Status: "COMPLETED", Conclusion: "SKIPPED", CompletedAt: "2026-05-25T00:00:00Z"},
+		}}
+		_, _, _, _, checks, _ := diffPR(j, v)
+		if len(checks) != 0 {
+			t.Errorf("all-green tick produced check changes, want none: %v", checks)
+		}
+	})
+
+	t.Run("FAILURE is surfaced even when other checks are green", func(t *testing.T) {
+		j := &Job{LastCheckConclusions: map[string]string{}}
+		v := &PRView{StatusCheckRollup: []StatusCheck{
+			{Name: "test linux", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-05-25T00:00:00Z"},
+			{Name: "test mac", Status: "COMPLETED", Conclusion: "FAILURE", CompletedAt: "2026-05-25T00:00:00Z"},
+		}}
+		_, _, _, _, checks, _ := diffPR(j, v)
+		if len(checks) != 1 {
+			t.Fatalf("expected only the FAILURE to surface, got %d: %v", len(checks), checks)
+		}
+		if !strings.Contains(checks[0], "test mac") || !strings.Contains(checks[0], "FAILURE") {
+			t.Errorf("surfaced wrong change: %q", checks[0])
+		}
+	})
+
+	t.Run("regression detected even across silently-absorbed SUCCESS", func(t *testing.T) {
+		// Prior state recorded the most recent persisted conclusion as
+		// SUCCESS (e.g., the wake-path saved it on a previous tick that
+		// fired for some other reason). Now the same check has flipped
+		// red — we must surface it. This is the SUCCESS→FAILURE
+		// regression case.
+		j := &Job{LastCheckConclusions: map[string]string{"test linux": "SUCCESS"}}
+		v := &PRView{StatusCheckRollup: []StatusCheck{
+			{Name: "test linux", Status: "COMPLETED", Conclusion: "FAILURE", CompletedAt: "2026-05-25T00:01:00Z"},
+		}}
+		_, _, _, _, checks, _ := diffPR(j, v)
+		if len(checks) != 1 || !strings.Contains(checks[0], "FAILURE") {
+			t.Errorf("SUCCESS→FAILURE regression not surfaced: %v", checks)
+		}
+	})
+
+	t.Run("in-progress checks are ignored", func(t *testing.T) {
+		j := &Job{LastCheckConclusions: map[string]string{}}
+		v := &PRView{StatusCheckRollup: []StatusCheck{
+			{Name: "test linux", Status: "IN_PROGRESS", Conclusion: "", CompletedAt: ""},
+		}}
+		_, _, _, _, checks, _ := diffPR(j, v)
+		if len(checks) != 0 {
+			t.Errorf("in-progress check leaked into diff: %v", checks)
+		}
+	})
+}
+
 func TestIncludePatternMatches(t *testing.T) {
 	body := `Plain text.
 

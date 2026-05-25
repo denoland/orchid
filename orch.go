@@ -805,6 +805,13 @@ func ghAutoCreatePR(cfg *Config, n int, j *Job, is Issue) (int, error) {
 	return num, nil
 }
 
+type StatusCheck struct {
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Conclusion  string `json:"conclusion"`
+	CompletedAt string `json:"completedAt"` // RFC3339; latest run per name wins
+}
+
 type PRView struct {
 	State      string `json:"state"`
 	HeadRefOid string `json:"headRefOid"`
@@ -828,12 +835,7 @@ type PRView struct {
 		Author struct{ Login string } `json:"author"`
 		Body   string                 `json:"body"`
 	} `json:"comments"`
-	StatusCheckRollup []struct {
-		Name        string `json:"name"`
-		Status      string `json:"status"`
-		Conclusion  string `json:"conclusion"`
-		CompletedAt string `json:"completedAt"` // RFC3339; latest run per name wins
-	} `json:"statusCheckRollup"`
+	StatusCheckRollup []StatusCheck `json:"statusCheckRollup"`
 	// Mergeable: GitHub returns "MERGEABLE", "CONFLICTING", or "UNKNOWN".
 	// UNKNOWN means GitHub hasn't finished computing the merge — a few
 	// seconds after the PR is viewed it usually settles. Used to surface
@@ -1820,6 +1822,22 @@ func mergeableTransition(prev, cur string) string {
 	return cur
 }
 
+// isActionableCheck reports whether a CI check conclusion warrants poking
+// the worker. SUCCESS / NEUTRAL / SKIPPED / STALE are the expected case
+// — there's no fix to push for a green check, and waking the worker just
+// to have them reply "nothing to address" wastes a session turn. Anything
+// else (FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, STARTUP_FAILURE,
+// and any conclusion GitHub adds in the future) is treated as actionable
+// — better to over-notify on an unknown state than swallow a real
+// failure.
+func isActionableCheck(conclusion string) bool {
+	switch conclusion {
+	case "SUCCESS", "NEUTRAL", "SKIPPED", "STALE":
+		return false
+	}
+	return true
+}
+
 func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments []string, pushed bool, checkChanges []string, mergeable string) {
 	seen := func(ids []string) map[string]bool {
 		m := map[string]bool{}
@@ -1852,7 +1870,12 @@ func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments 
 		pushed = true
 	}
 	// Build latest-per-name map: GitHub returns all historical runs; we only
-	// care about the most recent completed run for each check name.
+	// care about the most recent completed run for each check name. Then
+	// drop transitions to non-actionable conclusions — a freshly-passed
+	// check has nothing for the worker to address, so waking them on it
+	// just burns a session turn on a "nothing to address" round-trip
+	// (denoland/orchid#224). Failures, cancellations, timeouts, etc. still
+	// surface.
 	latest := map[string]string{} // name → conclusion
 	latestAt := map[string]string{}
 	for _, c := range v.StatusCheckRollup {
@@ -1866,7 +1889,7 @@ func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments 
 	}
 	prev := j.LastCheckConclusions
 	for name, conclusion := range latest {
-		if prev[name] != conclusion {
+		if prev[name] != conclusion && isActionableCheck(conclusion) {
 			checkChanges = append(checkChanges, fmt.Sprintf("%s: %s", name, conclusion))
 		}
 	}
