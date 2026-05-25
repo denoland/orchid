@@ -22,14 +22,20 @@ import (
 //
 // relayURL example: wss://orchid.com/agent
 // token: per-user agent token minted by the relay on signup.
-func runRelayAgent(parent context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler) {
+//
+// stateWake fires whenever orch's state changes; statePush returns the
+// current /api/state body. Together they drive the push-based state
+// stream that lets the dashboard drop its 3s poll loop — relay
+// broadcasts each new body to all subscribed browsers and a hibernated
+// DO costs nothing when nothing's changing.
+func runRelayAgent(parent context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler, stateWake <-chan struct{}, statePush func() []byte) {
 	backoff := 500 * time.Millisecond
 	for {
 		if parent.Err() != nil {
 			return
 		}
 		sessionStart := time.Now()
-		err := relayAgentSession(parent, relayURL, token, httpSecret, localAddr, allowedLogins, handler)
+		err := relayAgentSession(parent, relayURL, token, httpSecret, localAddr, allowedLogins, handler, stateWake, statePush)
 		// A long-lived session means the connection was healthy — reset
 		// the backoff so a single hiccup later doesn't park us at 30s.
 		// Otherwise grow exponentially (capped) to avoid hammering CF
@@ -50,7 +56,7 @@ func runRelayAgent(parent context.Context, relayURL, token, httpSecret, localAdd
 	}
 }
 
-func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler) error {
+func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler, stateWake <-chan struct{}, statePush func() []byte) error {
 	u, err := url.Parse(relayURL)
 	if err != nil {
 		return fmt.Errorf("parse relay url: %w", err)
@@ -109,6 +115,38 @@ func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAd
 		}
 	}()
 
+	// State pusher. Every saveState wakes us via stateWake; we send the
+	// current snapshot to the relay which fans it out to subscribed
+	// browser WSs. Throttled to once per 500ms so a burst of saves
+	// coalesces — the dashboard never needed sub-second granularity.
+	// Initial frame on connect bootstraps any client that subscribed
+	// before orch came back up.
+	if stateWake != nil && statePush != nil {
+		go func() {
+			emit := func() {
+				body := statePush()
+				_ = a.sendCtl(pingCtx, ctlFrame{T: "state-update", State: json.RawMessage(body)})
+			}
+			emit()
+			throttle := time.NewTicker(500 * time.Millisecond)
+			defer throttle.Stop()
+			pending := false
+			for {
+				select {
+				case <-pingCtx.Done():
+					return
+				case <-stateWake:
+					pending = true
+				case <-throttle.C:
+					if pending {
+						pending = false
+						emit()
+					}
+				}
+			}
+		}()
+	}
+
 	return a.loop(ctx)
 }
 
@@ -134,19 +172,23 @@ type wsStream struct {
 }
 
 type ctlFrame struct {
-	T       string     `json:"t"`
-	ID      uint32     `json:"id,omitempty"`
-	Method  string     `json:"method,omitempty"`
-	Path    string     `json:"path,omitempty"`
-	Headers [][]string `json:"headers,omitempty"`
-	HasBody bool       `json:"hasBody,omitempty"`
-	Status  int        `json:"status,omitempty"`
-	UserID  int        `json:"userId,omitempty"`
-	Login   string     `json:"login,omitempty"`
-	Stream  bool       `json:"streaming,omitempty"`
-	Data    string     `json:"data,omitempty"`
-	Code    int        `json:"code,omitempty"`
-	Reason  string     `json:"reason,omitempty"`
+	T       string          `json:"t"`
+	ID      uint32          `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Path    string          `json:"path,omitempty"`
+	Headers [][]string      `json:"headers,omitempty"`
+	HasBody bool            `json:"hasBody,omitempty"`
+	Status  int             `json:"status,omitempty"`
+	UserID  int             `json:"userId,omitempty"`
+	Login   string          `json:"login,omitempty"`
+	Stream  bool            `json:"streaming,omitempty"`
+	Data    string          `json:"data,omitempty"`
+	Code    int             `json:"code,omitempty"`
+	Reason  string          `json:"reason,omitempty"`
+	// State carries an /api/state payload on a "state-update" frame.
+	// Raw so we don't pay for double-JSON-encoding a body that's
+	// already JSON.
+	State json.RawMessage `json:"state,omitempty"`
 }
 
 func (a *agent) sendCtl(ctx context.Context, f ctlFrame) error {

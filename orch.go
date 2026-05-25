@@ -228,6 +228,11 @@ type State struct {
 	MentionCursor *time.Time       `json:"mention_cursor,omitempty"` // last "updated" timestamp seen by the mention poller
 	Maintainers   *MaintainerCache `json:"maintainers,omitempty"`    // cached org member list
 	httpSnap      atomic.Value     // stores map[int]Job; refreshed at tick start, lock-free reads
+	// Bcast is a coalescing change signal. saveState non-blocking-sends
+	// here so any subscriber goroutine (the relay agent's state pusher)
+	// can wake up and emit a fresh state snapshot. Capacity-1 channel
+	// means rapid-fire saves collapse into one wake.
+	Bcast chan struct{} `json:"-"`
 }
 
 // MaintainerCache caches the configured org's member logins. Refreshed
@@ -1675,7 +1680,7 @@ func renderBootstrap(tmpl string, is Issue, branch, targetName, targetRepo, inbo
 func loadState(path string) (*State, error) {
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return &State{Jobs: map[int]*Job{}}, nil
+		return &State{Jobs: map[int]*Job{}, Bcast: make(chan struct{}, 1)}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -1687,6 +1692,7 @@ func loadState(path string) (*State, error) {
 	if s.Jobs == nil {
 		s.Jobs = map[int]*Job{}
 	}
+	s.Bcast = make(chan struct{}, 1)
 	return &s, nil
 }
 
@@ -1708,6 +1714,15 @@ func saveState(path string, s *State) error {
 		snap[n] = *j
 	}
 	s.httpSnap.Store(snap)
+	// Wake any state-push subscriber (relay agent). Non-blocking — if
+	// the channel buffer is already full, the subscriber will see this
+	// change folded into the next wake.
+	if s.Bcast != nil {
+		select {
+		case s.Bcast <- struct{}{}:
+		default:
+		}
+	}
 	return nil
 }
 
@@ -2973,6 +2988,52 @@ type apiStateResp struct {
 	Operator string        `json:"operator"` // tmux session name if alive, "" if dead
 }
 
+// buildAPIStateJSON renders the /api/state payload from the current
+// snapshot. Shared by the HTTP handler and the relay agent's WS push so
+// both deliver byte-identical bodies — dashboard can swap from polling
+// to push without any client-side schema branching.
+func buildAPIStateJSON(cfg *Config, st *State) []byte {
+	var snap map[int]Job
+	if v := st.httpSnap.Load(); v != nil {
+		snap = v.(map[int]Job)
+	}
+	load := map[string]int{}
+	jobs := make([]apiJobEntry, 0, len(snap))
+	for issue, j := range snap {
+		jobs = append(jobs, apiJobEntry{
+			Issue:    issue,
+			Job:      j,
+			Activity: paneActivitySnapshot(j.Tmux),
+		})
+		load[j.VM]++
+	}
+	sort.Slice(jobs, func(a, b int) bool { return jobs[a].Tmux < jobs[b].Tmux })
+
+	vms := make([]apiVMEntry, 0, len(cfg.VMs))
+	for _, vm := range cfg.VMs {
+		bot, _ := vmBotIdentity(cfg.Orch, vm)
+		vms = append(vms, apiVMEntry{
+			Name:     vm.Name,
+			Host:     vm.Host,
+			Capacity: vm.Capacity,
+			Used:     load[vm.Name],
+			Bot:      bot,
+			Agent:    vmAgent(vm).name,
+		})
+	}
+	op := ""
+	if operatorAlive(cfg) {
+		op = operatorTmux
+	}
+	body, _ := json.Marshal(apiStateResp{
+		Jobs:     jobs,
+		VMs:      vms,
+		Inbox:    cfg.GitHub.InboxRepo,
+		Operator: op,
+	})
+	return body
+}
+
 // describe renders a markdown block describing this orch instance: config
 // surface plus current job snapshot. Drop into a CLAUDE.md so future Claude
 // sessions know how to operate this instance without rediscovering it.
@@ -3201,49 +3262,7 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 
 	// /api/state — JSON snapshot of jobs + VMs
 	mux.HandleFunc("/api/state", auth(func(w http.ResponseWriter, r *http.Request) {
-		var snap map[int]Job
-		if v := st.httpSnap.Load(); v != nil {
-			snap = v.(map[int]Job)
-		}
-		load := map[string]int{}
-		jobs := make([]apiJobEntry, 0, len(snap))
-		for issue, j := range snap {
-			jobs = append(jobs, apiJobEntry{
-				Issue:    issue,
-				Job:      j,
-				Activity: paneActivitySnapshot(j.Tmux),
-			})
-			load[j.VM]++
-		}
-		sort.Slice(jobs, func(a, b int) bool { return jobs[a].Tmux < jobs[b].Tmux })
-
-		vms := make([]apiVMEntry, 0, len(cfg.VMs))
-		for _, vm := range cfg.VMs {
-			bot, _ := vmBotIdentity(cfg.Orch, vm)
-			vms = append(vms, apiVMEntry{
-				Name:     vm.Name,
-				Host:     vm.Host,
-				Capacity: vm.Capacity,
-				Used:     load[vm.Name],
-				Bot:      bot,
-				Agent:    vmAgent(vm).name,
-			})
-		}
-
-		op := ""
-		if operatorAlive(cfg) {
-			op = operatorTmux
-		}
-		// Marshal once so we can hash for the ETag short-circuit before
-		// committing to writing the body. Dashboard polls /api/state
-		// every second; the response rarely changes between ticks, so
-		// 304ing the unchanged ones cuts a lot of egress.
-		body, _ := json.Marshal(apiStateResp{
-			Jobs:     jobs,
-			VMs:      vms,
-			Inbox:    cfg.GitHub.InboxRepo,
-			Operator: op,
-		})
+		body := buildAPIStateJSON(cfg, st)
 		etag := fmt.Sprintf(`W/"%x"`, fnv64(string(body)))
 		w.Header().Set("ETag", etag)
 		// no-cache (not no-store) so the browser revalidates with
@@ -4460,7 +4479,7 @@ func main() {
 		if *relayToken == "" {
 			log.Fatalf("-relay requires -relay-token (issued by the relay on signup)")
 		}
-		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st))
+		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st), st.Bcast, func() []byte { return buildAPIStateJSON(&cfg, st) })
 	}
 
 	for i := range cfg.VMs {

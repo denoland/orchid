@@ -8,40 +8,90 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false
-    let id: ReturnType<typeof setInterval> | undefined
-    async function poll() {
-      // Skip the round-trip when the tab is hidden — backgrounded tabs
-      // were our biggest unnecessary DO bill. The visibilitychange
-      // listener below kicks an immediate poll on return so the user
-      // never sees stale state.
+    let ws: WebSocket | null = null
+    let pollTimer: ReturnType<typeof setInterval> | undefined
+    let reopenTimer: ReturnType<typeof setTimeout> | undefined
+    let reopenDelay = 1000
+
+    // 401/403 means the session cookie expired or never existed — kick
+    // to OAuth via the apex /login. Same flow regardless of which
+    // transport (WS or fetch fallback) noticed first.
+    const bounceToLogin = () => {
+      const apex = location.host.split('.').slice(1).join('.')
+      const next = encodeURIComponent(location.href)
+      location.href = `https://${apex}/login?next=${next}`
+    }
+
+    // HTTP fallback used when the events WS can't be opened — e.g. the
+    // user is running orch locally without the relay, or a corporate
+    // proxy strips Upgrade. Behaves like the old polling loop but at a
+    // gentler cadence.
+    const fetchOnce = async () => {
       if (document.hidden) return
       try {
         const res = await fetch('/api/state')
-        // Session cookie missing / expired — kick to OAuth so the
-        // browser doesn't sit on an empty dashboard forever.
-        if (res.status === 401 || res.status === 403) {
-          // /login lives on the apex. Strip the leftmost subdomain
-          // segment to reach it, then come back here after OAuth.
-          const apex = location.host.split('.').slice(1).join('.')
-          const next = encodeURIComponent(location.href)
-          location.href = `https://${apex}/login?next=${next}`
-          return
-        }
+        if (res.status === 401 || res.status === 403) { bounceToLogin(); return }
         if (!res.ok) return
         const data: State = await res.json()
         if (!cancelled) setState(data)
       } catch { /* swallow */ }
     }
-    poll()
-    // 3s instead of 1s — orchid dispatch is multi-second anyway,
-    // so sub-second polling just burned DO requests.
-    id = setInterval(poll, 3000)
-    const onVis = () => { if (!document.hidden) poll() }
-    document.addEventListener('visibilitychange', onVis)
+
+    const startFallback = () => {
+      if (pollTimer) return
+      fetchOnce()
+      pollTimer = setInterval(fetchOnce, 5000)
+    }
+
+    const stopFallback = () => {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = undefined }
+    }
+
+    const openWS = () => {
+      if (cancelled) return
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      try {
+        ws = new WebSocket(`${proto}//${location.host}/api/events/ws`)
+      } catch {
+        startFallback()
+        return
+      }
+      ws.onopen = () => {
+        // WS up — drop the fallback polling and reset the reconnect
+        // backoff. Relay sends the cached state immediately so we get
+        // an initial render without a separate /api/state fetch.
+        reopenDelay = 1000
+        stopFallback()
+      }
+      ws.onmessage = (ev) => {
+        if (cancelled) return
+        try {
+          const data = JSON.parse(ev.data) as State
+          setState(data)
+        } catch { /* ignore */ }
+      }
+      ws.onclose = () => {
+        if (cancelled) return
+        ws = null
+        // Reconnect with capped exponential backoff. Falls back to
+        // polling in the meantime so the dashboard never goes blank.
+        startFallback()
+        reopenTimer = setTimeout(openWS, reopenDelay)
+        reopenDelay = Math.min(reopenDelay * 2, 30000)
+      }
+      ws.onerror = () => {
+        // Errors arrive just before close — close handler does the
+        // reconnect, so this is intentionally a no-op.
+      }
+    }
+
+    openWS()
+
     return () => {
       cancelled = true
-      if (id) clearInterval(id)
-      document.removeEventListener('visibilitychange', onVis)
+      if (ws) { try { ws.close() } catch {} }
+      stopFallback()
+      if (reopenTimer) clearTimeout(reopenTimer)
     }
   }, [])
 

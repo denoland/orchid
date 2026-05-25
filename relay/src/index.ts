@@ -192,6 +192,21 @@ app.use('*', async (c, next) => {
     return do_.fetch(new Request('https://internal/_gh_repos'))
   }
 
+  // Push channel for /api/state. The DO holds a hibernated WS per
+  // browser tab; orch sends an update frame on every state change.
+  // Bypasses the agent-tunnel path entirely so an idle subscriber
+  // costs zero DO CPU/requests after the initial open.
+  if (url.pathname === '/api/events/ws') {
+    if (c.req.raw.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
+      return new Response('expected websocket', { status: 426 })
+    }
+    const do_ = c.env.USER.get(c.env.USER.idFromName(sub))
+    return do_.fetch(new Request('https://internal/_events_ws', {
+      method: 'GET',
+      headers: { 'upgrade': 'websocket' },
+    }))
+  }
+
   // Proxy /api/* and /captures/ to the agent. WS upgrades go through a
   // dedicated DO path that pairs a WebSocketPair and multiplexes frames.
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/captures/')) {
