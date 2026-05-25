@@ -77,6 +77,16 @@ func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAd
 	q.Set("token", token)
 	u.RawQuery = q.Encode()
 
+	// Re-fetch the current allow-list every time we (re)connect so a
+	// dashboard edit landed mid-disconnect still gets pushed on the
+	// next handshake. allowedLoginsProvider takes precedence over the
+	// caller-supplied slice when set (the config-save handler wires
+	// it). Falls back to the captured allowedLogins arg when nil so
+	// pre-hot-reload callers keep working.
+	current := allowedLogins
+	if allowedLoginsProvider != nil {
+		current = allowedLoginsProvider()
+	}
 	conn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
 		HTTPHeader: http.Header{
 			"X-Agent-Token": []string{token},
@@ -94,9 +104,24 @@ func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAd
 	// to invited GitHub logins without code changes on the worker side.
 	cfgFrame, _ := json.Marshal(map[string]any{
 		"t":              "config",
-		"allowed_logins": allowedLogins,
+		"allowed_logins": current,
 	})
 	_ = conn.Write(ctx, websocket.MessageText, cfgFrame)
+
+	// Expose the live socket so hot-reload paths (config save handler)
+	// can re-push the allow-list without an orch restart. Cleared
+	// before we return so a half-torn-down session can't keep being
+	// written to.
+	liveAgentMu.Lock()
+	liveAgentConn = conn
+	liveAgentMu.Unlock()
+	defer func() {
+		liveAgentMu.Lock()
+		if liveAgentConn == conn {
+			liveAgentConn = nil
+		}
+		liveAgentMu.Unlock()
+	}()
 
 	a := &agent{
 		conn:       conn,
@@ -239,6 +264,41 @@ type agent struct {
 type paneSub struct {
 	refs   int
 	cancel context.CancelFunc
+}
+
+// allowedLoginsProvider is set by main() to a closure that reads the
+// current cfg.Orch.AllowedLogins. The relay-agent reconnect path
+// prefers it over the static slice it was constructed with, so a
+// dashboard save lands on the next handshake without restart.
+var allowedLoginsProvider func() []string
+
+// liveAgentConn holds the active outbound WS to the relay (when one
+// exists). pushAllowedLogins writes a fresh `config` frame to it so
+// allow-list edits apply without waiting for the next disconnect.
+var (
+	liveAgentMu   sync.Mutex
+	liveAgentConn *websocket.Conn
+)
+
+// pushAllowedLogins re-sends the operator allow-list to the relay on
+// the currently-open agent socket. No-op when there's no live
+// connection (orch is running standalone, or the relay is currently
+// reconnecting); the next handshake re-reads from
+// allowedLoginsProvider anyway, so the new value lands either way.
+func pushAllowedLogins(logins []string) {
+	liveAgentMu.Lock()
+	conn := liveAgentConn
+	liveAgentMu.Unlock()
+	if conn == nil {
+		return
+	}
+	frame, _ := json.Marshal(map[string]any{
+		"t":              "config",
+		"allowed_logins": logins,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = conn.Write(ctx, websocket.MessageText, frame)
 }
 
 type wsStream struct {

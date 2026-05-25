@@ -4157,6 +4157,13 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			// Hot-apply the bits we can without an orch restart. The
+			// allow-list is the one Settings-page edit that
+			// matters most for owner-shared dashboards — push it to
+			// the relay immediately so the invited login can refresh
+			// and see the dashboard without a service bounce.
+			cfg.Orch.AllowedLogins = append([]string(nil), trial.Orch.AllowedLogins...)
+			pushAllowedLogins(cfg.Orch.AllowedLogins)
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.Error(w, "GET/PUT/POST only", http.StatusMethodNotAllowed)
@@ -4942,6 +4949,10 @@ func main() {
 			}
 			return st.store.PutSnap(body)
 		}
+		// allowedLoginsProvider lets the config-save handler hot-push
+		// allow-list edits without an orch restart. Captures cfg by
+		// pointer so the closure reads the freshest slice each call.
+		allowedLoginsProvider = func() []string { return append([]string(nil), cfg.Orch.AllowedLogins...) }
 		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st), st.Bcast, func() []byte { return buildAPIStateJSON(&cfg, st) }, snapRead, snapWrite, func(s string) *VMBlock { return lookupPaneVM(&cfg, st, s) })
 	}
 
