@@ -81,17 +81,20 @@ export function Pane({ session }: Props) {
     })
 
     // Server-Sent Events stream of base64-encoded `tmux capture-pane`
-    // snapshots. The server diffs and only sends when content changes, so
-    // the term doesn't redraw unless something happened on the VM.
+    // snapshots. Held open only while the card is on-screen and the
+    // tab is foregrounded — every second of an idle stream burns DO
+    // duration and ~40KB/s of egress for content nobody's reading.
     let es: EventSource | null = null
     let cancelled = false
+    let isVisible = true       // intersection observer says it's on screen
+    let isForeground = !document.hidden
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+
+    const shouldStream = () => isVisible && isForeground
 
     function connect() {
-      if (cancelled) return
+      if (cancelled || !shouldStream() || es) return
       setStatus('connecting')
-      es?.close()
-      // Pass current xterm size so the server can resize the tmux pane to
-      // exactly match — claude renders to fit the available cols/rows.
       const cols = term.cols
       const rows = term.rows
       es = new EventSource(
@@ -101,10 +104,8 @@ export function Pane({ session }: Props) {
       const decoder = new TextDecoder('utf-8')
       es.onmessage = (ev) => {
         try {
-          // `atob` produces a binary string where each char is a raw byte.
-          // Passing it directly to term.write would re-encode multi-byte
-          // UTF-8 sequences as UTF-16 code units — box-drawing chars become
-          // `â` mojibake. Decode to a real UTF-8 string first.
+          // atob produces a binary string where each char is a raw byte;
+          // decode to real UTF-8 so multi-byte glyphs survive.
           const bin = atob(ev.data)
           const bytes = new Uint8Array(bin.length)
           for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
@@ -114,14 +115,38 @@ export function Pane({ session }: Props) {
       }
       es.onerror = () => {
         setStatus('error')
-        // EventSource auto-reconnects on transient errors, but if the
-        // server returned a permanent failure we close and retry on a
-        // longer cadence to avoid hammering.
         if (es?.readyState === EventSource.CLOSED) {
-          setTimeout(connect, 2000)
+          es = null
+          if (shouldStream()) retryTimer = setTimeout(connect, 2000)
         }
       }
     }
+    function disconnect() {
+      if (retryTimer) { clearTimeout(retryTimer); retryTimer = undefined }
+      if (es) { es.close(); es = null }
+      setStatus('connecting')
+    }
+
+    // Pause the stream when the card scrolls / flows off-screen.
+    // 0% threshold = react as soon as it leaves the viewport.
+    const io = new IntersectionObserver((entries) => {
+      const v = entries[0]?.isIntersecting ?? true
+      if (v === isVisible) return
+      isVisible = v
+      if (shouldStream()) connect()
+      else disconnect()
+    }, { threshold: 0 })
+    io.observe(containerRef.current)
+
+    // Tab visibility — backgrounded tabs would otherwise keep the
+    // stream open + burn DO duration for content they can't render.
+    const onVis = () => {
+      isForeground = !document.hidden
+      if (shouldStream()) connect()
+      else disconnect()
+    }
+    document.addEventListener('visibilitychange', onVis)
+
     connect()
 
     const doFit = () => {
@@ -136,7 +161,10 @@ export function Pane({ session }: Props) {
 
     return () => {
       cancelled = true
+      if (retryTimer) clearTimeout(retryTimer)
       es?.close()
+      io.disconnect()
+      document.removeEventListener('visibilitychange', onVis)
       window.removeEventListener('resize', doFit)
       ro.disconnect()
       term.dispose()
