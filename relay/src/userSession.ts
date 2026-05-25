@@ -13,6 +13,10 @@ type Frame =
   | { t: 'ws-open'; id: number; path: string; headers: [string, string][] }
   | { t: 'ws-text'; id: number; data: string }
   | { t: 'ws-close'; id: number; code?: number; reason?: string }
+  // Orch pushes a fresh /api/state body on every change. Relay caches
+  // the latest and fans out to every browser subscribed via
+  // /api/events/ws — replaces the dashboard's 3s polling loop.
+  | { t: 'state-update'; state: unknown }
 
 function encodeBinary(streamId: number, chunk: Uint8Array): Uint8Array {
   const out = new Uint8Array(4 + chunk.byteLength)
@@ -61,6 +65,10 @@ export class UserSession {
   // but when it is it pulls 3 pages × 100 repos from api.github.com every
   // open. A 5-minute TTL keeps the dropdown fresh without re-fanning out.
   reposCache: { body: string; expires: number } | null = null
+  // Latest /api/state body the agent pushed. Held in memory so a fresh
+  // subscriber gets the current snapshot immediately on /api/events/ws
+  // open — they don't have to wait for the next state change to render.
+  lastState: string | null = null
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
@@ -87,6 +95,7 @@ export class UserSession {
     if (url.pathname === '/_mint') return this.handleMint(req)
     if (url.pathname === '/_proxy') return this.handleProxy(req)
     if (url.pathname === '/_proxy_ws') return this.handleProxyWS(req)
+    if (url.pathname === '/_events_ws') return this.handleEventsWS(req)
     if (url.pathname === '/_info') return this.handleInfo()
     if (url.pathname === '/_check_access') return this.handleCheckAccess(req)
     if (url.pathname === '/_revoke') return this.handleRevoke()
@@ -247,6 +256,10 @@ export class UserSession {
   // accepted via state.acceptWebSocket. Routes everything through the
   // same handler the old addEventListener path used.
   async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer) {
+    // /_events_ws subscribers are read-only — drop any inbound traffic
+    // so they can't be used as a back-channel into the agent stream.
+    const tags = this.state.getTags(ws)
+    if (tags.includes('events')) return
     if (this.agentWS == null) this.agentWS = ws
     this.onAgentMessage({ data } as MessageEvent)
   }
@@ -285,6 +298,28 @@ export class UserSession {
     while (!this.agentWS && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100))
     }
+  }
+
+  // Read-only state-event channel. Browsers open one WS here on
+  // dashboard mount and receive every /api/state push the agent emits.
+  // Accepted via state.acceptWebSocket so CF hibernates idle sockets —
+  // a backgrounded tab costs zero DO CPU until the next state change.
+  // We don't expect any inbound traffic from the browser; webSocketMessage
+  // ignores frames from these WSs.
+  private async handleEventsWS(req: Request): Promise<Response> {
+    if (req.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
+      return new Response('expected websocket', { status: 426 })
+    }
+    const pair = new WebSocketPair()
+    const client = pair[0]
+    const server = pair[1]
+    this.state.acceptWebSocket(server, ['events'])
+    // Prime the new subscriber with the latest cached state so the
+    // dashboard can render without a separate /api/state fetch.
+    if (this.lastState) {
+      try { server.send(this.lastState) } catch {}
+    }
+    return new Response(null, { status: 101, webSocket: client })
   }
 
   private async handleProxyWS(req: Request): Promise<Response> {
@@ -365,6 +400,18 @@ export class UserSession {
         this.allowedLogins = list
           .map((s: any) => String(s).toLowerCase().trim())
           .filter(Boolean)
+        return
+      }
+      // State push from orch. Cache the latest body so newly-arriving
+      // subscribers get the current snapshot, and fan out to every
+      // active /_events_ws subscriber. Hibernated WSs survive across
+      // DO eviction so this works even after the relay restarts.
+      if (f.t === 'state-update') {
+        const body = JSON.stringify(f.state ?? {})
+        this.lastState = body
+        for (const sub of this.state.getWebSockets('events')) {
+          try { sub.send(body) } catch {}
+        }
         return
       }
       const id = (f as any).id as number | undefined
