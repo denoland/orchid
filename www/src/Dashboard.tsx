@@ -36,7 +36,9 @@ import {
   NOTE_W, NOTE_H, LINK_W, LINK_H,
 } from '@orchid/whiteboard'
 
-interface Props { state: State }
+import type { RelayInfo } from './App'
+
+interface Props { state: State; relay: RelayInfo | null }
 
 const CARD_W = 220
 const CARD_H = 96
@@ -305,15 +307,15 @@ function makeCardNode(
 
 // ─── dashboard ────────────────────────────────────────────────────────
 
-export function Dashboard({ state }: Props) {
+export function Dashboard({ state, relay }: Props) {
   return (
     <ReactFlowProvider>
-      <DashboardInner state={state} />
+      <DashboardInner state={state} relay={relay} />
     </ReactFlowProvider>
   )
 }
 
-function DashboardInner({ state }: Props) {
+function DashboardInner({ state, relay }: Props) {
   const { jobs = [], inbox = '' } = state
   const snapRef = useRef<Snap>(emptySnap())
   const [snapLoaded, setSnapLoaded] = useState(false)
@@ -1008,7 +1010,7 @@ function DashboardInner({ state }: Props) {
           onOpenCapture={() => setShowCapture(true)}
         />
       )}
-      {showSettings && <SettingsPage jobs={jobs} state={state} onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsPage jobs={jobs} state={state} relay={relay} onClose={() => setShowSettings(false)} />}
       {showCapture && <CapturePage jobs={jobs} inbox={inbox} onClose={() => setShowCapture(false)} />}
       {view === 'canvas' && !showSettings && !showCapture && (
         <FloatingToolbar tool={tool} setTool={setTool} addNote={addNote} />
@@ -1517,9 +1519,10 @@ function timeAgo(iso?: string | null): string {
 
 type SectionId = 'orch' | 'access' | 'capture' | 'vms' | 'targets' | 'danger'
 
-function SettingsPage({ jobs, state, onClose }: {
+function SettingsPage({ jobs, state, relay, onClose }: {
   jobs: Job[]
   state: State
+  relay: RelayInfo | null
   onClose: () => void
 }) {
   const [cfg, setCfg] = useState<OrchestratorCfg | null>(null)
@@ -1791,7 +1794,7 @@ function SettingsPage({ jobs, state, onClose }: {
                 title="VMs"
                 subtitle="Worker sessions run on boxes that have joined this orch. Bring a new one online by running the join command on it — no SSH config to fill in here."
               >
-                <VMJoinGuide vms={vms} sessionsByVM={sessionsByVM} />
+                <VMJoinGuide vms={vms} sessionsByVM={sessionsByVM} relay={relay} />
               </Section>
             )}
 
@@ -1935,13 +1938,6 @@ function useGhProfiles(logins: string[]): Map<string, GhProfile | 'loading' | 'm
 }
 const profileCache = new Map<string, GhProfile | 'loading' | 'missing'>()
 
-interface RelayInfo {
-  connected: boolean
-  token: string | null
-  login: string | null
-  root: string | null  // ROOT_DOMAIN exposed by the relay so we don't have to guess from location.hostname
-}
-
 // VMJoinGuide replaces the old form-based VM CRUD. It surfaces the
 // install + join command operators run on a new box to bring it
 // online, plus a read-only roster of VMs the orch already knows about
@@ -1952,19 +1948,16 @@ interface RelayInfo {
 // the first-run InstallModal uses. Local-only orchs (no relay) get a
 // fallback that points at swarm.hcl, since there's no relay endpoint
 // for a fresh box to dial into.
-function VMJoinGuide({ vms, sessionsByVM }: {
+function VMJoinGuide({ vms, sessionsByVM, relay }: {
   vms: VMCfg[]
   sessionsByVM: Map<string, Job[]>
+  relay: RelayInfo | null
 }) {
-  const [info, setInfo] = useState<RelayInfo | null | 'unavailable'>(null)
-  useEffect(() => {
-    let alive = true
-    fetch('/api/_relay/info', { credentials: 'same-origin' })
-      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
-      .then((j: RelayInfo) => { if (alive) setInfo(j) })
-      .catch(() => { if (alive) setInfo('unavailable') })
-    return () => { alive = false }
-  }, [])
+  // relay-info now arrives via the App-level events WS. Treat null as
+  // "loading"; once the WS lands its first frame, the JoinCommandCard
+  // can render. Local-only orchs (no relay agent token) fall into the
+  // unavailable branch automatically because relay.token stays null.
+  const info: RelayInfo | null | 'unavailable' = relay ?? null
 
   const isLocal = (vm: VMCfg) =>
     vm.host === 'localhost' || vm.host === '127.0.0.1' || vm.host === '::1'

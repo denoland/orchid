@@ -123,12 +123,24 @@ func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAd
 	// before orch came back up.
 	if stateWake != nil && statePush != nil {
 		go func() {
+			// Skip emits when the marshaled body matches the last one
+			// we sent — most ticks redo the same work (poll → no
+			// change → saveState → identical JSON). Hashing dodges
+			// both the WS write and the resulting DO wake on relay.
+			var lastHash uint64
 			emit := func() {
 				body := statePush()
+				h := fnv64(string(body))
+				if h == lastHash {
+					return
+				}
+				lastHash = h
 				_ = a.sendCtl(pingCtx, ctlFrame{T: "state-update", State: json.RawMessage(body)})
 			}
 			emit()
-			throttle := time.NewTicker(500 * time.Millisecond)
+			// 2s throttle keeps the dashboard near-real-time while
+			// folding sub-second bursts into a single frame.
+			throttle := time.NewTicker(2 * time.Second)
 			defer throttle.Stop()
 			pending := false
 			for {
