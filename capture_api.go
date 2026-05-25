@@ -100,12 +100,12 @@ func captureAssetsDirOrPlaceholder(cfg *Config) string {
 }
 
 // captureAssetsDir resolves the asset directory, creating it if needed.
-// Defaults to <dir of state_file>/captures when AssetsDir isn't configured,
+// Defaults to <dir of state_db>/captures when AssetsDir isn't configured,
 // so a fresh `capture`-block-only install Just Works.
 func captureAssetsDir(cfg *Config) (string, error) {
 	dir := cfg.Orch.Capture.AssetsDir
 	if dir == "" {
-		dir = filepath.Join(filepath.Dir(cfg.Orch.StateFile), "captures")
+		dir = filepath.Join(filepath.Dir(cfg.Orch.StateDB), "captures")
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err

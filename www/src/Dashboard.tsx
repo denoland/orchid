@@ -1329,7 +1329,7 @@ interface CaptureCfg {
 }
 interface OrchestratorCfg {
   poll_interval?: string
-  state_file?: string
+  state_db?: string
   branch_prefix?: string
   workdir_root?: string
   http_addr?: string
