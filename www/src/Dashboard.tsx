@@ -1527,7 +1527,7 @@ function SettingsPage({ jobs, state, onClose }: {
   const [vms, setVms] = useState<VMCfg[]>([])
   const [targets, setTargets] = useState<TargetCfg[]>([])
   const [original, setOriginal] = useState<{
-    cfg: OrchestratorCfg; gh: GhCfg; vms: VMCfg[]; targets: TargetCfg[]
+    cfg: OrchestratorCfg; gh: GhCfg; targets: TargetCfg[]
   } | null>(null)
   const [status, setStatus] = useState<string>('')
   const [section, setSection] = useState<SectionId>('orch')
@@ -1544,7 +1544,7 @@ function SettingsPage({ jobs, state, onClose }: {
         const v = (j.vms ?? []) as VMCfg[]
         const t = (j.targets ?? []) as TargetCfg[]
         setCfg({ ...o }); setGh({ ...g }); setVms([...v]); setTargets([...t])
-        setOriginal({ cfg: { ...o }, gh: { ...g }, vms: [...v], targets: [...t] })
+        setOriginal({ cfg: { ...o }, gh: { ...g }, targets: [...t] })
       })
       .catch((e) => setStatus('load failed: ' + String(e)))
     return () => { alive = false }
@@ -1560,9 +1560,8 @@ function SettingsPage({ jobs, state, onClose }: {
     if (!cfg || !gh || !original) return false
     return JSON.stringify(cfg) !== JSON.stringify(original.cfg) ||
       JSON.stringify(gh) !== JSON.stringify(original.gh) ||
-      JSON.stringify(vms) !== JSON.stringify(original.vms) ||
       JSON.stringify(targets) !== JSON.stringify(original.targets)
-  }, [cfg, gh, vms, targets, original])
+  }, [cfg, gh, targets, original])
 
   const save = async () => {
     if (!cfg || !gh || !original) return
@@ -1579,14 +1578,10 @@ function SettingsPage({ jobs, state, onClose }: {
     patch.github = gh
     if (capture) patch['orchestrator.capture'] = capture
 
-    // VMs / targets — keyed-block patches. Diff against original.
+    // Targets — keyed-block patches. Diff against original. VMs aren't
+    // patched from the dashboard: the VMs section is read-only and
+    // surfaces a join command instead of an editable form.
     const byNameOrig = (arr: { name: string }[]) => Object.fromEntries(arr.map((x) => [x.name, x]))
-    const vmOrig = byNameOrig(original.vms), vmCur = byNameOrig(vms)
-    for (const name of new Set([...Object.keys(vmOrig), ...Object.keys(vmCur)])) {
-      if (!vmCur[name]) { patch[`vm.${name}`] = { __delete: true }; continue }
-      const { name: _n, ...body } = vmCur[name] as any
-      patch[`vm.${name}`] = body
-    }
     const tgOrig = byNameOrig(original.targets), tgCur = byNameOrig(targets)
     for (const name of new Set([...Object.keys(tgOrig), ...Object.keys(tgCur)])) {
       if (!tgCur[name]) { patch[`target.${name}`] = { __delete: true }; continue }
@@ -1604,7 +1599,7 @@ function SettingsPage({ jobs, state, onClose }: {
       setStatus('error: ' + (await r.text()))
       return
     }
-    setOriginal({ cfg: { ...cfg }, gh: { ...gh }, vms: [...vms], targets: [...targets] })
+    setOriginal({ cfg: { ...cfg }, gh: { ...gh }, targets: [...targets] })
     setStatus('saved — restart orchid to apply')
     setTimeout(() => setStatus(''), 4000)
   }
@@ -1794,9 +1789,9 @@ function SettingsPage({ jobs, state, onClose }: {
             {section === 'vms' && (
               <Section
                 title="VMs"
-                subtitle="Where worker sessions run. Local = same box orchid runs on. Remote = SSH into another host."
+                subtitle="Worker sessions run on boxes that have joined this orch. Bring a new one online by running the join command on it — no SSH config to fill in here."
               >
-                <VMsList vms={vms} setVms={setVms} sessionsByVM={sessionsByVM} />
+                <VMJoinGuide vms={vms} sessionsByVM={sessionsByVM} />
               </Section>
             )}
 
@@ -1940,34 +1935,55 @@ function useGhProfiles(logins: string[]): Map<string, GhProfile | 'loading' | 'm
 }
 const profileCache = new Map<string, GhProfile | 'loading' | 'missing'>()
 
-function VMsList({ vms, setVms, sessionsByVM }: {
+interface RelayInfo {
+  connected: boolean
+  token: string | null
+  login: string | null
+}
+
+// VMJoinGuide replaces the old form-based VM CRUD. It surfaces the
+// install + join command operators run on a new box to bring it
+// online, plus a read-only roster of VMs the orch already knows about
+// (with their live session counts).
+//
+// The command needs the relay subdomain + agent token to embed in the
+// `orch join` URL — both come from /api/_relay/info, the same endpoint
+// the first-run InstallModal uses. Local-only orchs (no relay) get a
+// fallback that points at swarm.hcl, since there's no relay endpoint
+// for a fresh box to dial into.
+function VMJoinGuide({ vms, sessionsByVM }: {
   vms: VMCfg[]
-  setVms: React.Dispatch<React.SetStateAction<VMCfg[]>>
   sessionsByVM: Map<string, Job[]>
 }) {
-  const update = (i: number, patch: Partial<VMCfg>) =>
-    setVms((arr) => arr.map((x, j) => j === i ? { ...x, ...patch } : x))
-  // Treat empty host as Remote-in-progress so a freshly-added Remote
-  // card stays on the Remote tab until the user actually fills in the
-  // host (otherwise it'd flip to Local the moment they cleared the
-  // field).
+  const [info, setInfo] = useState<RelayInfo | null | 'unavailable'>(null)
+  useEffect(() => {
+    let alive = true
+    fetch('/api/_relay/info', { credentials: 'same-origin' })
+      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+      .then((j: RelayInfo) => { if (alive) setInfo(j) })
+      .catch(() => { if (alive) setInfo('unavailable') })
+    return () => { alive = false }
+  }, [])
+
   const isLocal = (vm: VMCfg) =>
     vm.host === 'localhost' || vm.host === '127.0.0.1' || vm.host === '::1'
 
   return (
-    <div>
-      <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800/70 overflow-hidden">
-        {vms.length === 0 && (
-          <div className="px-4 py-5 text-[13px] text-zinc-500 dark:text-zinc-400 text-center">
-            No VMs yet. Add Local for this box, Remote for an SSH host.
-          </div>
-        )}
-        {vms.map((vm, i) => {
-          const live = sessionsByVM.get(vm.name)?.length ?? 0
-          const local = isLocal(vm)
-          return (
-            <details key={vm.name + i} className="group">
-              <summary className="flex items-center gap-3 px-4 py-3 cursor-pointer list-none hover:bg-zinc-50/80 dark:hover:bg-zinc-900/40">
+    <div className="space-y-6">
+      <JoinCommandCard info={info} />
+      <div>
+        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-2 px-1">Connected</div>
+        <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800/70 overflow-hidden">
+          {vms.length === 0 && (
+            <div className="px-4 py-5 text-[13px] text-zinc-500 dark:text-zinc-400 text-center">
+              No VMs yet — run the command above on a box to bring it online.
+            </div>
+          )}
+          {vms.map((vm, i) => {
+            const live = sessionsByVM.get(vm.name)?.length ?? 0
+            const local = isLocal(vm)
+            return (
+              <div key={vm.name + i} className="flex items-center gap-3 px-4 py-3">
                 <span className="w-8 h-8 rounded-md flex items-center justify-center flex-shrink-0 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">
                   {local ? (
                     <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
@@ -1994,64 +2010,113 @@ function VMsList({ vms, setVms, sessionsByVM }: {
                 <span className="mono text-[11px] text-zinc-400 dark:text-zinc-500 flex-shrink-0">
                   {live} / {vm.capacity ?? '∞'}
                 </span>
-                <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="text-zinc-400 group-open:rotate-180 transition-transform">
-                  <polyline points="6 9 12 15 18 9" />
-                </svg>
-              </summary>
-              <div className="px-4 pb-4 pt-1 space-y-3 bg-zinc-50/60 dark:bg-zinc-900/40">
-                <div className="flex gap-2 mb-1">
-                  <button
-                    onClick={() => update(i, { host: 'localhost', user: 'orchid', key: undefined })}
-                    className={`mono text-[11px] px-2.5 py-1 rounded ring-1 transition-colors ${local ? 'bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 ring-transparent' : 'ring-zinc-200 dark:ring-zinc-700 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800'}`}
-                  >Local</button>
-                  <button
-                    onClick={() => update(i, { host: vm.host && !isLocal(vm) ? vm.host : '', user: vm.user || 'root' })}
-                    className={`mono text-[11px] px-2.5 py-1 rounded ring-1 transition-colors ${!local ? 'bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 ring-transparent' : 'ring-zinc-200 dark:ring-zinc-700 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800'}`}
-                  >Remote (SSH)</button>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <Input value={vm.name} onChange={(v) => update(i, { name: v })} placeholder="name (e.g. local)" />
-                  <Input value={String(vm.capacity ?? '')} onChange={(v) => update(i, { capacity: v ? Number(v) : undefined })} placeholder="capacity" />
-                  {!local && (
-                    <>
-                      <Input value={vm.host ?? ''} onChange={(v) => update(i, { host: v })} placeholder="host (1.2.3.4 or example.com)" />
-                      <Input value={vm.user ?? ''} onChange={(v) => update(i, { user: v })} placeholder="ssh user (e.g. root)" />
-                      <div className="col-span-2">
-                        <Input value={vm.key ?? ''} onChange={(v) => update(i, { key: v })} placeholder="path to ssh key (optional — uses agent / default key)" />
-                      </div>
-                    </>
-                  )}
-                  <select
-                    value={vm.agent ?? ''}
-                    onChange={(e) => update(i, { agent: e.target.value || undefined })}
-                    className="mono w-full text-[12.5px] bg-zinc-50 dark:bg-zinc-950 ring-1 ring-zinc-200 dark:ring-zinc-800 rounded-md px-3 py-2 outline-none text-zinc-900 dark:text-zinc-100"
-                  >
-                    <option value="">agent (default: claude)</option>
-                    <option value="claude">claude</option>
-                    <option value="codex">codex</option>
-                  </select>
-                  <Input value={vm.bot_login ?? ''} onChange={(v) => update(i, { bot_login: v })} placeholder="bot login override (optional)" />
-                </div>
-                <div className="flex justify-end">
-                  <button
-                    onClick={() => setVms((arr) => arr.filter((_, j) => j !== i))}
-                    className="mono text-[11px] px-2.5 py-1 rounded ring-1 ring-rose-200 dark:ring-rose-800 text-rose-600 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950"
-                  >remove VM</button>
-                </div>
               </div>
-            </details>
-          )
-        })}
+            )
+          })}
+        </div>
+        <div className="mt-2 px-1 text-[11.5px] text-zinc-400 dark:text-zinc-500">
+          Per-VM SSH settings, capacity, agent, and bot overrides live in <code className="mono">swarm.hcl</code>.
+        </div>
       </div>
-      <div className="mt-3 flex gap-2">
+    </div>
+  )
+}
+
+function JoinCommandCard({ info }: { info: RelayInfo | null | 'unavailable' }) {
+  // Two branches:
+  //   - Relay-managed orch: build the install + join commands from the
+  //     subdomain + agent token in /api/_relay/info. Same shape as the
+  //     first-run InstallModal so the muscle memory carries over.
+  //   - Local orch (no relay, or relay endpoint missing): there's no
+  //     network identity for a fresh VM to dial into, so we point
+  //     the operator at swarm.hcl instead.
+  if (info === null) {
+    return (
+      <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 p-6">
+        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">Add a VM</div>
+        <div className="text-[12.5px] text-zinc-500 dark:text-zinc-400">Loading…</div>
+      </div>
+    )
+  }
+  if (info === 'unavailable' || !info.login || !info.token) {
+    return (
+      <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 p-6 space-y-3">
+        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Add a VM</div>
+        <div className="text-[13px] text-zinc-700 dark:text-zinc-300 leading-relaxed">
+          This orch is running standalone — there's no relay endpoint for a
+          new VM to join through.
+        </div>
+        <div className="text-[12.5px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
+          Add a <code className="mono">vm "&lt;name&gt;" {`{ … }`}</code> block to{' '}
+          <code className="mono">swarm.hcl</code> and restart orchid. To switch to
+          a relay-managed orch, sign in at{' '}
+          <code className="mono">orchid.littledivy.com</code> and run{' '}
+          <code className="mono">orch join</code> with the issued token.
+        </div>
+      </div>
+    )
+  }
+
+  const sub = info.login.toLowerCase().replace(/[^a-z0-9-]/g, '')
+  const root = location.hostname.split('.').slice(-2).join('.')
+  const install = `curl -fsSL https://${root}/install.sh | sh`
+  const join = `orch join wss://${sub}.${root}/agent ${info.token}`
+  return (
+    <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 p-6 space-y-5">
+      <div className="flex items-center justify-between">
+        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Add a VM</div>
+        <div className="text-[11.5px] text-zinc-400 dark:text-zinc-500">SSH into the new box as root</div>
+      </div>
+      <JoinStep n={1} label="Install orch">
+        <JoinCmd value={install} />
+      </JoinStep>
+      <JoinStep n={2} label="Join this orch">
+        <JoinCmd value={join} secret />
+      </JoinStep>
+      <div className="text-[11.5px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
+        The join token grants this orch's worker pool — treat it like a password.
+        Rotate it from the <span className="italic">Danger zone</span> tab if it leaks.
+      </div>
+    </div>
+  )
+}
+
+function JoinStep({ n, label, children }: { n: number; label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-1.5">
+        <span className="mono text-[10.5px] text-zinc-400 dark:text-zinc-500">{n}.</span>
+        <span className="text-[12px] text-zinc-600 dark:text-zinc-300">{label}</span>
+      </div>
+      {children}
+    </div>
+  )
+}
+
+function JoinCmd({ value, secret }: { value: string; secret?: boolean }) {
+  const [copied, setCopied] = useState(false)
+  const [revealed, setRevealed] = useState(!secret)
+  // Mask the trailing token. The command structure stays visible so the
+  // operator can sanity-check the URL before pasting.
+  const display = revealed ? value : value.replace(/(\S+)$/, (m) => m.replace(/./g, '•'))
+  return (
+    <div className="relative group">
+      <pre className="bg-zinc-950 text-zinc-100 mono text-[12px] p-3 pr-24 rounded-lg overflow-x-auto whitespace-pre">{display}</pre>
+      <div className="absolute top-1/2 right-2 -translate-y-1/2 flex items-center gap-1">
+        {secret && (
+          <button
+            onClick={() => setRevealed((v) => !v)}
+            className="mono text-[10.5px] px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+          >{revealed ? 'hide' : 'show'}</button>
+        )}
         <button
-          onClick={() => setVms((arr) => [...arr, { name: arr.some((x) => x.name === 'local') ? `local-${arr.length}` : 'local', host: 'localhost', user: 'orchid', capacity: 4 }])}
-          className="mono text-[12px] px-3 py-1.5 rounded-md ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-        >+ Local</button>
-        <button
-          onClick={() => setVms((arr) => [...arr, { name: '', host: '', user: 'root', capacity: 4 }])}
-          className="mono text-[12px] px-3 py-1.5 rounded-md ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-        >+ Remote</button>
+          onClick={() => {
+            navigator.clipboard.writeText(value).catch(() => {})
+            setCopied(true)
+            setTimeout(() => setCopied(false), 1200)
+          }}
+          className="mono text-[10.5px] px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 opacity-80 group-hover:opacity-100 transition-opacity"
+        >{copied ? 'copied' : 'copy'}</button>
       </div>
     </div>
   )
