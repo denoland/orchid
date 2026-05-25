@@ -95,9 +95,14 @@ app.use('*', async (c, next) => {
   if (!sub) return next()
 
   // /logout from any subdomain → bounce to apex /logout where the
-  // cookie clear actually lives.
-  if (url.pathname === '/logout') {
-    return Response.redirect(`https://${c.env.ROOT_DOMAIN}/logout`, 302)
+  // cookie clear actually lives. Same for /login so the landing's
+  // "Get started" button works even when it's served on a subdomain.
+  if (url.pathname === '/logout' || url.pathname === '/login') {
+    const next = url.searchParams.get('next') ?? `https://${url.host}/`
+    const target = url.pathname === '/login'
+      ? `https://${c.env.ROOT_DOMAIN}/login?next=${encodeURIComponent(next)}`
+      : `https://${c.env.ROOT_DOMAIN}/logout`
+    return Response.redirect(target, 302)
   }
 
   // /agent WS — orch instances connect here. Auth happens inside the DO
