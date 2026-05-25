@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -9,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,14 +40,14 @@ import (
 // dashboard and persists them. Together they replace the /api/snap
 // HTTP path so card drags don't fan out into one DO+tunnel round-trip
 // per debounce.
-func runRelayAgent(parent context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler, stateWake <-chan struct{}, statePush func() []byte, snapRead func() []byte, snapWrite func([]byte) error) {
+func runRelayAgent(parent context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler, stateWake <-chan struct{}, statePush func() []byte, snapRead func() []byte, snapWrite func([]byte) error, paneVM func(string) *VMBlock) {
 	backoff := 500 * time.Millisecond
 	for {
 		if parent.Err() != nil {
 			return
 		}
 		sessionStart := time.Now()
-		err := relayAgentSession(parent, relayURL, token, httpSecret, localAddr, allowedLogins, handler, stateWake, statePush, snapRead, snapWrite)
+		err := relayAgentSession(parent, relayURL, token, httpSecret, localAddr, allowedLogins, handler, stateWake, statePush, snapRead, snapWrite, paneVM)
 		// A long-lived session means the connection was healthy — reset
 		// the backoff so a single hiccup later doesn't park us at 30s.
 		// Otherwise grow exponentially (capped) to avoid hammering CF
@@ -63,7 +68,7 @@ func runRelayAgent(parent context.Context, relayURL, token, httpSecret, localAdd
 	}
 }
 
-func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler, stateWake <-chan struct{}, statePush func() []byte, snapRead func() []byte, snapWrite func([]byte) error) error {
+func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler, stateWake <-chan struct{}, statePush func() []byte, snapRead func() []byte, snapWrite func([]byte) error, paneVM func(string) *VMBlock) error {
 	u, err := url.Parse(relayURL)
 	if err != nil {
 		return fmt.Errorf("parse relay url: %w", err)
@@ -102,6 +107,8 @@ func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAd
 		wsStreams:  map[uint32]*wsStream{},
 		snapWrite:  snapWrite,
 		subs:       make(chan int, 1),
+		panes:      map[string]*paneSub{},
+		paneVM:     paneVM,
 	}
 	// Assume subscribers until the relay tells us otherwise. The relay
 	// pushes a `subs` frame immediately on agent connect, but if it
@@ -219,6 +226,19 @@ type agent struct {
 	mu        sync.Mutex
 	streams   map[uint32]*agentStream
 	wsStreams map[uint32]*wsStream
+
+	// pane subscriptions, keyed by tmux session id. Multiple browser
+	// tabs viewing the same pane share one capture goroutine; the
+	// refcount lets us stop the underlying tmux loop when the last
+	// subscriber leaves.
+	panesMu sync.Mutex
+	panes   map[string]*paneSub
+	paneVM  func(string) *VMBlock
+}
+
+type paneSub struct {
+	refs   int
+	cancel context.CancelFunc
 }
 
 type wsStream struct {
@@ -241,6 +261,11 @@ type ctlFrame struct {
 	Code    int             `json:"code,omitempty"`
 	Reason  string          `json:"reason,omitempty"`
 	Count   int             `json:"count,omitempty"`
+	// pane channel: pane-sub / pane-unsub from browser, pane frames
+	// from orch carrying gzip+base64 tmux capture output.
+	PaneID string `json:"paneId,omitempty"`
+	Cols   int    `json:"cols,omitempty"`
+	Rows   int    `json:"rows,omitempty"`
 	// State carries an /api/state payload on a "state-update" frame.
 	// Raw so we don't pay for double-JSON-encoding a body that's
 	// already JSON.
@@ -334,6 +359,14 @@ func (a *agent) onCtl(ctx context.Context, f *ctlFrame) {
 		a.mu.Unlock()
 		if ws != nil {
 			_ = ws.conn.Write(ctx, websocket.MessageText, []byte(f.Data))
+		}
+	case "pane-sub":
+		if f.PaneID != "" {
+			a.startPane(ctx, f.PaneID, f.Cols, f.Rows)
+		}
+	case "pane-unsub":
+		if f.PaneID != "" {
+			a.stopPane(f.PaneID)
 		}
 	case "subs":
 		// Relay's running sub count. Pause emits when nobody is
@@ -526,4 +559,113 @@ func (w *relayResponseWriter) ensureHead() {
 func (w *relayResponseWriter) finish() {
 	w.ensureHead()
 	_ = w.agent.sendCtl(w.ctx, ctlFrame{T: "res-end", ID: w.id})
+}
+
+// startPane stands up (or refcounts onto) a tmux capture goroutine for
+// the given session and ships its output as `pane` frames over the
+// agent WS. Replaces the legacy /api/pane/stream SSE — those bills CF
+// Workers DO wall-time for the full lifetime of the stream, whereas
+// frames over the hibernated events WS only wake the DO momentarily.
+func (a *agent) startPane(ctx context.Context, id string, cols, rows int) {
+	a.panesMu.Lock()
+	if p, ok := a.panes[id]; ok {
+		p.refs++
+		a.panesMu.Unlock()
+		return
+	}
+	paneCtx, cancel := context.WithCancel(ctx)
+	a.panes[id] = &paneSub{refs: 1, cancel: cancel}
+	a.panesMu.Unlock()
+	go a.runPaneCapture(paneCtx, id, cols, rows)
+}
+
+func (a *agent) stopPane(id string) {
+	a.panesMu.Lock()
+	defer a.panesMu.Unlock()
+	p, ok := a.panes[id]
+	if !ok {
+		return
+	}
+	p.refs--
+	if p.refs <= 0 {
+		p.cancel()
+		delete(a.panes, id)
+	}
+}
+
+func (a *agent) runPaneCapture(ctx context.Context, id string, cols, rows int) {
+	// Same session-id sanitisation the HTTP handler did — refuse
+	// anything outside tmux-name territory before shelling out.
+	for _, c := range id {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return
+		}
+	}
+	if a.paneVM == nil {
+		return
+	}
+	vm := a.paneVM(id)
+	if vm == nil {
+		return
+	}
+	if cols < 40 {
+		cols = 80
+	}
+	if rows < 10 {
+		rows = 24
+	}
+	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux resize-window -t %s -x %d -y %d 2>/dev/null", id, cols, rows))
+
+	remote := fmt.Sprintf(
+		`while :; do tmux capture-pane -p -e -t %s -S -200 2>&1; printf '\x1e'; sleep 0.2; done`,
+		id,
+	)
+	var cmd *exec.Cmd
+	if isLocal(*vm) {
+		cmd = exec.CommandContext(ctx, "bash", "-c", remote)
+	} else {
+		cmd = exec.CommandContext(ctx, "ssh", append(sshArgs(*vm), remote)...)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+
+	rd := bufio.NewReader(stdout)
+	var buf strings.Builder
+	gzbuf := new(bytes.Buffer)
+	gzw := gzip.NewWriter(gzbuf)
+	var last string
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		b, err := rd.ReadByte()
+		if err != nil {
+			return
+		}
+		if b == 0x1e {
+			snap := buf.String()
+			buf.Reset()
+			if snap == last {
+				continue
+			}
+			last = snap
+			gzbuf.Reset()
+			gzw.Reset(gzbuf)
+			_, _ = gzw.Write([]byte(snap))
+			_ = gzw.Close()
+			data := "z:" + base64.StdEncoding.EncodeToString(gzbuf.Bytes())
+			if err := a.sendCtl(ctx, ctlFrame{T: "pane", PaneID: id, Data: data}); err != nil {
+				return
+			}
+		} else {
+			buf.WriteByte(b)
+		}
+	}
 }

@@ -3101,6 +3101,28 @@ type apiStateResp struct {
 	Operator string        `json:"operator"` // tmux session name if alive, "" if dead
 }
 
+// lookupPaneVM resolves a tmux session id to the VM it's running on.
+// Shared by the HTTP pane handlers and the relay-agent pane mux —
+// keeps both paths in sync on session→VM resolution rules.
+func lookupPaneVM(cfg *Config, st *State, session string) *VMBlock {
+	if v := st.httpSnap.Load(); v != nil {
+		for _, j := range v.(map[int]Job) {
+			if j.Tmux == session {
+				return vmByName(cfg, j.VM)
+			}
+		}
+	}
+	for i := range cfg.VMs {
+		if isLocal(cfg.VMs[i]) {
+			_, _, err := sshExec(cfg.VMs[i], fmt.Sprintf("tmux has-session -t %s 2>/dev/null", session))
+			if err == nil {
+				return &cfg.VMs[i]
+			}
+		}
+	}
+	return nil
+}
+
 // buildAPIStateJSON renders the /api/state payload from the current
 // snapshot. Shared by the HTTP handler and the relay agent's WS push so
 // both deliver byte-identical bodies — dashboard can swap from polling
@@ -3392,24 +3414,7 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 	// paneVM resolves a tmux session to its VM. Checks active jobs first,
 	// then falls back to scanning localhost VMs (for operator sessions not
 	// tracked in state).
-	paneVM := func(session string) *VMBlock {
-		if v := st.httpSnap.Load(); v != nil {
-			for _, j := range v.(map[int]Job) {
-				if j.Tmux == session {
-					return vmByName(cfg, j.VM)
-				}
-			}
-		}
-		for i := range cfg.VMs {
-			if isLocal(cfg.VMs[i]) {
-				_, _, err := sshExec(cfg.VMs[i], fmt.Sprintf("tmux has-session -t %s 2>/dev/null", session))
-				if err == nil {
-					return &cfg.VMs[i]
-				}
-			}
-		}
-		return nil
-	}
+	paneVM := func(session string) *VMBlock { return lookupPaneVM(cfg, st, session) }
 
 	// POST /api/pane?s=<session> — forward body bytes as tmux input.
 	// Snapshots stream over /api/pane/stream below.
@@ -4629,7 +4634,7 @@ func main() {
 			}
 			return os.Rename(tmp, snapPath)
 		}
-		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st), st.Bcast, func() []byte { return buildAPIStateJSON(&cfg, st) }, snapRead, snapWrite)
+		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st), st.Bcast, func() []byte { return buildAPIStateJSON(&cfg, st) }, snapRead, snapWrite, func(s string) *VMBlock { return lookupPaneVM(&cfg, st, s) })
 	}
 
 	for i := range cfg.VMs {
