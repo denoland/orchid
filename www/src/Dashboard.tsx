@@ -1939,6 +1939,7 @@ interface RelayInfo {
   connected: boolean
   token: string | null
   login: string | null
+  root: string | null  // ROOT_DOMAIN exposed by the relay so we don't have to guess from location.hostname
 }
 
 // VMJoinGuide replaces the old form-based VM CRUD. It surfaces the
@@ -2058,7 +2059,11 @@ function JoinCommandCard({ info }: { info: RelayInfo | null | 'unavailable' }) {
   }
 
   const sub = info.login.toLowerCase().replace(/[^a-z0-9-]/g, '')
-  const root = location.hostname.split('.').slice(-2).join('.')
+  // ROOT_DOMAIN comes from the relay so multi-label roots like
+  // orchid.littledivy.com don't get truncated to littledivy.com by a
+  // naive slice(-2). Falls back to hostname for older relays missing
+  // the field.
+  const root = info.root ?? location.hostname.split('.').slice(-2).join('.')
   const install = `curl -fsSL https://${root}/install.sh | sh`
   const join = `orch join wss://${sub}.${root}/agent ${info.token}`
   return (
