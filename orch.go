@@ -4134,18 +4134,23 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				http.Error(w, "patch: "+perr.Error(), http.StatusBadRequest)
 				return
 			}
+			// Re-parse the patched bytes before touching disk. hclsimple
+			// picks its parser by file extension, so writing to `.tmp`
+			// first (the old code) blew up with "unrecognized file
+			// format suffix .tmp" even on perfectly valid output.
+			// Decode in-memory, keyed off the real filename so error
+			// messages point at swarm.hcl.
+			var trial Config
+			if err := hclsimple.Decode(filepath.Base(path), out, nil, &trial); err != nil {
+				http.Error(w, "invalid hcl after patch: "+err.Error(), http.StatusBadRequest)
+				return
+			}
 			tmp := path + ".tmp"
 			// 0o600 — swarm.hcl carries http_secret, capture.auth_token,
 			// and any per-VM credentials the operator wired in. World-
 			// readable is a needless leak to anyone with shell on the box.
 			if err := os.WriteFile(tmp, out, 0o600); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			var trial Config
-			if err := hclsimple.DecodeFile(tmp, nil, &trial); err != nil {
-				_ = os.Remove(tmp)
-				http.Error(w, "invalid hcl after patch: "+err.Error(), http.StatusBadRequest)
 				return
 			}
 			if err := os.Rename(tmp, path); err != nil {
