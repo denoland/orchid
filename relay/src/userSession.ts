@@ -56,6 +56,11 @@ export class UserSession {
   allowedLogins: string[] = []
   nextStreamId = 1
   streams = new Map<number, PendingStream>()
+  // In-memory snapshot of the user's GitHub repo list. Cached for the DO
+  // isolate's lifetime up to TTL — the Settings page is opened rarely,
+  // but when it is it pulls 3 pages × 100 repos from api.github.com every
+  // open. A 5-minute TTL keeps the dropdown fresh without re-fanning out.
+  reposCache: { body: string; expires: number } | null = null
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
@@ -97,15 +102,31 @@ export class UserSession {
     const body = (await req.json()) as { token?: string }
     if (!body.token) return new Response('missing token', { status: 400 })
     this.ghToken = body.token
+    // Different token may see a different repo set (private repos in
+    // particular). Drop the cache so the next /repos call re-fetches.
+    this.reposCache = null
     await this.state.storage.put('ghToken', body.token)
     return Response.json({ ok: true })
   }
 
-  // Owner-only repo browser. Hits the live GH API on each call —
-  // results are cached at the worker edge via response Cache-Control.
+  // Owner-only repo browser. Cached in-memory for the DO isolate's
+  // lifetime (TTL below) so the Settings dropdown doesn't fan out to
+  // api.github.com on every open. The response also carries a private
+  // Cache-Control so the browser doesn't refetch on tab switches.
   // `q` filters client-side; full list is paginated up to ~300 repos.
-  private async handleGhRepos(req: Request): Promise<Response> {
+  private async handleGhRepos(_req: Request): Promise<Response> {
     if (!this.ghToken) return new Response('no gh token', { status: 412 })
+    const now = Date.now()
+    const ttl = 300_000 // 5 minutes
+    if (this.reposCache && this.reposCache.expires > now) {
+      return new Response(this.reposCache.body, {
+        headers: {
+          'content-type': 'application/json',
+          'cache-control': 'private, max-age=60',
+          'x-orchid-cache': 'hit',
+        },
+      })
+    }
     type Repo = {
       full_name: string
       private: boolean
@@ -123,6 +144,7 @@ export class UserSession {
         },
       })
       if (!r.ok) {
+        // Don't poison the cache with partial / error pages.
         return Response.json({ error: 'gh ' + r.status, repos: out }, { status: 200 })
       }
       const page_data = (await r.json()) as Repo[]
@@ -137,7 +159,15 @@ export class UserSession {
       }
       if (page_data.length < 100) break
     }
-    return Response.json({ repos: out })
+    const body = JSON.stringify({ repos: out })
+    this.reposCache = { body, expires: now + ttl }
+    return new Response(body, {
+      headers: {
+        'content-type': 'application/json',
+        'cache-control': 'private, max-age=60',
+        'x-orchid-cache': 'miss',
+      },
+    })
   }
 
   // Owner-only: wipe the current agent token and force a fresh mint on

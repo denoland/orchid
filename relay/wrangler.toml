@@ -19,10 +19,23 @@ routes = [
 [assets]
 directory = "./public"
 binding = "ASSETS"
-# Run Worker code on every request so apex / and subdomain routing get
-# evaluated before CF serves a matching static asset. Without this,
-# /index.html beats app.get('/') and the apex serves the dashboard SPA.
-run_worker_first = true
+# Only the routes that require app logic invoke the Worker first; every
+# other path is served straight from CF's asset edge (no Worker request,
+# no CPU). The apex "/" must stay on this list — without it the dashboard
+# SPA's index.html shadows app.get('/') and the marketing landing breaks.
+# Subdomain auth still works because dashboard data lives behind /api/*,
+# which is in the list — public /_a/* bundles are safe to serve direct.
+run_worker_first = [
+  "/",
+  "/login",
+  "/oauth/*",
+  "/dashboard",
+  "/logout",
+  "/healthz",
+  "/agent",
+  "/api/*",
+  "/captures/*",
+]
 
 [[durable_objects.bindings]]
 name = "USER"
