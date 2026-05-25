@@ -2,10 +2,13 @@ package main
 
 import (
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/hcl/v2/hclsimple"
 )
 
 func TestParseCronFrontmatter(t *testing.T) {
@@ -416,6 +419,184 @@ func TestValidRepoRejectsArgvInjection(t *testing.T) {
 		if validRepo.MatchString(r) {
 			t.Errorf("validRepo accepted bad value %q", r)
 		}
+	}
+}
+
+func TestSlugifyHostname(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"worker01.dc.example.com", "worker01"},
+		{"127.0.0.1", "vm-127"},
+		{"hyphen-host", "hyphen-host"},
+		{"UPPER", "upper"},
+		{"with:port:1234", "with"},
+		{"  ", ""},
+		{"!!!", ""},
+		{"1234", "vm-1234"},
+	}
+	for _, tc := range cases {
+		got := slugifyHostname(tc.in)
+		if got != tc.want {
+			t.Errorf("slugifyHostname(%q): got %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestAllocVMName(t *testing.T) {
+	cfg := &Config{VMs: []VMBlock{{Name: "local"}, {Name: "worker01"}, {Name: "vm-1"}}}
+	if got := allocVMName(cfg, "worker01.dc.example.com"); got != "vm-2" {
+		t.Errorf("allocVMName when hostname collides: got %q, want vm-2 (vm-1 already taken)", got)
+	}
+	if got := allocVMName(cfg, "worker02"); got != "worker02" {
+		t.Errorf("allocVMName fresh hostname: got %q, want worker02", got)
+	}
+	if got := allocVMName(cfg, ""); got != "vm-2" {
+		t.Errorf("allocVMName no hostname falls back to vm-N: got %q, want vm-2", got)
+	}
+}
+
+func TestValidVMName(t *testing.T) {
+	good := []string{"local", "vm-1", "worker_01", "a", "A1"}
+	bad := []string{"", "-leading", "_leading", "has space", "x.y", "../etc/passwd", strings.Repeat("a", 64)}
+	for _, n := range good {
+		if !validVMName(n) {
+			t.Errorf("validVMName(%q) = false, want true", n)
+		}
+	}
+	for _, n := range bad {
+		if validVMName(n) {
+			t.Errorf("validVMName(%q) = true, want false", n)
+		}
+	}
+}
+
+func TestAppendAuthorizedKeyIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/authorized_keys"
+	// Pre-existing other entries must survive.
+	if err := os.WriteFile(path, []byte("ssh-rsa AAA existing-user\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const marker = "# orchid-central:worker01"
+	key1 := "ssh-ed25519 AAAFIRST orchid"
+	key2 := "ssh-ed25519 AAASECOND orchid"
+	for i := 0; i < 3; i++ {
+		if err := appendAuthorizedKey(path, marker, key1); err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+	}
+	b, _ := os.ReadFile(path)
+	if got := strings.Count(string(b), marker); got != 1 {
+		t.Errorf("after 3 writes of same key, marker appears %d times, want 1\n%s", got, b)
+	}
+	if got := strings.Count(string(b), key1); got != 1 {
+		t.Errorf("key1 appears %d times, want 1", got)
+	}
+	if !strings.Contains(string(b), "ssh-rsa AAA existing-user") {
+		t.Errorf("pre-existing entry was lost:\n%s", b)
+	}
+	// Rotation: same marker, different key replaces the old line.
+	if err := appendAuthorizedKey(path, marker, key2); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(path)
+	if strings.Contains(string(b), "AAAFIRST") {
+		t.Errorf("rotation kept stale key:\n%s", b)
+	}
+	if !strings.Contains(string(b), key2) {
+		t.Errorf("rotation missing new key:\n%s", b)
+	}
+}
+
+func TestStripMarkerBlock(t *testing.T) {
+	src := []byte("a line\n# m\nsecond line\nthird line\n")
+	got := string(stripMarkerBlock(src, "# m"))
+	want := "a line\nthird line\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// Marker present but no line follows.
+	src2 := []byte("a\n# m")
+	got2 := string(stripMarkerBlock(src2, "# m"))
+	if got2 != "a" {
+		t.Errorf("trailing-marker case: got %q, want %q", got2, "a")
+	}
+	// Empty input.
+	if got := string(stripMarkerBlock(nil, "# m")); got != "" {
+		t.Errorf("nil input: got %q, want empty", got)
+	}
+}
+
+func TestPatchHCLAddsVMBlock(t *testing.T) {
+	src := []byte(`github {
+  inbox_repo = "denoland/orchid"
+}
+
+orchestrator {
+  poll_interval = "30s"
+  state_file    = "/root/orch/state.json"
+  branch_prefix = "orch/"
+  workdir_root  = "/home/orchid/orch-work"
+}
+
+# Local VM (untouched)
+vm "local" {
+  host = "localhost"
+  user = "orchid"
+}
+
+bootstrap_prompt = ""
+`)
+	patch := map[string]map[string]any{
+		"vm.worker01": {
+			"host":         "10.0.0.5",
+			"user":         "orchid",
+			"key":          "/root/orch/vm-keys/worker01",
+			"capacity":     float64(4),
+			"join_managed": true,
+		},
+	}
+	out, err := patchHCL(src, patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, `vm "worker01"`) {
+		t.Errorf("missing new vm block:\n%s", s)
+	}
+	// hclwrite aligns the `=` columns, so match on the value only.
+	if !strings.Contains(s, `"10.0.0.5"`) {
+		t.Errorf("missing host value:\n%s", s)
+	}
+	if !strings.Contains(s, `join_managed`) || !strings.Contains(s, `true`) {
+		t.Errorf("missing join_managed attr:\n%s", s)
+	}
+	// Untouched local block + comment survive.
+	if !strings.Contains(s, `vm "local"`) {
+		t.Errorf("local vm was removed:\n%s", s)
+	}
+	if !strings.Contains(s, `# Local VM (untouched)`) {
+		t.Errorf("comment was stripped:\n%s", s)
+	}
+	// HCL still parses.
+	tmp := t.TempDir() + "/swarm.hcl"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var trial Config
+	if err := hclsimple.DecodeFile(tmp, nil, &trial); err != nil {
+		t.Fatalf("patched hcl fails to decode: %v\n%s", err, s)
+	}
+	var found bool
+	for _, v := range trial.VMs {
+		if v.Name == "worker01" {
+			found = true
+			if v.Host != "10.0.0.5" || v.Key != "/root/orch/vm-keys/worker01" || !v.JoinManaged {
+				t.Errorf("decoded block wrong: %+v", v)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("decoded config missing worker01")
 	}
 }
 
