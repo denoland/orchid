@@ -678,7 +678,7 @@ func TestDiffPRMergeable(t *testing.T) {
 	t.Run("MERGEABLE → CONFLICTING surfaced", func(t *testing.T) {
 		j := &Job{LastMergeable: "MERGEABLE"}
 		v := &PRView{Mergeable: "CONFLICTING"}
-		_, _, _, _, _, m := diffPR(j, v)
+		_, _, _, _, _, _, _, _, m := diffPR(j, v, "")
 		if m != "CONFLICTING" {
 			t.Errorf("got mergeable=%q, want CONFLICTING", m)
 		}
@@ -686,7 +686,7 @@ func TestDiffPRMergeable(t *testing.T) {
 	t.Run("UNKNOWN never bubbles up", func(t *testing.T) {
 		j := &Job{LastMergeable: "MERGEABLE"}
 		v := &PRView{Mergeable: "UNKNOWN"}
-		_, _, _, _, _, m := diffPR(j, v)
+		_, _, _, _, _, _, _, _, m := diffPR(j, v, "")
 		if m != "" {
 			t.Errorf("got mergeable=%q, want \"\" (UNKNOWN is transient)", m)
 		}
@@ -694,7 +694,7 @@ func TestDiffPRMergeable(t *testing.T) {
 	t.Run("stable MERGEABLE is silent", func(t *testing.T) {
 		j := &Job{LastMergeable: "MERGEABLE"}
 		v := &PRView{Mergeable: "MERGEABLE"}
-		_, _, _, _, _, m := diffPR(j, v)
+		_, _, _, _, _, _, _, _, m := diffPR(j, v, "")
 		if m != "" {
 			t.Errorf("got mergeable=%q, want \"\" (no transition)", m)
 		}
@@ -741,7 +741,7 @@ func TestDiffPRChecksFilterSuccess(t *testing.T) {
 			{Name: "lint", Status: "COMPLETED", Conclusion: "NEUTRAL", CompletedAt: "2026-05-25T00:00:00Z"},
 			{Name: "docs only", Status: "COMPLETED", Conclusion: "SKIPPED", CompletedAt: "2026-05-25T00:00:00Z"},
 		}}
-		_, _, _, _, checks, _ := diffPR(j, v)
+		_, _, _, _, _, _, _, checks, _ := diffPR(j, v, "")
 		if len(checks) != 0 {
 			t.Errorf("all-green tick produced check changes, want none: %v", checks)
 		}
@@ -753,7 +753,7 @@ func TestDiffPRChecksFilterSuccess(t *testing.T) {
 			{Name: "test linux", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-05-25T00:00:00Z"},
 			{Name: "test mac", Status: "COMPLETED", Conclusion: "FAILURE", CompletedAt: "2026-05-25T00:00:00Z"},
 		}}
-		_, _, _, _, checks, _ := diffPR(j, v)
+		_, _, _, _, _, _, _, checks, _ := diffPR(j, v, "")
 		if len(checks) != 1 {
 			t.Fatalf("expected only the FAILURE to surface, got %d: %v", len(checks), checks)
 		}
@@ -772,7 +772,7 @@ func TestDiffPRChecksFilterSuccess(t *testing.T) {
 		v := &PRView{StatusCheckRollup: []StatusCheck{
 			{Name: "test linux", Status: "COMPLETED", Conclusion: "FAILURE", CompletedAt: "2026-05-25T00:01:00Z"},
 		}}
-		_, _, _, _, checks, _ := diffPR(j, v)
+		_, _, _, _, _, _, _, checks, _ := diffPR(j, v, "")
 		if len(checks) != 1 || !strings.Contains(checks[0], "FAILURE") {
 			t.Errorf("SUCCESS→FAILURE regression not surfaced: %v", checks)
 		}
@@ -783,9 +783,143 @@ func TestDiffPRChecksFilterSuccess(t *testing.T) {
 		v := &PRView{StatusCheckRollup: []StatusCheck{
 			{Name: "test linux", Status: "IN_PROGRESS", Conclusion: "", CompletedAt: ""},
 		}}
-		_, _, _, _, checks, _ := diffPR(j, v)
+		_, _, _, _, _, _, _, checks, _ := diffPR(j, v, "")
 		if len(checks) != 0 {
 			t.Errorf("in-progress check leaked into diff: %v", checks)
+		}
+	})
+}
+
+// TestDiffPRBotSelfFilter verifies the bot's own activity is partitioned
+// into the silent buckets (still tracked for "seen" advancement, but
+// never surfaced to the worker) while third-party activity flows through
+// the visible buckets unchanged. Regression: orchid used to wake the
+// worker about its own comments and commits.
+func TestDiffPRBotSelfFilter(t *testing.T) {
+	bot := "divybot"
+	mkView := func() *PRView {
+		v := &PRView{}
+		v.Reviews = append(v.Reviews, struct {
+			ID     string                 `json:"id"`
+			Author struct{ Login string } `json:"author"`
+			State  string                 `json:"state"`
+			Body   string                 `json:"body"`
+		}{ID: "rev-bot", Author: struct{ Login string }{Login: bot}, State: "COMMENTED", Body: "self"})
+		v.Reviews = append(v.Reviews, struct {
+			ID     string                 `json:"id"`
+			Author struct{ Login string } `json:"author"`
+			State  string                 `json:"state"`
+			Body   string                 `json:"body"`
+		}{ID: "rev-human", Author: struct{ Login string }{Login: "alice"}, State: "APPROVED", Body: "lgtm"})
+		v.Comments = append(v.Comments, struct {
+			ID     string                 `json:"id"`
+			Author struct{ Login string } `json:"author"`
+			Body   string                 `json:"body"`
+		}{ID: "c-bot", Author: struct{ Login string }{Login: bot}, Body: "pushed follow-up"})
+		v.Comments = append(v.Comments, struct {
+			ID     string                 `json:"id"`
+			Author struct{ Login string } `json:"author"`
+			Body   string                 `json:"body"`
+		}{ID: "c-human", Author: struct{ Login string }{Login: "bob"}, Body: "nit"})
+		return v
+	}
+
+	t.Run("bot reviews/comments go silent, human ones visible", func(t *testing.T) {
+		j := &Job{}
+		v := mkView()
+		vr, _, vi, sr, _, si, _, _, _ := diffPR(j, v, bot)
+		if len(vr) != 1 || vr[0] != "rev-human" {
+			t.Errorf("visibleReviews = %v, want [rev-human]", vr)
+		}
+		if len(sr) != 1 || sr[0] != "rev-bot" {
+			t.Errorf("silentReviews = %v, want [rev-bot]", sr)
+		}
+		if len(vi) != 1 || vi[0] != "c-human" {
+			t.Errorf("visibleIssue = %v, want [c-human]", vi)
+		}
+		if len(si) != 1 || si[0] != "c-bot" {
+			t.Errorf("silentIssue = %v, want [c-bot]", si)
+		}
+	})
+
+	t.Run("bot-authored HEAD commit suppresses pushed", func(t *testing.T) {
+		j := &Job{LastHeadOID: "old-sha"}
+		v := &PRView{HeadRefOid: "new-sha"}
+		v.Commits = append(v.Commits, struct {
+			Oid     string `json:"oid"`
+			Authors []struct {
+				Login string `json:"login"`
+			} `json:"authors"`
+		}{Oid: "new-sha", Authors: []struct {
+			Login string `json:"login"`
+		}{{Login: bot}}})
+		_, _, _, _, _, _, pushed, _, _ := diffPR(j, v, bot)
+		if pushed {
+			t.Errorf("pushed = true for bot-authored HEAD, want false")
+		}
+	})
+
+	t.Run("human HEAD commit still surfaces pushed", func(t *testing.T) {
+		j := &Job{LastHeadOID: "old-sha"}
+		v := &PRView{HeadRefOid: "new-sha"}
+		v.Commits = append(v.Commits, struct {
+			Oid     string `json:"oid"`
+			Authors []struct {
+				Login string `json:"login"`
+			} `json:"authors"`
+		}{Oid: "new-sha", Authors: []struct {
+			Login string `json:"login"`
+		}{{Login: "alice"}}})
+		_, _, _, _, _, _, pushed, _, _ := diffPR(j, v, bot)
+		if !pushed {
+			t.Errorf("pushed = false for human-authored HEAD, want true")
+		}
+	})
+
+	t.Run("co-authored bot+human HEAD still surfaces pushed", func(t *testing.T) {
+		j := &Job{LastHeadOID: "old-sha"}
+		v := &PRView{HeadRefOid: "new-sha"}
+		v.Commits = append(v.Commits, struct {
+			Oid     string `json:"oid"`
+			Authors []struct {
+				Login string `json:"login"`
+			} `json:"authors"`
+		}{Oid: "new-sha", Authors: []struct {
+			Login string `json:"login"`
+		}{{Login: bot}, {Login: "alice"}}})
+		_, _, _, _, _, _, pushed, _, _ := diffPR(j, v, bot)
+		if !pushed {
+			t.Errorf("pushed = false for co-authored HEAD with a human, want true")
+		}
+	})
+
+	t.Run("missing HEAD in commits list falls back to notify", func(t *testing.T) {
+		j := &Job{LastHeadOID: "old-sha"}
+		v := &PRView{HeadRefOid: "new-sha"} // no commits payload at all
+		_, _, _, _, _, _, pushed, _, _ := diffPR(j, v, bot)
+		if !pushed {
+			t.Errorf("pushed = false when HEAD missing from commits, want true (conservative)")
+		}
+	})
+
+	t.Run("empty botLogin disables filtering", func(t *testing.T) {
+		j := &Job{}
+		v := mkView()
+		vr, _, vi, sr, _, si, _, _, _ := diffPR(j, v, "")
+		if len(sr) != 0 || len(si) != 0 {
+			t.Errorf("silent buckets should be empty when botLogin unset: sr=%v si=%v", sr, si)
+		}
+		if len(vr) != 2 || len(vi) != 2 {
+			t.Errorf("all items should be visible when botLogin unset: vr=%v vi=%v", vr, vi)
+		}
+	})
+
+	t.Run("seen IDs are not re-classified", func(t *testing.T) {
+		j := &Job{SeenIssueCommentIDs: []string{"c-bot", "c-human"}}
+		v := mkView()
+		_, _, vi, _, _, si, _, _, _ := diffPR(j, v, bot)
+		if len(vi) != 0 || len(si) != 0 {
+			t.Errorf("seen comments should not appear in either bucket: vi=%v si=%v", vi, si)
 		}
 	})
 }

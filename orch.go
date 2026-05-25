@@ -841,12 +841,21 @@ type PRView struct {
 	// seconds after the PR is viewed it usually settles. Used to surface
 	// base-branch conflicts to the worker without manual nudging.
 	Mergeable string `json:"mergeable"`
+	// Commits is the chronological commit list on the PR head branch. We
+	// use it to attribute new pushes — when the bot itself pushed, we
+	// suppress the wake-up since the worker is already aware.
+	Commits []struct {
+		Oid     string `json:"oid"`
+		Authors []struct {
+			Login string `json:"login"`
+		} `json:"authors"`
+	} `json:"commits"`
 }
 
 func ghPRView(repo string, n int) (*PRView, error) {
 	out, errStr, err := run("gh", "pr", "view", fmt.Sprint(n),
 		"--repo", repo,
-		"--json", "state,headRefOid,reviews,comments,statusCheckRollup,mergeable")
+		"--json", "state,headRefOid,reviews,comments,statusCheckRollup,mergeable,commits")
 	if err != nil {
 		return nil, fmt.Errorf("gh pr view: %v: %s", err, errStr)
 	}
@@ -1838,7 +1847,55 @@ func isActionableCheck(conclusion string) bool {
 	return true
 }
 
-func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments []string, pushed bool, checkChanges []string, mergeable string) {
+// headPushedByBot reports whether the PR's current HEAD commit was
+// authored solely by the configured bot. Used to suppress "new commits
+// pushed" wake-ups when the worker is responding to its own activity.
+//
+// We deliberately check only the HEAD commit, not every commit since
+// LastHeadOID — if a third party (human or another bot) had pushed in
+// between, our worker would have had to fetch+rebase before pushing on
+// top, so it's already aware of that intermediate work. If the bot
+// authors HEAD it has, by transitive reasoning, seen everything below
+// it. Empty botLogin returns false (defensive: any misconfiguration
+// still surfaces pushes).
+func headPushedByBot(v *PRView, botLogin string) bool {
+	if botLogin == "" || v.HeadRefOid == "" {
+		return false
+	}
+	for _, c := range v.Commits {
+		if c.Oid != v.HeadRefOid {
+			continue
+		}
+		if len(c.Authors) == 0 {
+			return false
+		}
+		for _, a := range c.Authors {
+			if a.Login != botLogin {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// diffPR partitions unseen PR activity into two buckets:
+//
+//   - visible*: items the worker should be woken about (third-party
+//     reviews/comments and pushes by anyone other than the bot).
+//   - silent*: items authored by the bot itself. Must still be tracked
+//     so we don't keep re-scanning them on every tick, but pasting them
+//     back into the bot's own pane is noise — the worker already knows
+//     it wrote that comment or pushed that commit.
+//
+// pushed is true only if HEAD changed *and* the latest commit was not
+// authored solely by the bot. If botLogin is empty, no filtering is
+// applied (defensive — a misconfigured swarm still gets notifications).
+func diffPR(j *Job, v *PRView, botLogin string) (
+	visibleReviews, visibleThread, visibleIssue []string,
+	silentReviews, silentThread, silentIssue []string,
+	pushed bool, checkChanges []string, mergeable string,
+) {
 	seen := func(ids []string) map[string]bool {
 		m := map[string]bool{}
 		for _, id := range ids {
@@ -1846,28 +1903,46 @@ func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments 
 		}
 		return m
 	}
+	isBot := func(login string) bool {
+		return botLogin != "" && login == botLogin
+	}
 	rs := seen(j.SeenReviewIDs)
 	for _, r := range v.Reviews {
-		if !rs[r.ID] {
-			newReviews = append(newReviews, r.ID)
+		if rs[r.ID] {
+			continue
+		}
+		if isBot(r.Author.Login) {
+			silentReviews = append(silentReviews, r.ID)
+		} else {
+			visibleReviews = append(visibleReviews, r.ID)
 		}
 	}
 	tc := seen(j.SeenThreadCommentIDs)
 	for _, t := range v.ReviewThreads {
 		for _, c := range t.Comments {
-			if !tc[c.ID] {
-				newThreadComments = append(newThreadComments, c.ID)
+			if tc[c.ID] {
+				continue
+			}
+			if isBot(c.Author.Login) {
+				silentThread = append(silentThread, c.ID)
+			} else {
+				visibleThread = append(visibleThread, c.ID)
 			}
 		}
 	}
 	ic := seen(j.SeenIssueCommentIDs)
 	for _, c := range v.Comments {
-		if !ic[c.ID] {
-			newIssueComments = append(newIssueComments, c.ID)
+		if ic[c.ID] {
+			continue
+		}
+		if isBot(c.Author.Login) {
+			silentIssue = append(silentIssue, c.ID)
+		} else {
+			visibleIssue = append(visibleIssue, c.ID)
 		}
 	}
 	if j.LastHeadOID != "" && j.LastHeadOID != v.HeadRefOid {
-		pushed = true
+		pushed = !headPushedByBot(v, botLogin)
 	}
 	// Build latest-per-name map: GitHub returns all historical runs; we only
 	// care about the most recent completed run for each check name. Then
@@ -2903,14 +2978,25 @@ func tick(cfg *Config, st *State) {
 			_ = saveState(cfg.Orch.StateFile, st)
 			continue
 		}
-		nr, ntc, nic, pushed, checks, mergeable := diffPR(j, v)
-		if len(nr) == 0 && len(ntc) == 0 && len(nic) == 0 && !pushed && len(checks) == 0 && mergeable == "" {
+		botLogin, _ := vmBotIdentity(cfg.Orch, *vm)
+		vr, vt, vi, sr, st_, si, pushed, checks, mergeable := diffPR(j, v, botLogin)
+		// silent items (bot's own comments/reviews) must be marked seen
+		// even when nothing else changed, or we'll re-evaluate them on
+		// every tick forever.
+		hasSilent := len(sr) > 0 || len(st_) > 0 || len(si) > 0
+		if len(vr) == 0 && len(vt) == 0 && len(vi) == 0 && !pushed && len(checks) == 0 && mergeable == "" {
 			j.LastHeadOID = v.HeadRefOid
 			// Record the mergeable baseline (silently) on no-diff ticks so
 			// the first MERGEABLE observation after PR open doesn't show up
 			// as a transition later. UNKNOWN is left out — it's transient.
 			if v.Mergeable != "" && v.Mergeable != "UNKNOWN" {
 				j.LastMergeable = v.Mergeable
+			}
+			if hasSilent {
+				j.SeenReviewIDs = append(j.SeenReviewIDs, sr...)
+				j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, st_...)
+				j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, si...)
+				_ = saveState(cfg.Orch.StateFile, st)
 			}
 			continue
 		}
@@ -2954,14 +3040,17 @@ func tick(cfg *Config, st *State) {
 				continue
 			}
 		}
-		msg := summarize(v, nr, ntc, nic, pushed, checks, mergeable)
+		msg := summarize(v, vr, vt, vi, pushed, checks, mergeable)
 		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
 			log.Printf("issue #%d: poke failed: %v", n, err)
 			continue
 		}
-		j.SeenReviewIDs = append(j.SeenReviewIDs, nr...)
-		j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, ntc...)
-		j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, nic...)
+		j.SeenReviewIDs = append(j.SeenReviewIDs, vr...)
+		j.SeenReviewIDs = append(j.SeenReviewIDs, sr...)
+		j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, vt...)
+		j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, st_...)
+		j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, vi...)
+		j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, si...)
 		j.LastHeadOID = v.HeadRefOid
 		if v.Mergeable != "" && v.Mergeable != "UNKNOWN" {
 			j.LastMergeable = v.Mergeable
