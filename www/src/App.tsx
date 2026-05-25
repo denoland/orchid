@@ -8,7 +8,13 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false
+    let id: ReturnType<typeof setInterval> | undefined
     async function poll() {
+      // Skip the round-trip when the tab is hidden — backgrounded tabs
+      // were our biggest unnecessary DO bill. The visibilitychange
+      // listener below kicks an immediate poll on return so the user
+      // never sees stale state.
+      if (document.hidden) return
       try {
         const res = await fetch('/api/state')
         // Session cookie missing / expired — kick to OAuth so the
@@ -27,8 +33,16 @@ export default function App() {
       } catch { /* swallow */ }
     }
     poll()
-    const id = setInterval(poll, 1000)
-    return () => { cancelled = true; clearInterval(id) }
+    // 3s instead of 1s — orchid dispatch is multi-second anyway,
+    // so sub-second polling just burned DO requests.
+    id = setInterval(poll, 3000)
+    const onVis = () => { if (!document.hidden) poll() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      cancelled = true
+      if (id) clearInterval(id)
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [])
 
   return (

@@ -3,6 +3,21 @@ import { useState } from 'react'
 const ROUTES = ['clawpatrol', 'orchid', 'deno'] as const
 type Route = typeof ROUTES[number]
 
+// Orch's /api/drafts demands X-Capture-Token (the same secret macOS/iOS
+// apps use). The dashboard is already auth'd via session cookie, but the
+// capture endpoint deliberately ignores cookies — it's the one path that
+// has to work for native clients without a relay session. So fetch the
+// token from /api/config once and reuse it for every Capture click.
+let captureTokenPromise: Promise<string | null> | null = null
+function getCaptureToken(): Promise<string | null> {
+  if (captureTokenPromise) return captureTokenPromise
+  captureTokenPromise = fetch('/api/config', { credentials: 'include', cache: 'no-store' })
+    .then((r) => r.ok ? r.json() : null)
+    .then((j: any) => j?.orchestrator?.capture?.auth_token ?? null)
+    .catch(() => null)
+  return captureTokenPromise
+}
+
 type Outcome =
   | { kind: 'sent'; url: string | null }
   | { kind: 'error'; reason: string }
@@ -37,9 +52,14 @@ export function Composer({ autoFocus, onSent, onCancel }: ComposerProps = {}) {
         text: { body: note.trim(), originURL: window.location.href },
         target: { repo: 'denoland/orchid', labels: [route] },
       }
+      const tok = await getCaptureToken()
+      if (!tok) {
+        setOutcome({ kind: 'error', reason: 'capture token unavailable — configure capture block in swarm.hcl' })
+        return
+      }
       const res = await fetch('/api/drafts', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-capture-token': tok },
         body: JSON.stringify(body),
       })
       if (!res.ok) {

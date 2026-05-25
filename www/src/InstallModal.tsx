@@ -23,6 +23,7 @@ export function InstallModal() {
     let cancelled = false
     let id: ReturnType<typeof setInterval> | undefined
     async function poll() {
+      if (document.hidden) return
       try {
         const res = await fetch('/api/_relay/info', { credentials: 'same-origin' })
         if (!res.ok) { if (id) clearInterval(id); return }
