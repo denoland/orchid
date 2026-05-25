@@ -20,6 +20,16 @@
 #   ORCHID_REPO    denoland/orchid (source repo to build orch from)
 #
 # Idempotent: re-running pulls latest, rebuilds, restarts.
+
+# Bash-only. If a user pipes us into `sh` (the default on Debian/Ubuntu
+# where /bin/sh is dash), bail with a clear message instead of failing
+# at the first `set -o pipefail` with the cryptic "Illegal option" error.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "error: install.sh requires bash. Re-run with:" >&2
+  echo "  curl -fsSL https://orchid.littledivy.com/install.sh | bash" >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 INSTALL_DIR=${INSTALL_DIR:-/root/orch}
