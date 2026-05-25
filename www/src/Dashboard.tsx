@@ -85,12 +85,21 @@ async function fetchSnap(): Promise<Snap | null> {
     return normalizeSnap(await r.json())
   } catch { return null }
 }
-// Debounced PUT so rapid drags don't flood the server. Flushed on
-// pagehide/beforeunload via sendBeacon so a refresh mid-debounce never
-// loses the latest layout.
+// Bus-aware snap save path. When the events WS is up, layout writes
+// piggyback that connection (saveBusSender is wired by App.tsx on
+// mount) so card drags don't hit the /api/snap HTTP route — every
+// avoided round-trip is one fewer DO request on Cloudflare. The HTTP
+// PUT remains as a fallback for local-mode operators with no relay
+// agent connected, and for pagehide when the bus isn't initialised.
+let saveBusSender: ((msg: any) => void) | null = null
+export function setSnapBusSender(fn: ((msg: any) => void) | null) { saveBusSender = fn }
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 let savePending: Snap | null = null
 function doPut(body: Snap) {
+  if (saveBusSender) {
+    try { saveBusSender({ t: 'snap-put', snap: body }) } catch {}
+    return Promise.resolve()
+  }
   return fetch('/api/snap', {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
@@ -117,7 +126,11 @@ function flushSnap() {
   const body = savePending
   savePending = null
   if (!body) return
-  // sendBeacon survives navigation; falls back to fetch keepalive.
+  if (saveBusSender) {
+    try { saveBusSender({ t: 'snap-put', snap: body }) } catch {}
+    return
+  }
+  // sendBeacon survives navigation when the bus isn't available.
   const json = JSON.stringify(body)
   const sent = typeof navigator !== 'undefined' && navigator.sendBeacon &&
     navigator.sendBeacon('/api/snap', new Blob([json], { type: 'application/json' }))
@@ -333,18 +346,40 @@ function DashboardInner({ state, relay }: Props) {
   const lastPaneClickRef = useRef(0)
   const containerRef = useRef<HTMLDivElement>(null)
   const sendRef = useRef<(msg: any) => void>(() => {})
+  // Shared events-WS bus from App.tsx — see WSBusContext. Used for
+  // inbound snap pushes and to skip the /api/canvas/ws side-channel.
+  const bus = useContext(WSBusContext)
 
   const persist = useCallback(() => { saveSnap(snapRef.current) }, [])
 
-  // Pull canvas layout from server on first mount. Retry on failure
-  // so a single blippy request (auth race after OAuth, transient 503)
-  // never lets the rebuild effect default-grid the layout and PUT
-  // that clobbering snap back to the server.
+  // Snap (canvas layout) arrives via two channels, whichever wins:
+  //  1. Relay's events WS — primed on accept with the cached layout,
+  //     no HTTP round-trip. Skipped when there's no bus (local mode).
+  //  2. Fallback fetch of /api/snap. Retries on transient failure so a
+  //     single 503 right after OAuth doesn't let the rebuild effect
+  //     default-grid the layout and PUT that clobbering snap back.
+  const snapLoadedRef = useRef(false)
+  useEffect(() => { snapLoadedRef.current = snapLoaded }, [snapLoaded])
+  useEffect(() => {
+    if (!bus) return
+    return bus.subscribe((msg: any) => {
+      if (msg?.t !== 'snap') return
+      try {
+        const s = normalizeSnap(msg.snap ?? {})
+        snapRef.current = s
+        setEdges(s.edges)
+        setStrokes(s.strokes)
+        if (s.view) setView(s.view)
+        setSnapLoaded(true)
+      } catch {}
+    })
+  }, [bus])
   useEffect(() => {
     let alive = true
     let attempt = 0
     const load = async () => {
       while (alive) {
+        if (snapLoadedRef.current) return
         const s = await fetchSnap()
         if (!alive) return
         if (s) {
@@ -968,7 +1003,6 @@ function DashboardInner({ state, relay }: Props) {
     }
   }, [applyStrokeAdd, applyStrokeRemove, applyEdgeAdd, setNodes, setEdges, persist, makeNoteNode, makeLinkNode, makeTextNode, makePaneNode])
 
-  const bus = useContext(WSBusContext)
   const { cursors, sendCursor, send } = useCollabSocket({ onMessage: handleRemote, transport: bus })
   useEffect(() => { sendRef.current = send }, [send])
 

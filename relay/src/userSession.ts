@@ -17,6 +17,12 @@ type Frame =
   // the latest and fans out to every browser subscribed via
   // /api/events/ws — replaces the dashboard's 3s polling loop.
   | { t: 'state-update'; state: unknown }
+  // Snap (dashboard layout) push: orch ships the latest snap.json
+  // body to relay on every reconnect, relay caches it in DO storage
+  // and fans it out to events subscribers. Browser writes flow back
+  // through the same channel as `snap-put` frames.
+  | { t: 'snap'; snap: unknown }
+  | { t: 'snap-put'; snap: unknown }
 
 function encodeBinary(streamId: number, chunk: Uint8Array): Uint8Array {
   const out = new Uint8Array(4 + chunk.byteLength)
@@ -70,6 +76,10 @@ export class UserSession {
   // subscriber gets the current snapshot immediately on /api/events/ws
   // open — they don't have to wait for the next state change to render.
   lastState: string | null = null
+  // Cached snap (dashboard layout). Mirrors orch's snap.json so new
+  // tabs render their canvas without a separate fetch. Persisted to DO
+  // storage so it survives eviction even if orch is offline.
+  lastSnap: string | null = null
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
@@ -79,6 +89,7 @@ export class UserSession {
       this.uid = (await state.storage.get('uid')) ?? null
       this.login = (await state.storage.get('login')) ?? null
       this.ghToken = (await state.storage.get('ghToken')) ?? null
+      this.lastSnap = (await state.storage.get('lastSnap')) ?? null
       // Resurrect the agent WS that Cloudflare held open across DO
       // eviction. Without this, every cold start reports
       // `connected: false` until the agent's next reconnect — which
@@ -254,6 +265,10 @@ export class UserSession {
     // /api/_relay/info to detect the "agent online" transition. Push
     // it instead so the install modal hides the moment orch dials in.
     this.broadcastRelayInfo()
+    // Reset and push the current sub count so a freshly-connected
+    // agent skips state pushes immediately if nobody's watching.
+    this.lastSubCount = -1
+    this.notifySubs(true)
     return new Response(null, { status: 101, webSocket: client })
   }
 
@@ -280,6 +295,26 @@ export class UserSession {
           for (const peer of this.state.getWebSockets('events')) {
             if (peer === ws) continue
             try { peer.send(out) } catch {}
+          }
+        } else if (f && f.t === 'snap-put' && f.snap !== undefined) {
+          // Browser-side layout write. Cache + persist immediately so
+          // late-arriving tabs see the latest layout even if orch is
+          // offline. Mirror to other tabs in the same DO and forward
+          // to orch over the agent WS for durable disk persistence.
+          const body = JSON.stringify(f.snap ?? {})
+          if (body !== this.lastSnap) {
+            this.lastSnap = body
+            this.state.storage.put('lastSnap', body).catch(() => {})
+            const wrapped = `{"t":"snap","snap":${body}}`
+            for (const peer of this.state.getWebSockets('events')) {
+              if (peer === ws) continue
+              try { peer.send(wrapped) } catch {}
+            }
+            if (this.agentWS) {
+              try {
+                this.agentWS.send(JSON.stringify({ t: 'snap-put', snap: f.snap }))
+              } catch {}
+            }
           }
         }
         return
@@ -311,6 +346,7 @@ export class UserSession {
     if (wasAgent) {
       this.broadcastRelayInfo()
     } else {
+      this.notifySubs()
       // events-WS departure → tell remaining peers so they can drop
       // the stale cursor from their map without waiting for GC.
       try {
@@ -381,9 +417,13 @@ export class UserSession {
     const id = crypto.randomUUID().replaceAll('-', '').slice(0, 12)
     try { server.serializeAttachment({ id }) } catch {}
     try { server.send(JSON.stringify({ t: 'hello', userId: id })) } catch {}
+    this.notifySubs()
     try { server.send(JSON.stringify(this.relayInfoFrame(isOwner))) } catch {}
     if (this.lastState) {
       try { server.send(JSON.stringify({ t: 'state', state: JSON.parse(this.lastState) })) } catch {}
+    }
+    if (this.lastSnap) {
+      try { server.send(`{"t":"snap","snap":${this.lastSnap}}`) } catch {}
     }
     return new Response(null, { status: 101, webSocket: client })
   }
@@ -398,6 +438,26 @@ export class UserSession {
       // owner ever gets it — collab WSs get it as null.
       token: isOwner ? this.agentToken : null,
     }
+  }
+
+  // Tell the agent how many dashboard tabs are currently subscribed
+  // to the events channel. Orch uses this to skip emitting state-update
+  // frames when nobody's looking — saves the WS write + the DO wake
+  // on the relay side. Only sent when the count crosses 0 or > 0 so
+  // we don't spam the agent on every reload.
+  private lastSubCount = -1
+  private notifySubs(force = false) {
+    if (!this.agentWS) return
+    const count = this.state.getWebSockets('events').length
+    const transitioned =
+      (this.lastSubCount <= 0 && count > 0) ||
+      (this.lastSubCount > 0 && count === 0)
+    const send = force || transitioned
+    this.lastSubCount = count
+    if (!send) return
+    try {
+      this.agentWS.send(JSON.stringify({ t: 'subs', count }))
+    } catch {}
   }
 
   // Broadcast a relay-info frame to every subscriber. Owner and collab
@@ -502,6 +562,23 @@ export class UserSession {
       // inside webSocketMessage causes CF to close the calling WS,
       // which is the agent socket. A bad sub.send() (zombie client,
       // 1MiB frame, etc.) would otherwise take down the tunnel.
+      // Snap push from orch on (re)connect — fan it out to subs and
+      // persist into DO storage so an evicted DO can hand the layout
+      // straight to the next new tab without waiting for orch.
+      if (f.t === 'snap') {
+        try {
+          const body = JSON.stringify(f.snap ?? {})
+          if (body !== this.lastSnap) {
+            this.lastSnap = body
+            this.state.storage.put('lastSnap', body).catch(() => {})
+            const wrapped = `{"t":"snap","snap":${body}}`
+            for (const sub of this.state.getWebSockets('events')) {
+              try { sub.send(wrapped) } catch {}
+            }
+          }
+        } catch {}
+        return
+      }
       if (f.t === 'state-update') {
         try {
           const body = JSON.stringify(f.state ?? {})

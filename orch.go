@@ -4591,7 +4591,28 @@ func main() {
 		if *relayToken == "" {
 			log.Fatalf("-relay requires -relay-token (issued by the relay on signup)")
 		}
-		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st), st.Bcast, func() []byte { return buildAPIStateJSON(&cfg, st) })
+		snapPath := filepath.Join(filepath.Dir(cfg.Orch.StateFile), "snap.json")
+		snapRead := func() []byte {
+			b, err := os.ReadFile(snapPath)
+			if err != nil {
+				return nil
+			}
+			return b
+		}
+		snapWrite := func(body []byte) error {
+			if !json.Valid(body) {
+				return fmt.Errorf("invalid json")
+			}
+			tmp := snapPath + ".tmp"
+			if err := os.WriteFile(tmp, body, 0o644); err != nil {
+				return err
+			}
+			if prev, err := os.ReadFile(snapPath); err == nil && len(prev) > 0 {
+				_ = os.WriteFile(snapPath+".bak", prev, 0o644)
+			}
+			return os.Rename(tmp, snapPath)
+		}
+		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st), st.Bcast, func() []byte { return buildAPIStateJSON(&cfg, st) }, snapRead, snapWrite)
 	}
 
 	for i := range cfg.VMs {
