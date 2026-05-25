@@ -1,16 +1,35 @@
 #!/usr/bin/env bash
-# Orchid installer. Run on the target VM as root:
+# Orchid installer. Run on the target machine as root:
 #
 #     curl -fsSL https://raw.githubusercontent.com/denoland/orchid/main/install.sh | bash
 #
+# Two modes:
+#   default        Install + run the orchestrator daemon (central).
+#                  Reads `gh auth status` for the daemon's GitHub creds.
+#   WORKER=1       Worker-only install: deps + binary + service user, but no
+#                  swarm.hcl and no orchid.service. After it finishes, run
+#                    orch join vm <central-url> <invite-token>
+#                  on this machine — the central orch will provision a
+#                  dedicated SSH key for itself and add a `vm` block.
+#
 # Env overrides:
-#   INSTALL_DIR   /root/orch
-#   SERVICE_USER  orchid          (created if missing, runs the worker tmux sessions)
-#   BOT_LOGIN     orchidbot       (GitHub login the bot commits/PRs as)
-#   GH_TOKEN      (prompted)      (PAT with repo + issues scope on the inbox repo)
-#   INBOX_REPO    (prompted)      (e.g. denoland/orchid)
+#   INSTALL_DIR    /root/orch
+#   SERVICE_USER   orchid          (created if missing, runs the worker tmux sessions)
+#   BOT_LOGIN      orchidbot       (GitHub login the bot commits/PRs as; central only)
+#   INBOX_REPO     (prompted)      (e.g. denoland/orchid; central only)
+#   ORCHID_REPO    denoland/orchid (source repo to build orch from)
 #
 # Idempotent: re-running pulls latest, rebuilds, restarts.
+
+# Bash-only. If a user pipes us into `sh` (the default on Debian/Ubuntu
+# where /bin/sh is dash), bail with a clear message instead of failing
+# at the first `set -o pipefail` with the cryptic "Illegal option" error.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "error: install.sh requires bash. Re-run with:" >&2
+  echo "  curl -fsSL https://orchid.littledivy.com/install.sh | bash" >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 INSTALL_DIR=${INSTALL_DIR:-/root/orch}
@@ -18,6 +37,7 @@ SERVICE_USER=${SERVICE_USER:-orchid}
 BOT_LOGIN=${BOT_LOGIN:-orchidbot}
 SRC_DIR=${SRC_DIR:-/tmp/orchid-src}
 GO_VERSION=${GO_VERSION:-1.23.4}
+WORKER=${WORKER:-0}
 
 say() { printf "\033[1;35m▶\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m✗\033[0m %s\n" "$*" >&2; exit 1; }
@@ -32,11 +52,30 @@ command -v systemctl >/dev/null || die "systemd required"
 say "installing prerequisites"
 if command -v apt-get >/dev/null; then
   apt-get update -qq
-  apt-get install -y -qq git tmux openssl curl gh sudo >/dev/null
+  apt-get install -y -qq git tmux openssl openssh-client openssh-server curl gh sudo jq >/dev/null
 elif command -v dnf >/dev/null; then
-  dnf install -y -q git tmux openssl curl gh sudo >/dev/null
+  dnf install -y -q git tmux openssl openssh-clients openssh-server curl gh sudo jq >/dev/null
 else
-  die "no apt-get or dnf — install git tmux openssl curl gh sudo manually"
+  die "no apt-get or dnf — install git tmux openssl openssh curl gh sudo jq manually"
+fi
+
+# Require the operator to authenticate gh themselves rather than us
+# stashing a long-lived PAT in /root/orch/env. The daemon shells out to
+# `gh` for every API call, which reads ~/.config/gh/hosts.yml; this
+# means whatever auth the operator already trusts gets reused as-is.
+say "checking gh authentication"
+if ! gh auth status -h github.com >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+✗ gh CLI is not authenticated to github.com.
+
+Run:
+  gh auth login --hostname github.com --git-protocol https --web
+
+Pick scopes: repo, read:org, workflow.
+Then re-run this installer. The orch daemon will pick up the same auth
+(no GH_TOKEN needed) from /root/.config/gh/hosts.yml.
+EOF
+  exit 1
 fi
 
 if ! command -v go >/dev/null || [ "$(go env GOVERSION 2>/dev/null | sed 's/go//' | head -c4)" \< "1.23" ]; then
@@ -48,27 +87,33 @@ if ! command -v go >/dev/null || [ "$(go env GOVERSION 2>/dev/null | sed 's/go//
 fi
 
 say "fetching orchid source"
-# Prompt for the token now so the clone can authenticate (the repo is
-# currently private). It's also used below as the daemon's GH_TOKEN.
-if [ -z "${GH_TOKEN:-}" ]; then
-  echo
-  read -rsp "GitHub Personal Access Token (repo + issues scope on the inbox repo): " GH_TOKEN
-  echo
-fi
-[ -n "$GH_TOKEN" ] || die "GH_TOKEN required"
-
-CLONE_URL="https://x-access-token:${GH_TOKEN}@github.com/${ORCHID_REPO:-denoland/orchid}.git"
-if [ -d "$SRC_DIR/.git" ]; then
-  git -C "$SRC_DIR" remote set-url origin "$CLONE_URL"
-  git -C "$SRC_DIR" fetch --quiet origin
-  git -C "$SRC_DIR" reset --hard --quiet origin/main
-  # Strip the token back out so it doesn't sit in the working copy's
-  # .git/config.
-  git -C "$SRC_DIR" remote set-url origin "https://github.com/${ORCHID_REPO:-denoland/orchid}.git"
+# SKIP_FETCH=1 lets the operator pre-populate $SRC_DIR (e.g. via
+# `gh repo clone`) and have the installer build from that tree. Useful
+# when `gh auth token` returns a token without `repo` scope on the
+# orchid repo (fine-grained PATs, SSO orgs) so the in-script HTTPS
+# clone would otherwise 403.
+if [ "${SKIP_FETCH:-0}" = "1" ]; then
+  [ -d "$SRC_DIR/.git" ] || die "SKIP_FETCH=1 but $SRC_DIR has no .git — clone there first"
+  say "using existing $SRC_DIR (SKIP_FETCH=1)"
 else
-  rm -rf "$SRC_DIR"
-  git clone --quiet --depth 1 "$CLONE_URL" "$SRC_DIR"
-  git -C "$SRC_DIR" remote set-url origin "https://github.com/${ORCHID_REPO:-denoland/orchid}.git"
+  # gh auth token honors whatever method the operator used (browser, PAT,
+  # device flow), so the clone re-uses their existing credentials instead
+  # of needing a separate GH_TOKEN env.
+  CLONE_TOKEN=$(gh auth token 2>/dev/null || true)
+  [ -n "$CLONE_TOKEN" ] || die "gh auth token returned empty — re-run 'gh auth login' (or pre-clone and pass SKIP_FETCH=1 SRC_DIR=…)"
+  CLONE_URL="https://x-access-token:${CLONE_TOKEN}@github.com/${ORCHID_REPO:-denoland/orchid}.git"
+  if [ -d "$SRC_DIR/.git" ]; then
+    git -C "$SRC_DIR" remote set-url origin "$CLONE_URL"
+    git -C "$SRC_DIR" fetch --quiet origin
+    git -C "$SRC_DIR" reset --hard --quiet origin/main
+    # Strip the token back out so it doesn't sit in the working copy's
+    # .git/config.
+    git -C "$SRC_DIR" remote set-url origin "https://github.com/${ORCHID_REPO:-denoland/orchid}.git"
+  else
+    rm -rf "$SRC_DIR"
+    git clone --quiet --depth 1 "$CLONE_URL" "$SRC_DIR"
+    git -C "$SRC_DIR" remote set-url origin "https://github.com/${ORCHID_REPO:-denoland/orchid}.git"
+  fi
 fi
 
 say "building orch binary"
@@ -102,12 +147,35 @@ for u in root "$SERVICE_USER"; do
 done
 
 say "writing $INSTALL_DIR"
-mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/captures"
+mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/captures" "$INSTALL_DIR/vm-keys"
+chmod 700 "$INSTALL_DIR/vm-keys"
 mv /tmp/orch.new "$INSTALL_DIR/orch"
 chmod +x "$INSTALL_DIR/orch"
-# Expose the binary on PATH so `orch join <url> <token>` works from any
-# shell after install.
+# Expose the binary on PATH so `orch join …` works from any shell after
+# install. Required on both central and worker hosts.
 ln -sf "$INSTALL_DIR/orch" /usr/local/bin/orch
+
+if [ "$WORKER" = "1" ]; then
+  # Worker hosts don't run the orchestrator daemon — central drives them
+  # over SSH. We just need the binary, the service user, and ssh ready.
+  # Make sure sshd is up so `orch join vm` (run next) can hand central
+  # an SSH key that actually authenticates.
+  systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || true
+  cat <<EOF
+
+\033[1;32m✓ orchid worker prerequisites installed\033[0m
+
+next, on this machine:
+  orch join vm <central-url> <invite-token>
+
+  Get <invite-token> from the central host (its dashboard's Settings →
+  Add VM, or grab the orchestrator.http_secret from $INSTALL_DIR/swarm.hcl
+  there). Central will generate a dedicated SSH key, push the public
+  half to /home/$SERVICE_USER/.ssh/authorized_keys here, and add a
+  vm "<name>" {} block to its swarm.hcl.
+EOF
+  exit 0
+fi
 
 if [ -z "${INBOX_REPO:-}" ]; then
   read -rp "Inbox repo [denoland/orchid]: " INBOX_REPO
@@ -154,8 +222,10 @@ else
   say "swarm.hcl exists — leaving as-is"
 fi
 
+# env file holds only relay state now. The daemon picks up GitHub
+# credentials via ~/.config/gh/hosts.yml (populated by `gh auth login`),
+# so no GH_TOKEN to leak / rotate / sync.
 cat > "$INSTALL_DIR/env" <<EOF
-GH_TOKEN=$GH_TOKEN
 RELAY_URL=
 RELAY_TOKEN=
 EOF
@@ -210,6 +280,8 @@ if systemctl is-active --quiet orchid; then
 next:
   - open the dashboard URL above
   - file an issue in $INBOX_REPO with a target label → orchid spawns a session
+  - to add a worker VM: on that VM run install.sh with WORKER=1, then
+      orch join vm http://${IP:-this-host}:8000 $HTTP_SECRET
 EOF
 else
   die "orchid failed to start. check: journalctl -u orchid -n 50"

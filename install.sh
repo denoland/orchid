@@ -87,23 +87,33 @@ if ! command -v go >/dev/null || [ "$(go env GOVERSION 2>/dev/null | sed 's/go//
 fi
 
 say "fetching orchid source"
-# gh auth token honors whatever method the operator used (browser, PAT,
-# device flow), so the clone re-uses their existing credentials instead
-# of needing a separate GH_TOKEN env.
-CLONE_TOKEN=$(gh auth token 2>/dev/null || true)
-[ -n "$CLONE_TOKEN" ] || die "gh auth token returned empty — re-run 'gh auth login'"
-CLONE_URL="https://x-access-token:${CLONE_TOKEN}@github.com/${ORCHID_REPO:-denoland/orchid}.git"
-if [ -d "$SRC_DIR/.git" ]; then
-  git -C "$SRC_DIR" remote set-url origin "$CLONE_URL"
-  git -C "$SRC_DIR" fetch --quiet origin
-  git -C "$SRC_DIR" reset --hard --quiet origin/main
-  # Strip the token back out so it doesn't sit in the working copy's
-  # .git/config.
-  git -C "$SRC_DIR" remote set-url origin "https://github.com/${ORCHID_REPO:-denoland/orchid}.git"
+# SKIP_FETCH=1 lets the operator pre-populate $SRC_DIR (e.g. via
+# `gh repo clone`) and have the installer build from that tree. Useful
+# when `gh auth token` returns a token without `repo` scope on the
+# orchid repo (fine-grained PATs, SSO orgs) so the in-script HTTPS
+# clone would otherwise 403.
+if [ "${SKIP_FETCH:-0}" = "1" ]; then
+  [ -d "$SRC_DIR/.git" ] || die "SKIP_FETCH=1 but $SRC_DIR has no .git — clone there first"
+  say "using existing $SRC_DIR (SKIP_FETCH=1)"
 else
-  rm -rf "$SRC_DIR"
-  git clone --quiet --depth 1 "$CLONE_URL" "$SRC_DIR"
-  git -C "$SRC_DIR" remote set-url origin "https://github.com/${ORCHID_REPO:-denoland/orchid}.git"
+  # gh auth token honors whatever method the operator used (browser, PAT,
+  # device flow), so the clone re-uses their existing credentials instead
+  # of needing a separate GH_TOKEN env.
+  CLONE_TOKEN=$(gh auth token 2>/dev/null || true)
+  [ -n "$CLONE_TOKEN" ] || die "gh auth token returned empty — re-run 'gh auth login' (or pre-clone and pass SKIP_FETCH=1 SRC_DIR=…)"
+  CLONE_URL="https://x-access-token:${CLONE_TOKEN}@github.com/${ORCHID_REPO:-denoland/orchid}.git"
+  if [ -d "$SRC_DIR/.git" ]; then
+    git -C "$SRC_DIR" remote set-url origin "$CLONE_URL"
+    git -C "$SRC_DIR" fetch --quiet origin
+    git -C "$SRC_DIR" reset --hard --quiet origin/main
+    # Strip the token back out so it doesn't sit in the working copy's
+    # .git/config.
+    git -C "$SRC_DIR" remote set-url origin "https://github.com/${ORCHID_REPO:-denoland/orchid}.git"
+  else
+    rm -rf "$SRC_DIR"
+    git clone --quiet --depth 1 "$CLONE_URL" "$SRC_DIR"
+    git -C "$SRC_DIR" remote set-url origin "https://github.com/${ORCHID_REPO:-denoland/orchid}.git"
+  fi
 fi
 
 say "building orch binary"
