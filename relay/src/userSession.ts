@@ -23,6 +23,12 @@ type Frame =
   // through the same channel as `snap-put` frames.
   | { t: 'snap'; snap: unknown }
   | { t: 'snap-put'; snap: unknown }
+  // Pane mux: browser asks orch (via relay) to start/stop a tmux
+  // capture stream, frames come back as `pane` carrying the same
+  // base64+gzip body the SSE endpoint used to write.
+  | { t: 'pane-sub'; paneId: string; cols?: number; rows?: number }
+  | { t: 'pane-unsub'; paneId: string }
+  | { t: 'pane'; paneId: string; data: string }
 
 function encodeBinary(streamId: number, chunk: Uint8Array): Uint8Array {
   const out = new Uint8Array(4 + chunk.byteLength)
@@ -296,6 +302,26 @@ export class UserSession {
             if (peer === ws) continue
             try { peer.send(out) } catch {}
           }
+        } else if (f && (f.t === 'pane-sub' || f.t === 'pane-unsub') && typeof f.paneId === 'string') {
+          // Track this WS's pane subscriptions in its hibernation
+          // attachment so a hard browser close (no explicit pane-unsub)
+          // is cleaned up in webSocketClose. Orch refcounts subscribers
+          // per session and stops the tmux capture goroutine when the
+          // last subscriber leaves.
+          const a = (ws.deserializeAttachment() as { id?: string; panes?: string[] }) || {}
+          const set = new Set<string>(a.panes ?? [])
+          if (f.t === 'pane-sub') set.add(f.paneId)
+          else set.delete(f.paneId)
+          try { ws.serializeAttachment({ ...a, panes: Array.from(set) }) } catch {}
+          if (this.agentWS) {
+            try {
+              this.agentWS.send(JSON.stringify({
+                t: f.t, paneId: f.paneId,
+                cols: typeof f.cols === 'number' ? f.cols : undefined,
+                rows: typeof f.rows === 'number' ? f.rows : undefined,
+              }))
+            } catch {}
+          }
         } else if (f && f.t === 'snap-put' && f.snap !== undefined) {
           // Browser-side layout write. Cache + persist immediately so
           // late-arriving tabs see the latest layout even if orch is
@@ -348,15 +374,23 @@ export class UserSession {
     } else {
       this.notifySubs()
       // events-WS departure → tell remaining peers so they can drop
-      // the stale cursor from their map without waiting for GC.
+      // the stale cursor from their map without waiting for GC, and
+      // tell orch to refcount-down any pane captures this WS was
+      // holding open (browser closes don't always send pane-unsub).
       try {
-        const a = ws.deserializeAttachment() as { id?: string } | null
+        const a = ws.deserializeAttachment() as { id?: string; panes?: string[] } | null
         const id = a?.id
         if (id) {
           const out = JSON.stringify({ t: 'leave', userId: id })
           for (const peer of this.state.getWebSockets('events')) {
             if (peer === ws) continue
             try { peer.send(out) } catch {}
+          }
+        }
+        const panes = a?.panes ?? []
+        if (panes.length > 0 && this.agentWS) {
+          for (const paneId of panes) {
+            try { this.agentWS.send(JSON.stringify({ t: 'pane-unsub', paneId })) } catch {}
           }
         }
       } catch {}
@@ -565,6 +599,18 @@ export class UserSession {
       // Snap push from orch on (re)connect — fan it out to subs and
       // persist into DO storage so an evicted DO can hand the layout
       // straight to the next new tab without waiting for orch.
+      // Pane frame from orch — fan out to every events sub. Pane.tsx
+      // filters by paneId on the client side; that's cheaper than
+      // tracking per-WS subscription sets across hibernation here.
+      if (f.t === 'pane') {
+        try {
+          const wrapped = `{"t":"pane","paneId":${JSON.stringify(f.paneId ?? '')},"data":${JSON.stringify(f.data ?? '')}}`
+          for (const sub of this.state.getWebSockets('events')) {
+            try { sub.send(wrapped) } catch {}
+          }
+        } catch {}
+        return
+      }
       if (f.t === 'snap') {
         try {
           const body = JSON.stringify(f.snap ?? {})
