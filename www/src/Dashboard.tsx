@@ -2113,6 +2113,150 @@ function VMJoinGuide({ vms, sessionsByVM, relay }: {
   )
 }
 
+interface UsageHistoryRow {
+  date: string
+  session_id: string
+  model: string
+  input_tokens: number
+  cache_creation: number
+  cache_read: number
+  output_tokens: number
+  cost_usd: number
+}
+
+/// Stacked-bar chart of daily Claude spend over a rolling window.
+/// SVG, no chart library — every dep we keep out is one less hit on
+/// the bundle size. X axis = day, Y axis = USD. Bars are stacked by
+/// model family so a glance shows where the budget went (opus vs
+/// sonnet vs haiku splits).
+function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
+  type DayBar = { date: string; opus: number; sonnet: number; haiku: number; other: number; total: number }
+  const grid = useMemo<DayBar[]>(() => {
+    // Build the contiguous date axis even when a day has zero spend.
+    // Otherwise an idle weekend leaves a hole and the bars shift.
+    const by = new Map<string, DayBar>()
+    const today = new Date()
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(today.getTime() - i * 86400_000)
+      const k = d.toISOString().slice(0, 10)
+      by.set(k, { date: k, opus: 0, sonnet: 0, haiku: 0, other: 0, total: 0 })
+    }
+    for (const r of rows) {
+      const bar = by.get(r.date)
+      if (!bar) continue
+      const m = r.model.toLowerCase()
+      const fam = m.includes('opus') ? 'opus'
+        : m.includes('sonnet') ? 'sonnet'
+        : m.includes('haiku') ? 'haiku' : 'other'
+      bar[fam] += r.cost_usd
+      bar.total += r.cost_usd
+    }
+    return Array.from(by.values())
+  }, [rows, days])
+
+  const max = Math.max(0.01, ...grid.map((g) => g.total))
+  const total = grid.reduce((acc, g) => acc + g.total, 0)
+  const W = 760, H = 200, pad = { l: 36, r: 12, t: 12, b: 22 }
+  const innerW = W - pad.l - pad.r
+  const innerH = H - pad.t - pad.b
+  const barW = innerW / grid.length
+
+  const fam = {
+    opus:   { fill: '#a78bfa', label: 'opus' },
+    sonnet: { fill: '#34d399', label: 'sonnet' },
+    haiku:  { fill: '#60a5fa', label: 'haiku' },
+    other:  { fill: '#71717a', label: 'other' },
+  } as const
+
+  // Y-axis ticks at 0, 25%, 50%, 75%, 100% of max.
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((p) => ({ y: pad.t + innerH - p * innerH, v: p * max }))
+
+  return (
+    <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
+      <div className="flex items-center mb-3">
+        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+          Daily spend · last {days}d
+        </div>
+        <div className="flex-1" />
+        <div className="mono text-[12px] text-zinc-600 dark:text-zinc-300 tabular-nums">
+          ${total.toFixed(2)} window total
+        </div>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
+        {ticks.map((t, i) => (
+          <g key={i}>
+            <line x1={pad.l} x2={W - pad.r} y1={t.y} y2={t.y} stroke="currentColor" className="text-zinc-200 dark:text-zinc-800" strokeDasharray={i === 0 ? '' : '2 3'} />
+            <text x={pad.l - 6} y={t.y + 3} textAnchor="end" className="fill-zinc-400 dark:fill-zinc-500" fontSize="9">
+              ${t.v.toFixed(t.v < 1 ? 2 : 1)}
+            </text>
+          </g>
+        ))}
+        {grid.map((g, i) => {
+          const x = pad.l + i * barW
+          const stacks: { fill: string; v: number }[] = [
+            { fill: fam.opus.fill,   v: g.opus },
+            { fill: fam.sonnet.fill, v: g.sonnet },
+            { fill: fam.haiku.fill,  v: g.haiku },
+            { fill: fam.other.fill,  v: g.other },
+          ].filter((s) => s.v > 0)
+          let yCursor = pad.t + innerH
+          return (
+            <g key={g.date}>
+              {stacks.map((s, j) => {
+                const h = (s.v / max) * innerH
+                yCursor -= h
+                return <rect key={j} x={x + 1} y={yCursor} width={Math.max(0, barW - 2)} height={Math.max(0, h)} fill={s.fill} />
+              })}
+              {i % Math.ceil(days / 8) === 0 && (
+                <text x={x + barW / 2} y={H - 6} textAnchor="middle" className="fill-zinc-400 dark:fill-zinc-500" fontSize="9">
+                  {g.date.slice(5)}
+                </text>
+              )}
+              <title>{`${g.date}\n$${g.total.toFixed(2)}\nopus $${g.opus.toFixed(2)} · sonnet $${g.sonnet.toFixed(2)} · haiku $${g.haiku.toFixed(2)}`}</title>
+            </g>
+          )
+        })}
+      </svg>
+      <div className="flex items-center gap-3 mt-2 mono text-[10.5px] text-zinc-500 dark:text-zinc-400">
+        {(['opus', 'sonnet', 'haiku', 'other'] as const).map((k) => (
+          <span key={k} className="inline-flex items-center gap-1">
+            <span className="inline-block w-2 h-2 rounded-sm" style={{ background: fam[k].fill }} />
+            {fam[k].label}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/// Rolled-up totals across a configurable window. Pulls the same
+/// /api/usage_history payload and re-aggregates so the operator can
+/// switch between day / week / month without a round trip.
+function UsageRollups({ rows }: { rows: UsageHistoryRow[] }) {
+  const today = new Date().toISOString().slice(0, 10)
+  const windowSum = (days: number) => {
+    const since = new Date(Date.now() - days * 86400_000).toISOString().slice(0, 10)
+    return rows.filter((r) => r.date >= since && r.date <= today)
+      .reduce((acc, r) => acc + r.cost_usd, 0)
+  }
+  const card = (label: string, days: number) => {
+    const v = windowSum(days)
+    return (
+      <div className="rounded-lg ring-1 ring-zinc-200 dark:ring-zinc-800 px-4 py-3 flex-1">
+        <div className="text-[10.5px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-1">{label}</div>
+        <div className="mono text-[20px] text-zinc-900 dark:text-zinc-100 tabular-nums">${v.toFixed(2)}</div>
+      </div>
+    )
+  }
+  return (
+    <div className="flex items-stretch gap-3">
+      {card('Today',   1)}
+      {card('7 days',  7)}
+      {card('30 days', 30)}
+    </div>
+  )
+}
+
 // Settings → Usage tab. Sorted by spend desc so the most expensive
 // sessions float to the top. Quota strip up top mirrors the
 // (hidden-on-some-accounts) header chip so operators can see the
@@ -2128,8 +2272,46 @@ function UsageTable({ jobs, quota }: { jobs: Job[]; quota?: State['quota'] }) {
     () => rows.reduce((acc, j) => acc + (j.usage?.cost_usd ?? 0), 0),
     [rows],
   )
+  const [history, setHistory] = useState<UsageHistoryRow[] | null>(null)
+  const [days, setDays] = useState(30)
+  useEffect(() => {
+    let alive = true
+    fetch(`/api/usage_history?days=${days}`, { credentials: 'include', cache: 'no-store' })
+      .then((r) => r.ok ? r.json() : null)
+      .then((j) => { if (alive) setHistory(j?.rows ?? []) })
+      .catch(() => { if (alive) setHistory([]) })
+    const id = setInterval(() => {
+      fetch(`/api/usage_history?days=${days}`, { credentials: 'include', cache: 'no-store' })
+        .then((r) => r.ok ? r.json() : null)
+        .then((j) => { if (alive) setHistory(j?.rows ?? []) })
+        .catch(() => {})
+    }, 60_000)
+    return () => { alive = false; clearInterval(id) }
+  }, [days])
   return (
     <div className="space-y-6">
+      {history && history.length > 0 && (
+        <>
+          <UsageRollups rows={history} />
+          <div className="flex items-center justify-end gap-1">
+            {[7, 30, 90].map((d) => (
+              <button
+                key={d}
+                onClick={() => setDays(d)}
+                className={
+                  'mono text-[11px] px-2 py-1 rounded ' +
+                  (days === d
+                    ? 'bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-900'
+                    : 'text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800')
+                }
+              >
+                {d}d
+              </button>
+            ))}
+          </div>
+          <UsageChart rows={history} days={days} />
+        </>
+      )}
       {quota ? (
         <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
           <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">
