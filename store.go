@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   date           TEXT NOT NULL,
   session_id     TEXT NOT NULL,
   model          TEXT NOT NULL,
+  issue          INTEGER NOT NULL DEFAULT 0,
   input_tokens   INTEGER NOT NULL DEFAULT 0,
   cache_creation INTEGER NOT NULL DEFAULT 0,
   cache_read     INTEGER NOT NULL DEFAULT 0,
@@ -71,11 +72,15 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   PRIMARY KEY (date, session_id, model)
 );
 CREATE INDEX IF NOT EXISTS usage_daily_date ON usage_daily(date);`); err != nil {
-		_ = db.Close()
-		return nil, err
+			_ = db.Close()
+			return nil, err
+		}
+		// Best-effort migration for installs created before the issue
+		// column existed. ALTER TABLE ADD COLUMN is idempotent in the
+		// "already exists" sense — we swallow the error.
+		_, _ = db.Exec(`ALTER TABLE usage_daily ADD COLUMN issue INTEGER NOT NULL DEFAULT 0`)
+		return &Store{db: db}, nil
 	}
-	return &Store{db: db}, nil
-}
 
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
@@ -250,18 +255,19 @@ func (s *Store) PutKV(key string, value []byte) error {
 // scanner replays jsonl files idempotently — same input always yields
 // the same total — so ON CONFLICT REPLACE is safe and lets us re-scan
 // without dedupe bookkeeping.
-func (s *Store) UpsertUsageDaily(date, sessionID, model string, inputT, cacheCreate, cacheRead, outputT int64, costUSD float64) error {
+func (s *Store) UpsertUsageDaily(date, sessionID, model string, issue int, inputT, cacheCreate, cacheRead, outputT int64, costUSD float64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`INSERT INTO usage_daily (date, session_id, model, input_tokens, cache_creation, cache_read, output_tokens, cost_usd)
-		VALUES (?,?,?,?,?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO usage_daily (date, session_id, model, issue, input_tokens, cache_creation, cache_read, output_tokens, cost_usd)
+		VALUES (?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(date, session_id, model) DO UPDATE SET
+			issue          = excluded.issue,
 			input_tokens   = excluded.input_tokens,
 			cache_creation = excluded.cache_creation,
 			cache_read     = excluded.cache_read,
 			output_tokens  = excluded.output_tokens,
 			cost_usd       = excluded.cost_usd`,
-		date, sessionID, model, inputT, cacheCreate, cacheRead, outputT, costUSD)
+		date, sessionID, model, issue, inputT, cacheCreate, cacheRead, outputT, costUSD)
 	return err
 }
 
@@ -270,6 +276,7 @@ type UsageDailyRow struct {
 	Date          string  `json:"date"`
 	SessionID     string  `json:"session_id"`
 	Model         string  `json:"model"`
+	Issue         int     `json:"issue,omitempty"`
 	InputTokens   int64   `json:"input_tokens"`
 	CacheCreation int64   `json:"cache_creation"`
 	CacheRead     int64   `json:"cache_read"`
@@ -284,7 +291,7 @@ type UsageDailyRow struct {
 func (s *Store) LoadUsageHistory(sinceDate string) ([]UsageDailyRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT date, session_id, model, input_tokens, cache_creation, cache_read, output_tokens, cost_usd
+	rows, err := s.db.Query(`SELECT date, session_id, model, issue, input_tokens, cache_creation, cache_read, output_tokens, cost_usd
 		FROM usage_daily WHERE date >= ? ORDER BY date ASC`, sinceDate)
 	if err != nil {
 		return nil, err
@@ -293,7 +300,7 @@ func (s *Store) LoadUsageHistory(sinceDate string) ([]UsageDailyRow, error) {
 	var out []UsageDailyRow
 	for rows.Next() {
 		var r UsageDailyRow
-		if err := rows.Scan(&r.Date, &r.SessionID, &r.Model, &r.InputTokens, &r.CacheCreation, &r.CacheRead, &r.OutputTokens, &r.CostUSD); err != nil {
+		if err := rows.Scan(&r.Date, &r.SessionID, &r.Model, &r.Issue, &r.InputTokens, &r.CacheCreation, &r.CacheRead, &r.OutputTokens, &r.CostUSD); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

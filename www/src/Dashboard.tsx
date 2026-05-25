@@ -2117,16 +2117,7 @@ function VMJoinGuide({ vms, sessionsByVM, relay }: {
   )
 }
 
-interface UsageHistoryRow {
-  date: string
-  session_id: string
-  model: string
-  input_tokens: number
-  cache_creation: number
-  cache_read: number
-  output_tokens: number
-  cost_usd: number
-}
+import type { UsageHistoryRow } from './types'
 
 /// Stacked-bar chart of daily Claude spend over a rolling window.
 /// SVG, no chart library — every dep we keep out is one less hit on
@@ -2172,11 +2163,14 @@ function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
     other:  { fill: '#71717a', label: 'other' },
   } as const
 
-  // Y-axis ticks at 0, 25%, 50%, 75%, 100% of max.
   const ticks = [0, 0.25, 0.5, 0.75, 1].map((p) => ({ y: pad.t + innerH - p * innerH, v: p * max }))
 
+  const [hover, setHover] = useState<{ i: number; x: number; y: number } | null>(null)
+  const svgRef = useRef<SVGSVGElement | null>(null)
+  const hovered = hover ? grid[hover.i] : null
+
   return (
-    <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
+    <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5 relative">
       <div className="flex items-center mb-3">
         <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
           Daily spend · last {days}d
@@ -2186,7 +2180,12 @@ function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
           ${total.toFixed(2)} window total
         </div>
       </div>
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
+      <svg
+        ref={svgRef}
+        viewBox={`0 0 ${W} ${H}`}
+        className="w-full"
+        onPointerLeave={() => setHover(null)}
+      >
         {ticks.map((t, i) => (
           <g key={i}>
             <line x1={pad.l} x2={W - pad.r} y1={t.y} y2={t.y} stroke="currentColor" className="text-zinc-200 dark:text-zinc-800" strokeDasharray={i === 0 ? '' : '2 3'} />
@@ -2204,23 +2203,51 @@ function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
             { fill: fam.other.fill,  v: g.other },
           ].filter((s) => s.v > 0)
           let yCursor = pad.t + innerH
+          const hot = hover?.i === i
           return (
-            <g key={g.date}>
+            <g
+              key={g.date}
+              onPointerEnter={(e) => {
+                const r = svgRef.current?.getBoundingClientRect()
+                if (!r) return
+                setHover({ i, x: e.clientX - r.left, y: e.clientY - r.top })
+              }}
+              onPointerMove={(e) => {
+                const r = svgRef.current?.getBoundingClientRect()
+                if (!r) return
+                setHover({ i, x: e.clientX - r.left, y: e.clientY - r.top })
+              }}
+              style={{ cursor: 'pointer' }}
+            >
+              {/* invisible full-height hit target so even a $0 day is hoverable */}
+              <rect x={x} y={pad.t} width={barW} height={innerH} fill="transparent" />
               {stacks.map((s, j) => {
                 const h = (s.v / max) * innerH
                 yCursor -= h
-                return <rect key={j} x={x + 1} y={yCursor} width={Math.max(0, barW - 2)} height={Math.max(0, h)} fill={s.fill} />
+                return <rect key={j} x={x + 1} y={yCursor} width={Math.max(0, barW - 2)} height={Math.max(0, h)} fill={s.fill} opacity={hover && !hot ? 0.5 : 1} />
               })}
               {i % Math.ceil(days / 8) === 0 && (
                 <text x={x + barW / 2} y={H - 6} textAnchor="middle" className="fill-zinc-400 dark:fill-zinc-500" fontSize="9">
                   {g.date.slice(5)}
                 </text>
               )}
-              <title>{`${g.date}\n$${g.total.toFixed(2)}\nopus $${g.opus.toFixed(2)} · sonnet $${g.sonnet.toFixed(2)} · haiku $${g.haiku.toFixed(2)}`}</title>
             </g>
           )
         })}
       </svg>
+      {hovered && hover && (
+        <div
+          className="pointer-events-none absolute bg-zinc-900/95 dark:bg-zinc-100/95 text-zinc-50 dark:text-zinc-900 mono text-[11px] rounded px-2 py-1 shadow-lg z-10"
+          style={{ left: Math.min(hover.x + 14, 600), top: Math.max(40, hover.y - 8) }}
+        >
+          <div className="text-[10.5px] opacity-80">{hovered.date}</div>
+          <div className="tabular-nums font-medium">${hovered.total.toFixed(2)}</div>
+          {hovered.opus   > 0 && <div className="tabular-nums">opus ${hovered.opus.toFixed(2)}</div>}
+          {hovered.sonnet > 0 && <div className="tabular-nums">sonnet ${hovered.sonnet.toFixed(2)}</div>}
+          {hovered.haiku  > 0 && <div className="tabular-nums">haiku ${hovered.haiku.toFixed(2)}</div>}
+          {hovered.other  > 0 && <div className="tabular-nums">other ${hovered.other.toFixed(2)}</div>}
+        </div>
+      )}
       <div className="flex items-center gap-3 mt-2 mono text-[10.5px] text-zinc-500 dark:text-zinc-400">
         {(['opus', 'sonnet', 'haiku', 'other'] as const).map((k) => (
           <span key={k} className="inline-flex items-center gap-1">
@@ -2233,14 +2260,230 @@ function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
   )
 }
 
-/// Per-session stacked-bar chart. Same per-day x-axis as UsageChart
-/// but each day's bar splits by session_id instead of model family —
-/// answers "which session is the budget going to" in the chosen window.
-/// Top-K sessions get their own colour, the rest collapse into "other"
-/// so the legend stays readable.
-function UsageBySessionChart({
+interface DonutSlice {
+  key: string
+  label: string
+  value: number
+  color: string
+  meta?: string
+}
+
+/// Reusable donut chart. Hovering a slice highlights it (outer-ring
+/// pop + dimmed siblings) and surfaces a tooltip with the label /
+/// value / share, anchored at the cursor. Pure SVG + a thin
+/// React-state hover model so we keep zero chart-lib deps.
+function Donut({ slices, title, units = '$', subtitle }: {
+  slices: DonutSlice[]
+  title: string
+  units?: string
+  subtitle?: string
+}) {
+  const [hover, setHover] = useState<{ key: string; x: number; y: number } | null>(null)
+  const ref = useRef<SVGSVGElement | null>(null)
+  const total = useMemo(() => slices.reduce((acc, s) => acc + s.value, 0), [slices])
+  // Build arcs. Skip zero slices so the legend isn't littered with
+  // "0.0%" entries from sessions that ran but consumed nothing.
+  const arcs = useMemo(() => {
+    const r = 56, R = 92
+    const cx = 110, cy = 110
+    let a = -Math.PI / 2 // 12-o'clock start
+    return slices.filter((s) => s.value > 0).map((s) => {
+      const frac = s.value / Math.max(1e-9, total)
+      const a2 = a + frac * Math.PI * 2
+      const large = a2 - a > Math.PI ? 1 : 0
+      const sx = cx + R * Math.cos(a),  sy = cy + R * Math.sin(a)
+      const ex = cx + R * Math.cos(a2), ey = cy + R * Math.sin(a2)
+      const sx2 = cx + r * Math.cos(a2), sy2 = cy + r * Math.sin(a2)
+      const ex2 = cx + r * Math.cos(a),  ey2 = cy + r * Math.sin(a)
+      const d = `M ${sx} ${sy} A ${R} ${R} 0 ${large} 1 ${ex} ${ey} L ${sx2} ${sy2} A ${r} ${r} 0 ${large} 0 ${ex2} ${ey2} Z`
+      a = a2
+      return { slice: s, d, frac }
+    })
+  }, [slices, total])
+
+  const hoveredSlice = hover ? slices.find((s) => s.key === hover.key) : null
+  const hoveredFrac = hoveredSlice ? hoveredSlice.value / Math.max(1e-9, total) : 0
+
+  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const r = ref.current?.getBoundingClientRect()
+    if (!r) return
+    setHover((h) => h ? { ...h, x: e.clientX - r.left, y: e.clientY - r.top } : h)
+  }
+
+  return (
+    <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5 relative">
+      <div className="flex items-center mb-3">
+        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">{title}</div>
+        <div className="flex-1" />
+        <div className="mono text-[12px] text-zinc-600 dark:text-zinc-300 tabular-nums">
+          {units}{total.toFixed(2)}{subtitle ? ' · ' + subtitle : ''}
+        </div>
+      </div>
+      <div className="flex items-center gap-6">
+        <svg
+          ref={ref}
+          viewBox="0 0 220 220"
+          className="flex-shrink-0"
+          style={{ width: 220, height: 220 }}
+          onPointerMove={onMove}
+          onPointerLeave={() => setHover(null)}
+        >
+          {arcs.map(({ slice, d }) => {
+            const dim = hover && hover.key !== slice.key ? 0.35 : 1
+            const pop = hover && hover.key === slice.key
+            return (
+              <path
+                key={slice.key}
+                d={d}
+                fill={slice.color}
+                opacity={dim}
+                style={{
+                  transformOrigin: '110px 110px',
+                  transform: pop ? 'scale(1.04)' : 'scale(1)',
+                  transition: 'opacity 80ms linear, transform 80ms ease-out',
+                  cursor: 'pointer',
+                }}
+                onPointerEnter={(e) => {
+                  const r = ref.current?.getBoundingClientRect()
+                  if (!r) return
+                  setHover({ key: slice.key, x: e.clientX - r.left, y: e.clientY - r.top })
+                }}
+              />
+            )
+          })}
+          {/* center label */}
+          <text x={110} y={106} textAnchor="middle" className="fill-zinc-900 dark:fill-zinc-100 mono" fontSize="18">
+            {hoveredSlice ? `${units}${hoveredSlice.value.toFixed(2)}` : `${units}${total.toFixed(2)}`}
+          </text>
+          <text x={110} y={124} textAnchor="middle" className="fill-zinc-500 dark:fill-zinc-400 mono" fontSize="10">
+            {hoveredSlice ? `${(hoveredFrac * 100).toFixed(1)}%` : 'total'}
+          </text>
+        </svg>
+        <div className="flex-1 min-w-0">
+          <div className="grid grid-cols-1 gap-1.5 max-h-[200px] overflow-y-auto pr-2">
+            {slices.filter((s) => s.value > 0).map((s) => {
+              const frac = s.value / Math.max(1e-9, total)
+              const dim = hover && hover.key !== s.key ? 'opacity-50' : ''
+              return (
+                <div
+                  key={s.key}
+                  className={'flex items-center gap-2 text-[11.5px] ' + dim}
+                  onPointerEnter={() => setHover({ key: s.key, x: 0, y: 0 })}
+                  onPointerLeave={() => setHover(null)}
+                >
+                  <span className="inline-block w-2 h-2 rounded-sm flex-shrink-0" style={{ background: s.color }} />
+                  <span className="flex-1 min-w-0 truncate text-zinc-700 dark:text-zinc-300" title={s.meta || s.label}>
+                    {s.label}
+                  </span>
+                  <span className="mono tabular-nums text-zinc-600 dark:text-zinc-300 w-14 text-right">{units}{s.value.toFixed(2)}</span>
+                  <span className="mono tabular-nums text-zinc-400 dark:text-zinc-500 w-10 text-right">{(frac * 100).toFixed(1)}%</span>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      </div>
+      {hoveredSlice && hover && hover.x > 0 && (
+        <div
+          className="pointer-events-none absolute bg-zinc-900/95 dark:bg-zinc-100/95 text-zinc-50 dark:text-zinc-900 mono text-[11px] rounded px-2 py-1 shadow-lg z-10"
+          style={{ left: hover.x + 14, top: hover.y - 8 }}
+        >
+          <div>{hoveredSlice.label}</div>
+          <div className="tabular-nums">{units}{hoveredSlice.value.toFixed(2)} · {(hoveredFrac * 100).toFixed(1)}%</div>
+          {hoveredSlice.meta && <div className="text-[10px] opacity-70">{hoveredSlice.meta}</div>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+const PALETTE_8 = ['#a78bfa','#34d399','#60a5fa','#f59e0b','#ec4899','#22d3ee','#f87171','#84cc16']
+
+/// Donut: spend per session in the window. Top 8 by spend + "other".
+/// Hover surfaces the session id and (if we can match it to a current
+/// job) the issue title + repo.
+function UsageBySessionDonut({
   rows, days, jobs,
 }: { rows: UsageHistoryRow[]; days: number; jobs: Job[] }) {
+  const jobByIssue = useMemo(() => {
+    const m = new Map<number, Job>()
+    for (const j of jobs) m.set(j.issue, j)
+    return m
+  }, [jobs])
+  const slices = useMemo<DonutSlice[]>(() => {
+    const by = new Map<string, { total: number; issue: number }>()
+    for (const r of rows) {
+      const cur = by.get(r.session_id) ?? { total: 0, issue: 0 }
+      cur.total += r.cost_usd
+      if (r.issue) cur.issue = r.issue
+      by.set(r.session_id, cur)
+    }
+    const sorted = Array.from(by.entries()).sort((a, b) => b[1].total - a[1].total)
+    const top = sorted.slice(0, 8)
+    const rest = sorted.slice(8).reduce((acc, [_, v]) => acc + v.total, 0)
+    const out: DonutSlice[] = top.map(([sid, v], i) => {
+      const job = v.issue ? jobByIssue.get(v.issue) : undefined
+      const title = job?.issue_title ?? (v.issue ? `issue #${v.issue}` : sid.slice(0, 8))
+      return {
+        key: sid,
+        label: title,
+        value: v.total,
+        color: PALETTE_8[i],
+        meta: v.issue ? `#${v.issue} · ${job?.target_repo ?? 'closed session'}` : `session ${sid.slice(0, 12)}`,
+      }
+    })
+    if (rest > 0) out.push({ key: '__other__', label: 'other sessions', value: rest, color: '#71717a' })
+    return out
+  }, [rows, jobByIssue])
+  const sessionCount = useMemo(() => new Set(rows.map((r) => r.session_id)).size, [rows])
+  return (
+    <Donut
+      slices={slices}
+      title={`Spend by session · ${days}d`}
+      subtitle={`${sessionCount} sessions`}
+    />
+  )
+}
+
+/// Donut: spend per upstream target repo. Session → issue → repo via
+/// the same job map. Sessions whose issue was already torn down show
+/// as "unknown" so the chart still totals correctly.
+function UsageByRepoDonut({
+  rows, days, jobs,
+}: { rows: UsageHistoryRow[]; days: number; jobs: Job[] }) {
+  const jobByIssue = useMemo(() => {
+    const m = new Map<number, Job>()
+    for (const j of jobs) m.set(j.issue, j)
+    return m
+  }, [jobs])
+  const slices = useMemo<DonutSlice[]>(() => {
+    const by = new Map<string, number>()
+    for (const r of rows) {
+      const job = r.issue ? jobByIssue.get(r.issue) : undefined
+      const repo = job?.target_repo ?? 'unknown'
+      by.set(repo, (by.get(repo) ?? 0) + r.cost_usd)
+    }
+    const sorted = Array.from(by.entries()).sort((a, b) => b[1] - a[1])
+    return sorted.map(([repo, v], i) => ({
+      key: repo,
+      label: repo,
+      value: v,
+      color: repo === 'unknown' ? '#71717a' : PALETTE_8[i % PALETTE_8.length],
+    }))
+  }, [rows, jobByIssue])
+  return (
+    <Donut
+      slices={slices}
+      title={`Spend by repo · ${days}d`}
+      subtitle={`${slices.length} repos`}
+    />
+  )
+}
+
+// Legacy stub kept off to avoid dragging the prior bar implementation
+// along. The donuts above replaced it entirely; callers shouldn't
+// reach this.
+function _legacyUsageBySessionChart({ rows, days, jobs }: { rows: UsageHistoryRow[]; days: number; jobs: Job[] }) {
   type DayBar = { date: string; parts: Record<string, number>; total: number }
   // Resolve session_id → human label from active jobs first, then
   // fall back to a short prefix so closed sessions still render.
@@ -2432,7 +2675,10 @@ function UsageTable({ jobs, quota }: { jobs: Job[]; quota?: State['quota'] }) {
             ))}
           </div>
           <UsageChart rows={history} days={days} />
-          <UsageBySessionChart rows={history} days={days} jobs={jobs} />
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            <UsageBySessionDonut rows={history} days={days} jobs={jobs} />
+            <UsageByRepoDonut    rows={history} days={days} jobs={jobs} />
+          </div>
         </>
       )}
       {quota ? (
