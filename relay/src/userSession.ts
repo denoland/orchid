@@ -256,12 +256,17 @@ export class UserSession {
   // accepted via state.acceptWebSocket. Routes everything through the
   // same handler the old addEventListener path used.
   async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer) {
-    // /_events_ws subscribers are read-only — drop any inbound traffic
-    // so they can't be used as a back-channel into the agent stream.
-    const tags = this.state.getTags(ws)
-    if (tags.includes('events')) return
-    if (this.agentWS == null) this.agentWS = ws
-    this.onAgentMessage({ data } as MessageEvent)
+    try {
+      // /_events_ws subscribers are read-only — drop any inbound
+      // traffic so they can't be used as a back-channel into the
+      // agent stream. Wrapped defensively so an unexpected getTags
+      // failure can't take down the agent WS via CF's
+      // unhandled-error-closes-the-socket behaviour.
+      const tags = this.state.getTags(ws) ?? []
+      if (tags.includes('events')) return
+      if (this.agentWS == null) this.agentWS = ws
+      this.onAgentMessage({ data } as MessageEvent)
+    } catch {}
   }
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean) {
     if (this.agentWS === ws) this.agentWS = null
@@ -406,12 +411,22 @@ export class UserSession {
       // subscribers get the current snapshot, and fan out to every
       // active /_events_ws subscriber. Hibernated WSs survive across
       // DO eviction so this works even after the relay restarts.
+      //
+      // The whole block is wrapped in try/catch — an unhandled throw
+      // inside webSocketMessage causes CF to close the calling WS,
+      // which is the agent socket. A bad sub.send() (zombie client,
+      // 1MiB frame, etc.) would otherwise take down the tunnel.
       if (f.t === 'state-update') {
-        const body = JSON.stringify(f.state ?? {})
-        this.lastState = body
-        for (const sub of this.state.getWebSockets('events')) {
-          try { sub.send(body) } catch {}
-        }
+        try {
+          const body = JSON.stringify(f.state ?? {})
+          // Skip the fanout when the body hasn't actually changed —
+          // saves N sends across all hibernated subs for no-op ticks.
+          if (body === this.lastState) return
+          this.lastState = body
+          for (const sub of this.state.getWebSockets('events')) {
+            try { sub.send(body) } catch {}
+          }
+        } catch {}
         return
       }
       const id = (f as any).id as number | undefined
