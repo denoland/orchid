@@ -3546,6 +3546,12 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			// Keep the previous good snap as .bak before overwriting —
+			// if a buggy client (or future code) clobbers positions, the
+			// most recent prior layout is still recoverable from disk.
+			if prev, err := os.ReadFile(snapPath); err == nil && len(prev) > 0 {
+				_ = os.WriteFile(snapPath+".bak", prev, 0o644)
+			}
 			if err := os.Rename(tmp, snapPath); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return

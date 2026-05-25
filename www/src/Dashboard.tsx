@@ -71,12 +71,16 @@ function normalizeSnap(raw: any): Snap {
     view: raw.view === 'list' ? 'list' : 'canvas',
   }
 }
-async function fetchSnap(): Promise<Snap> {
+/// Fetches the layout snap from orch. Returns `null` on any failure
+/// (network, auth, parse). The caller must NOT treat null as "empty
+/// snap" — that would defeat the persisted layout the first time a
+/// request blips. Use `null` to keep the rebuild effect parked.
+async function fetchSnap(): Promise<Snap | null> {
   try {
     const r = await fetch('/api/snap', { credentials: 'include', cache: 'no-store' })
-    if (!r.ok) return emptySnap()
+    if (!r.ok) return null
     return normalizeSnap(await r.json())
-  } catch { return emptySnap() }
+  } catch { return null }
 }
 // Debounced PUT so rapid drags don't flood the server. Flushed on
 // pagehide/beforeunload via sendBeacon so a refresh mid-debounce never
@@ -329,18 +333,30 @@ function DashboardInner({ state }: Props) {
 
   const persist = useCallback(() => { saveSnap(snapRef.current) }, [])
 
-  // Pull canvas layout from server on first mount. Until it arrives,
-  // render an empty canvas (cards still appear from /api/state polling).
+  // Pull canvas layout from server on first mount. Retry on failure
+  // so a single blippy request (auth race after OAuth, transient 503)
+  // never lets the rebuild effect default-grid the layout and PUT
+  // that clobbering snap back to the server.
   useEffect(() => {
     let alive = true
-    fetchSnap().then((s) => {
-      if (!alive) return
-      snapRef.current = s
-      setEdges(s.edges)
-      setStrokes(s.strokes)
-      if (s.view) setView(s.view)
-      setSnapLoaded(true)
-    })
+    let attempt = 0
+    const load = async () => {
+      while (alive) {
+        const s = await fetchSnap()
+        if (!alive) return
+        if (s) {
+          snapRef.current = s
+          setEdges(s.edges)
+          setStrokes(s.strokes)
+          if (s.view) setView(s.view)
+          setSnapLoaded(true)
+          return
+        }
+        attempt++
+        await new Promise((r) => setTimeout(r, Math.min(8000, 500 * 2 ** attempt)))
+      }
+    }
+    load()
     return () => { alive = false }
   }, [])
 
