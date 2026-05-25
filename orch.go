@@ -4661,15 +4661,17 @@ func handleVMJoin(w http.ResponseWriter, r *http.Request) error {
 		http.Error(w, "patch: "+err.Error(), http.StatusInternalServerError)
 		return err
 	}
+	// Validate before touching disk — hclsimple.DecodeFile picks its
+	// parser by extension, and `.tmp` blows it up. Decode in-memory
+	// so the trial parse uses the real filename's parser.
+	var trial Config
+	if err := hclsimple.Decode(filepath.Base(globalConfigPath), out, nil, &trial); err != nil {
+		http.Error(w, "swarm.hcl invalid after patch: "+err.Error(), http.StatusInternalServerError)
+		return err
+	}
 	tmp := globalConfigPath + ".tmp"
 	if err := os.WriteFile(tmp, out, 0o644); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return err
-	}
-	var trial Config
-	if err := hclsimple.DecodeFile(tmp, nil, &trial); err != nil {
-		_ = os.Remove(tmp)
-		http.Error(w, "swarm.hcl invalid after patch: "+err.Error(), http.StatusInternalServerError)
 		return err
 	}
 	if err := os.Rename(tmp, globalConfigPath); err != nil {
