@@ -135,9 +135,19 @@ app.use('*', async (c, next) => {
   }
 
   // Relay-side meta endpoint the dashboard polls to learn if the user's
-  // orch is online + grab the agent token for the install modal.
+  // orch is online + grab the agent token for the install modal. The
+  // agent token is the secret that lets ANY holder impersonate the
+  // owner's orch on the relay, so /info is owner-only — non-owner
+  // collaborators in allowed_logins get a connectivity-only view.
   if (url.pathname === '/api/_relay/info') {
     const do_ = c.env.USER.get(c.env.USER.idFromName(sub))
+    if (!user || user.subdomain !== sub) {
+      // Hand collaborators the bare connectivity bit they need to render
+      // the "online/offline" pill, never the token.
+      const r = await do_.fetch(new Request('https://internal/_info'))
+      const j = (await r.json()) as { connected?: boolean }
+      return Response.json({ connected: !!j.connected })
+    }
     return do_.fetch(new Request('https://internal/_info'))
   }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -266,6 +267,156 @@ func TestTmuxPasteBufUnique(t *testing.T) {
 			t.Fatalf("unique names: got %d, want %d", got, workers*perWorker)
 		}
 	})
+}
+
+func TestIsPrivateIP(t *testing.T) {
+	cases := []struct {
+		ip   string
+		want bool
+		why  string
+	}{
+		{"127.0.0.1", true, "loopback"},
+		{"::1", true, "loopback v6"},
+		{"10.0.0.1", true, "rfc1918"},
+		{"172.16.0.1", true, "rfc1918"},
+		{"192.168.1.1", true, "rfc1918"},
+		{"169.254.169.254", true, "link-local / cloud IMDS"},
+		{"100.64.0.1", true, "carrier-grade NAT"},
+		{"100.127.255.254", true, "carrier-grade NAT upper"},
+		{"0.0.0.0", true, "unspecified"},
+		{"255.255.255.255", true, "broadcast"},
+		{"224.0.0.1", true, "multicast"},
+		{"fe80::1", true, "link-local v6"},
+		{"ff02::1", true, "multicast v6"},
+		{"8.8.8.8", false, "public dns"},
+		{"1.1.1.1", false, "public dns"},
+		{"100.63.255.255", false, "just below CGNAT range"},
+		{"100.128.0.0", false, "just above CGNAT range"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.ip+"/"+tc.why, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("ParseIP(%q) returned nil", tc.ip)
+			}
+			got := isPrivateIP(ip)
+			if got != tc.want {
+				t.Errorf("isPrivateIP(%q): got %v, want %v (%s)", tc.ip, got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+func TestIsPrivateHost(t *testing.T) {
+	cases := []struct {
+		host string
+		want bool
+	}{
+		{"", true},
+		{"localhost", true},
+		{"127.0.0.1", true},
+		{"169.254.169.254", true},
+		{"10.0.0.1", true},
+		// public DNS resolution would be flaky in a sandbox, so the
+		// non-private side of the table is covered indirectly by
+		// TestIsPrivateIP. We assert the bypass attempts we know don't
+		// need DNS.
+	}
+	for _, tc := range cases {
+		t.Run(tc.host, func(t *testing.T) {
+			got := isPrivateHost(tc.host)
+			if got != tc.want {
+				t.Errorf("isPrivateHost(%q): got %v, want %v", tc.host, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveDraftTargetEnforcesAllowList pins down the rule that a Draft
+// can only target the configured default repo OR a repo explicitly listed
+// in capture.allowed_repos. Any other request-supplied repo is rejected
+// so a leaked capture token can't be turned into "spam any repo this PAT
+// can write to".
+func TestResolveDraftTargetEnforcesAllowList(t *testing.T) {
+	cfg := &Config{
+		GitHub: GitHubBlock{InboxRepo: "owner/inbox"},
+		Orch: OrchBlock{
+			Capture: &CaptureBlock{
+				DefaultRepo:  "owner/default",
+				AllowedRepos: []string{"owner/extra"},
+			},
+		},
+	}
+
+	t.Run("no target uses default", func(t *testing.T) {
+		repo, _, err := resolveDraftTarget(cfg, &DraftPayload{})
+		if err != nil {
+			t.Fatalf("unexpected: %v", err)
+		}
+		if repo != "owner/default" {
+			t.Errorf("repo: got %q, want %q", repo, "owner/default")
+		}
+	})
+
+	t.Run("explicit allow-listed target", func(t *testing.T) {
+		repo, _, err := resolveDraftTarget(cfg, &DraftPayload{Target: &DraftTarget{Repo: "owner/extra"}})
+		if err != nil {
+			t.Fatalf("unexpected: %v", err)
+		}
+		if repo != "owner/extra" {
+			t.Errorf("repo: got %q, want %q", repo, "owner/extra")
+		}
+	})
+
+	t.Run("explicit default still allowed", func(t *testing.T) {
+		_, _, err := resolveDraftTarget(cfg, &DraftPayload{Target: &DraftTarget{Repo: "owner/default"}})
+		if err != nil {
+			t.Fatalf("unexpected: %v", err)
+		}
+	})
+
+	t.Run("rejects unlisted repo", func(t *testing.T) {
+		_, _, err := resolveDraftTarget(cfg, &DraftPayload{Target: &DraftTarget{Repo: "attacker/private"}})
+		if err == nil {
+			t.Fatal("expected error for unlisted repo, got nil")
+		}
+	})
+
+	t.Run("strips flag-shaped labels", func(t *testing.T) {
+		_, labels, err := resolveDraftTarget(cfg, &DraftPayload{Target: &DraftTarget{
+			Repo:   "owner/extra",
+			Labels: []string{"good", "--repo=attacker/repo", "-x", " "},
+		}})
+		if err != nil {
+			t.Fatalf("unexpected: %v", err)
+		}
+		if len(labels) != 1 || labels[0] != "good" {
+			t.Errorf("labels: got %+v, want [good]", labels)
+		}
+	})
+}
+
+// TestValidRepoRejectsArgvInjection ensures the regex used to gate
+// `gh issue create --repo <repo>` doesn't admit values that could break
+// out into an extra argv element or carry shell metacharacters.
+func TestValidRepoRejectsArgvInjection(t *testing.T) {
+	good := []string{"denoland/orchid", "user/repo-name", "x.y/z_1", "ORG/REPO"}
+	for _, r := range good {
+		if !validRepo.MatchString(r) {
+			t.Errorf("validRepo rejected good value %q", r)
+		}
+	}
+	bad := []string{
+		"", "noslash", "/leading", "trailing/", "owner//repo",
+		"owner/repo extra", "owner/repo;rm -rf /", "owner/repo\nattack",
+		"-foo/repo", "owner/--repo", "owner/repo/extra",
+		"a b/c", "owner/repo\x00x",
+	}
+	for _, r := range bad {
+		if validRepo.MatchString(r) {
+			t.Errorf("validRepo accepted bad value %q", r)
+		}
+	}
 }
 
 func TestIncludePatternMatches(t *testing.T) {
