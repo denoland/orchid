@@ -3903,6 +3903,28 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		}
 	}))
 
+	// GET /api/usage_history?days=30 — daily Claude spend + token
+	// breakdown sourced from the per-conversation jsonl files. Rows
+	// are returned at session×model granularity; the dashboard
+	// aggregates client-side so the same payload powers day/week/
+	// month rollups and per-session drill-ins.
+	mux.HandleFunc("/api/usage_history", auth(func(w http.ResponseWriter, r *http.Request) {
+		days := atoiClamp(r.URL.Query().Get("days"), 30, 1, 365)
+		since := time.Now().UTC().AddDate(0, 0, -days).Format("2006-01-02")
+		rows, err := st.store.LoadUsageHistory(since)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"since": since,
+			"days":  days,
+			"rows":  rows,
+		})
+	}))
+
 	// GET /api/og?url=... — fetch a remote page and pull its OpenGraph
 	// metadata (og:image, og:title, og:description). Used by the canvas to
 	// render rich link cards. Has a hard 6s timeout + 1MB read limit + an
@@ -4932,6 +4954,18 @@ func main() {
 	for i := range cfg.VMs {
 		vm := cfg.VMs[i]
 		go tailStatusLine(context.Background(), vm, st.Bcast)
+	}
+
+	// History scanner: walks ~/.claude/projects/**/*.jsonl on every VM
+	// and aggregates per-day tokens + cost into the usage_daily table.
+	// Backfills on startup, then incrementally re-reads tail bytes of
+	// modified files. Drives the Usage tab's charts.
+	for i := range cfg.VMs {
+		vm := cfg.VMs[i]
+		if !isLocal(vm) {
+			continue // remote VMs need ssh-side scanning; defer to a later pass
+		}
+		go runUsageScanLoop(context.Background(), projectsRootFor(vm), st.store, 5*time.Minute)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

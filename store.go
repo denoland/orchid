@@ -58,7 +58,19 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE TABLE IF NOT EXISTS kv (
   key   TEXT PRIMARY KEY,
   value BLOB NOT NULL
-);`); err != nil {
+);
+CREATE TABLE IF NOT EXISTS usage_daily (
+  date           TEXT NOT NULL,
+  session_id     TEXT NOT NULL,
+  model          TEXT NOT NULL,
+  input_tokens   INTEGER NOT NULL DEFAULT 0,
+  cache_creation INTEGER NOT NULL DEFAULT 0,
+  cache_read     INTEGER NOT NULL DEFAULT 0,
+  output_tokens  INTEGER NOT NULL DEFAULT 0,
+  cost_usd       REAL    NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, session_id, model)
+);
+CREATE INDEX IF NOT EXISTS usage_daily_date ON usage_daily(date);`); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -232,6 +244,61 @@ func (s *Store) PutKV(key string, value []byte) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// UpsertUsageDaily writes one row per (date, session_id, model). The
+// scanner replays jsonl files idempotently — same input always yields
+// the same total — so ON CONFLICT REPLACE is safe and lets us re-scan
+// without dedupe bookkeeping.
+func (s *Store) UpsertUsageDaily(date, sessionID, model string, inputT, cacheCreate, cacheRead, outputT int64, costUSD float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO usage_daily (date, session_id, model, input_tokens, cache_creation, cache_read, output_tokens, cost_usd)
+		VALUES (?,?,?,?,?,?,?,?)
+		ON CONFLICT(date, session_id, model) DO UPDATE SET
+			input_tokens   = excluded.input_tokens,
+			cache_creation = excluded.cache_creation,
+			cache_read     = excluded.cache_read,
+			output_tokens  = excluded.output_tokens,
+			cost_usd       = excluded.cost_usd`,
+		date, sessionID, model, inputT, cacheCreate, cacheRead, outputT, costUSD)
+	return err
+}
+
+// UsageDailyRow is one bucket from the table — per session × model × day.
+type UsageDailyRow struct {
+	Date          string  `json:"date"`
+	SessionID     string  `json:"session_id"`
+	Model         string  `json:"model"`
+	InputTokens   int64   `json:"input_tokens"`
+	CacheCreation int64   `json:"cache_creation"`
+	CacheRead     int64   `json:"cache_read"`
+	OutputTokens  int64   `json:"output_tokens"`
+	CostUSD       float64 `json:"cost_usd"`
+}
+
+// LoadUsageHistory returns all rows on or after `sinceDate` (YYYY-MM-DD
+// UTC). Caller aggregates client-side; rows stay normalised so the
+// dashboard can render per-day totals, per-model splits, and
+// per-session drill-ins from the same payload.
+func (s *Store) LoadUsageHistory(sinceDate string) ([]UsageDailyRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT date, session_id, model, input_tokens, cache_creation, cache_read, output_tokens, cost_usd
+		FROM usage_daily WHERE date >= ? ORDER BY date ASC`, sinceDate)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UsageDailyRow
+	for rows.Next() {
+		var r UsageDailyRow
+		if err := rows.Scan(&r.Date, &r.SessionID, &r.Model, &r.InputTokens, &r.CacheCreation, &r.CacheRead, &r.OutputTokens, &r.CostUSD); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) GetSnap() ([]byte, error) {
