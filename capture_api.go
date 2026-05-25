@@ -18,6 +18,7 @@ package main
 //     issue level is the GitHub layer's problem, not ours yet)
 
 import (
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -25,9 +26,18 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// validRepo recognizes a GitHub "owner/repo" name (the only thing we hand
+// to `gh issue create --repo`). Restricting clients to this shape closes
+// a slim argv-injection vector if `gh` ever grew double-dash-parsing for
+// the --repo value, and rejects obvious garbage like "../../../etc" early.
+// Each segment must start with an alphanumeric to keep "-foo/repo" (which
+// looks like a flag) and other dash-led shapes out.
+var validRepo = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
 
 // DraftPayload mirrors capture/DRAFT_PAYLOAD.md.
 type DraftPayload struct {
@@ -106,15 +116,23 @@ func captureAssetsDir(cfg *Config) (string, error) {
 func registerCaptureRoutes(mux *http.ServeMux, cfg *Config) {
 	cap := cfg.Orch.Capture
 
+	// Capture token is the only auth on this endpoint. Constant-time compare
+	// so an attacker can't probe its value byte-by-byte via response timing.
+	expectToken := []byte(cap.AuthToken)
 	mux.HandleFunc("/api/drafts", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		// Cheap CORS so the macOS app + a hypothetical web composer can hit
-		// this from anywhere. Token auth still gates access.
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		if got := r.Header.Get("X-Capture-Token"); got != cap.AuthToken {
+		// CORS removed: the macOS/iOS clients are native and do not need
+		// the preflight allowance, and the previous `Allow-Origin: *`
+		// invited any browser script that obtained the token (e.g. via
+		// an XSS in a third-party app reading the macOS keychain export)
+		// to file issues with it. If a future web composer ever needs
+		// access, set an explicit, restrictive allowlist here.
+		got := r.Header.Get("X-Capture-Token")
+		if len(expectToken) == 0 ||
+			subtle.ConstantTimeCompare([]byte(got), expectToken) != 1 {
 			http.Error(w, "bad token", http.StatusUnauthorized)
 			return
 		}
@@ -142,6 +160,18 @@ func registerCaptureRoutes(mux *http.ServeMux, cfg *Config) {
 			return
 		}
 
+		// Resolve target BEFORE writing the asset so a bad request doesn't
+		// leave files behind on disk.
+		repo, labels, terr := resolveDraftTarget(cfg, &d)
+		if terr != nil {
+			http.Error(w, terr.Error(), http.StatusForbidden)
+			return
+		}
+		if !validRepo.MatchString(repo) {
+			http.Error(w, "bad repo: "+repo, http.StatusBadRequest)
+			return
+		}
+
 		assetPath, assetURL, err := persistDraftAsset(cfg, &d)
 		if err != nil {
 			http.Error(w, "asset write: "+err.Error(), http.StatusInternalServerError)
@@ -149,8 +179,10 @@ func registerCaptureRoutes(mux *http.ServeMux, cfg *Config) {
 		}
 
 		title, issueBody := renderDraftIssue(&d, assetURL, assetPath)
-		repo, labels := resolveDraftTarget(cfg, &d)
 
+		// `--` after the flag block so a future gh release that adopts a
+		// new option can't be tricked into consuming a label value as a
+		// flag. (Belt + suspenders alongside validRepo.)
 		args := []string{"issue", "create", "--repo", repo, "--title", title, "--body", issueBody}
 		for _, l := range labels {
 			args = append(args, "--label", l)
@@ -182,8 +214,14 @@ func registerCaptureRoutes(mux *http.ServeMux, cfg *Config) {
 			return
 		}
 		name := strings.TrimPrefix(r.URL.Path, "/captures/")
-		// Defense in depth: reject any path that tries to climb out.
-		if name == "" || strings.Contains(name, "..") || strings.ContainsRune(name, '/') {
+		// Defense in depth: reject any path that tries to climb out, points
+		// at a dotfile (.htaccess, .ssh-style hidden state), or carries a
+		// path separator / NUL / control char.
+		if name == "" || strings.HasPrefix(name, ".") ||
+			strings.Contains(name, "..") ||
+			strings.ContainsRune(name, '/') ||
+			strings.ContainsRune(name, '\\') ||
+			strings.ContainsRune(name, 0) {
 			http.Error(w, "bad name", http.StatusBadRequest)
 			return
 		}
@@ -349,23 +387,51 @@ func renderDraftIssue(d *DraftPayload, assetURL, assetPath string) (string, stri
 	return title, b.String()
 }
 
-func resolveDraftTarget(cfg *Config, d *DraftPayload) (string, []string) {
-	repo := ""
+// resolveDraftTarget resolves the (repo, labels) the draft should land on
+// and refuses request-supplied targets that fall outside the configured
+// allow-list. The capture token grants the bearer the use of orch's
+// GH_TOKEN, which is typically broadly scoped — allowing arbitrary repo
+// targets would let a leaked capture token spam any repo the PAT can
+// write to. By default, only `default_repo` (or `inbox_repo`) is allowed;
+// operators opt other repos in via `capture.allowed_repos`.
+func resolveDraftTarget(cfg *Config, d *DraftPayload) (string, []string, error) {
+	defaultRepo := cfg.Orch.Capture.DefaultRepo
+	if defaultRepo == "" {
+		defaultRepo = cfg.GitHub.InboxRepo
+	}
 	var labels []string
+	repo := ""
 	if d.Target != nil {
-		repo = d.Target.Repo
-		labels = append([]string(nil), d.Target.Labels...)
+		repo = strings.TrimSpace(d.Target.Repo)
+		// Defensive copy + filter so a client can't smuggle in flag-shaped
+		// labels (e.g. "--repo other/repo"). gh accepts labels via
+		// `--label name`, so a value starting with `-` is never legitimate.
+		for _, l := range d.Target.Labels {
+			l = strings.TrimSpace(l)
+			if l == "" || strings.HasPrefix(l, "-") {
+				continue
+			}
+			labels = append(labels, l)
+		}
 	}
 	if repo == "" {
-		repo = cfg.Orch.Capture.DefaultRepo
-	}
-	if repo == "" {
-		repo = cfg.GitHub.InboxRepo
+		repo = defaultRepo
+	} else if repo != defaultRepo {
+		ok := false
+		for _, allowed := range cfg.Orch.Capture.AllowedRepos {
+			if repo == allowed {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return "", nil, fmt.Errorf("repo %q not in capture.allowed_repos", repo)
+		}
 	}
 	if len(labels) == 0 {
 		labels = append(labels, cfg.Orch.Capture.DefaultLabels...)
 	}
-	return repo, labels
+	return repo, labels, nil
 }
 
 func firstLine(s string) string {

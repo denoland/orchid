@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"log"
@@ -124,6 +127,14 @@ type OrchBlock struct {
 
 // CaptureBlock configures the /api/drafts endpoint that the Orchid Capture
 // macOS / iOS apps post to. When unset, the endpoint is disabled.
+//
+// Security note: the capture token is one secret that grants the bearer the
+// ability to file GitHub issues using the orchestrator's GH_TOKEN, which
+// is typically a broadly-scoped PAT. By default, drafts are filed against
+// DefaultRepo (or the inbox repo if unset). If you want clients to target
+// other repos via DraftPayload.Target.Repo, list them in AllowedRepos —
+// otherwise the handler rejects custom targets so a leaked capture token
+// can't be turned into "spam any repo this PAT can write to".
 type CaptureBlock struct {
 	AuthToken     string   `hcl:"auth_token" json:"auth_token"`
 	AssetsDir     string   `hcl:"assets_dir,optional" json:"assets_dir,omitempty"`
@@ -131,6 +142,11 @@ type CaptureBlock struct {
 	DefaultRepo   string   `hcl:"default_repo,optional" json:"default_repo,omitempty"`
 	DefaultLabels []string `hcl:"default_labels,optional" json:"default_labels,omitempty"`
 	MaxBodyMB     int      `hcl:"max_body_mb,optional" json:"max_body_mb,omitempty"`
+	// AllowedRepos lists every repo a Draft may explicitly target via
+	// `target.repo`. The default_repo / inbox_repo are always implicitly
+	// allowed. When unset (the safe default), clients cannot override the
+	// target — they get the default.
+	AllowedRepos []string `hcl:"allowed_repos,optional" json:"allowed_repos,omitempty"`
 }
 
 // MentionsBlock configures the cross-repo mention watcher. When set, orch
@@ -350,11 +366,49 @@ func stampUserID(data []byte, id string) []byte {
 	return out
 }
 
+// isPrivateIP returns true for any address family we never want to talk
+// to from a server-side fetcher: loopback, RFC1918, link-local, multicast,
+// unspecified, and the IPv4-broadcast literal. Cheap enumeration of the
+// "should never leave the host" set so isPrivateHost and the dial-time
+// guard share one definition.
+func isPrivateIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
+		ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip.Equal(net.IPv4bcast) {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		// 100.64.0.0/10 (carrier-grade NAT)
+		if v4[0] == 100 && v4[1]&0xc0 == 64 {
+			return true
+		}
+		// 169.254.0.0/16 covered by IsLinkLocalUnicast, but also block the
+		// AWS/GCP IMDS magic addresses explicitly in case future Go editions
+		// classify them differently.
+		if v4[0] == 169 && v4[1] == 254 {
+			return true
+		}
+	}
+	return false
+}
+
 // isPrivateHost blocks SSRF-prone destinations for the /api/og fetcher.
-// Resolves the host so DNS rebinding tricks land on the same guard.
+// First-line check at URL-parse time. The real enforcement happens at
+// dial time inside safeSSRFTransport — this is just a fast-fail so an
+// obviously-internal host never opens a socket at all.
 func isPrivateHost(host string) bool {
 	if host == "" || host == "localhost" {
 		return true
+	}
+	// Literal IP in the URL — judge directly.
+	if ip := net.ParseIP(host); ip != nil {
+		return isPrivateIP(ip)
 	}
 	ips, err := net.LookupIP(host)
 	if err != nil {
@@ -362,11 +416,50 @@ func isPrivateHost(host string) bool {
 		return true
 	}
 	for _, ip := range ips {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		if isPrivateIP(ip) {
 			return true
 		}
 	}
 	return false
+}
+
+// errBlockedDestination signals that the dial guard refused to connect to
+// an address it considers unsafe (SSRF target).
+var errBlockedDestination = errors.New("destination blocked: private/loopback IP")
+
+// safeSSRFTransport returns an http.Transport whose dial resolves the
+// host itself and rejects any private IP at connect time. This closes
+// the lookup-then-dial TOCTOU that isPrivateHost alone can't (DNS
+// rebinding: name first resolves to a public IP that passes the guard,
+// then re-resolves to 127.0.0.1 when the HTTP client actually dials).
+// Every redirect re-enters the dialer, so the guard is enforced uniformly
+// across the chain.
+func safeSSRFTransport() *http.Transport {
+	d := &net.Dialer{Timeout: 5 * time.Second}
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			for _, ip := range ips {
+				if isPrivateIP(ip.IP) {
+					return nil, errBlockedDestination
+				}
+			}
+			// Pin to the first non-private IP we resolved so the kernel
+			// can't re-resolve to something else after our check passes.
+			return d.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		},
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 6 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+		MaxIdleConns:          4,
+	}
 }
 
 var (
@@ -2881,7 +2974,19 @@ func describe(cfg *Config, st *State, hostname string) string {
 
 func renderLogin(w http.ResponseWriter, next, errMsg string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// CSP locks the login page to its own inline <style> and forbids any
+	// script or framing — a defence-in-depth shield against any future
+	// reflected-content bug on this template.
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.WriteHeader(http.StatusUnauthorized)
+	// Both `next` (came from the URL query / form field) and `errMsg`
+	// (constant in practice today, but future-proof anyway) flow into
+	// HTML attribute / element content. Escape with html.EscapeString
+	// — fmt.Sprintf's %q is Go-syntax, NOT HTML-safe, and previously
+	// allowed `next=" autofocus=" onfocus="…"` style attribute-injection.
 	fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset=utf-8>
 <title>orchid — sign in</title>
 <style>
@@ -2896,23 +3001,72 @@ button:hover{background:#0860ca}
 <form method=POST action=/login>
 <h2>orchid</h2>
 %s
-<input type=hidden name=next value=%q>
+<input type=hidden name=next value="%s">
 <input type=password name=token placeholder="token" autofocus>
 <button type=submit>Sign in</button>
 </form></body></html>`,
 		func() string {
 			if errMsg != "" {
-				return `<div class="err">` + errMsg + `</div>`
+				return `<div class="err">` + html.EscapeString(errMsg) + `</div>`
 			}
 			return ""
 		}(),
-		next)
+		html.EscapeString(next))
 }
 
 func httpHandler(cfg *Config, st *State) http.Handler {
 	secret := cfg.Orch.HTTPSecret
+	secretBytes := []byte(secret)
 
 	const cookieName = "orchid_token"
+
+	// secretMatches is a constant-time string compare against the configured
+	// http_secret. Empty secret never matches — caller must short-circuit on
+	// secret == "" instead.
+	secretMatches := func(tok string) bool {
+		if tok == "" {
+			return false
+		}
+		return subtle.ConstantTimeCompare([]byte(tok), secretBytes) == 1
+	}
+
+	// safeRedirectPath validates a `next=` redirect target so a crafted URL
+	// can't bounce the user off-host. Only same-origin paths (must start with
+	// a single "/", must not start with "//" which is a protocol-relative
+	// URL, must not contain control chars) survive; everything else falls
+	// back to "/".
+	safeRedirectPath := func(dest string) string {
+		if dest == "" || !strings.HasPrefix(dest, "/") || strings.HasPrefix(dest, "//") {
+			return "/"
+		}
+		for _, c := range dest {
+			if c < 0x20 || c == 0x7f {
+				return "/"
+			}
+		}
+		return dest
+	}
+
+	// behindTLS reports whether the proxy that forwarded the request is
+	// using TLS. Direct connections set r.TLS; the Cloudflare relay agent
+	// strips TLS but a future fronting proxy can advertise via the
+	// X-Forwarded-Proto header. We only flip Secure on cookies when we're
+	// sure — local-only operators on plain http would otherwise lose their
+	// session every request.
+	behindTLS := func(r *http.Request) bool {
+		if r.TLS != nil {
+			return true
+		}
+		return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	}
+
+	makeSessionCookie := func(r *http.Request) *http.Cookie {
+		return &http.Cookie{
+			Name: cookieName, Value: secret,
+			Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
+			Secure: behindTLS(r),
+		}
+	}
 
 	auth := func(next http.HandlerFunc) http.HandlerFunc {
 		if secret == "" {
@@ -2930,15 +3084,12 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 					tok = c.Value
 				}
 			}
-			if tok != secret {
-				renderLogin(w, r.URL.RequestURI(), "")
+			if !secretMatches(tok) {
+				renderLogin(w, safeRedirectPath(r.URL.RequestURI()), "")
 				return
 			}
 			if r.URL.Query().Get("token") != "" {
-				http.SetCookie(w, &http.Cookie{
-					Name: cookieName, Value: secret,
-					Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
-				})
+				http.SetCookie(w, makeSessionCookie(r))
 				q := r.URL.Query()
 				q.Del("token")
 				r.URL.RawQuery = q.Encode()
@@ -2958,18 +3109,11 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				return
 			}
 			_ = r.ParseForm()
-			if r.FormValue("token") == secret {
-				http.SetCookie(w, &http.Cookie{
-					Name: cookieName, Value: secret,
-					Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
-				})
-				dest := r.FormValue("next")
-				if dest == "" {
-					dest = "/"
-				}
-				http.Redirect(w, r, dest, http.StatusSeeOther)
+			if secretMatches(r.FormValue("token")) {
+				http.SetCookie(w, makeSessionCookie(r))
+				http.Redirect(w, r, safeRedirectPath(r.FormValue("next")), http.StatusSeeOther)
 			} else {
-				renderLogin(w, r.FormValue("next"), "invalid token")
+				renderLogin(w, safeRedirectPath(r.FormValue("next")), "invalid token")
 			}
 		})
 	}
@@ -3248,7 +3392,10 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 	// GET /api/og?url=... — fetch a remote page and pull its OpenGraph
 	// metadata (og:image, og:title, og:description). Used by the canvas to
 	// render rich link cards. Has a hard 6s timeout + 1MB read limit + an
-	// SSRF guard that blocks loopback / RFC1918 / link-local destinations.
+	// SSRF guard that blocks loopback / RFC1918 / link-local destinations
+	// both at URL-parse time and at the actual dial (close DNS-rebinding
+	// TOCTOU). Only http(s) URLs accepted — no file://, ftp://, gopher:// etc.
+	ogTransport := safeSSRFTransport()
 	mux.HandleFunc("/api/og", auth(func(w http.ResponseWriter, r *http.Request) {
 		raw := r.URL.Query().Get("url")
 		if raw == "" {
@@ -3256,8 +3403,14 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			return
 		}
 		u, err := url.Parse(raw)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			http.Error(w, "bad url", http.StatusBadRequest)
+			return
+		}
+		// Reject URLs with embedded userinfo (https://user:pass@host/) —
+		// the credentials would leak to a third-party host if redirected.
+		if u.User != nil {
+			http.Error(w, "userinfo in url not allowed", http.StatusBadRequest)
 			return
 		}
 		if isPrivateHost(u.Hostname()) {
@@ -3270,10 +3423,16 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		req.Header.Set("User-Agent", "OrchidLinkBot/1.0 (+orchid)")
 		req.Header.Set("Accept", "text/html,application/xhtml+xml")
 		client := &http.Client{
-			Timeout: 6 * time.Second,
+			Transport: ogTransport,
+			Timeout:   6 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) > 5 {
 					return fmt.Errorf("too many redirects")
+				}
+				// Re-validate scheme on every hop: a 30x to file:// or
+				// javascript:// would otherwise sneak past the entry check.
+				if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+					return fmt.Errorf("redirect to non-http scheme blocked")
 				}
 				if isPrivateHost(req.URL.Hostname()) {
 					return fmt.Errorf("redirect to private host blocked")
@@ -3446,7 +3605,10 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				return
 			}
 			tmp := path + ".tmp"
-			if err := os.WriteFile(tmp, out, 0o644); err != nil {
+			// 0o600 — swarm.hcl carries http_secret, capture.auth_token,
+			// and any per-VM credentials the operator wired in. World-
+			// readable is a needless leak to anyone with shell on the box.
+			if err := os.WriteFile(tmp, out, 0o600); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -3512,7 +3674,24 @@ func runJoin(args []string) {
 		fmt.Fprintln(os.Stderr, "usage: orch join <relay-url> <relay-token>")
 		os.Exit(2)
 	}
-	url, token := args[0], args[1]
+	relayArg, token := args[0], args[1]
+	// Reject anything that could break out of the `KEY=VALUE` line in the
+	// systemd EnvironmentFile or smuggle additional vars. Newlines and NULs
+	// are the obvious attack; control chars are gratuitous and never
+	// legitimate in either a URL or a token.
+	for _, c := range relayArg + token {
+		if c == '\n' || c == '\r' || c == 0 || c < 0x20 || c == 0x7f {
+			fmt.Fprintln(os.Stderr, "orch join: url/token contains control characters")
+			os.Exit(2)
+		}
+	}
+	// Validate URL shape so a typo doesn't quietly point the agent at an
+	// attacker-controlled origin. wss:// in prod, ws:// only for dev.
+	u, perr := url.Parse(relayArg)
+	if perr != nil || (u.Scheme != "wss" && u.Scheme != "ws") || u.Host == "" {
+		fmt.Fprintf(os.Stderr, "orch join: bad relay url (expect wss://host/path): %v\n", perr)
+		os.Exit(2)
+	}
 	envPath := os.Getenv("ORCHID_ENV_FILE")
 	if envPath == "" {
 		envPath = "/root/orch/env"
@@ -3529,7 +3708,7 @@ func runJoin(args []string) {
 			}
 		}
 	}
-	keep = append(keep, "RELAY_URL="+url, "RELAY_TOKEN="+token)
+	keep = append(keep, "RELAY_URL="+relayArg, "RELAY_TOKEN="+token)
 	if err := os.WriteFile(envPath, []byte(strings.Join(keep, "\n")+"\n"), 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s: %v\n", envPath, err)
 		os.Exit(1)
@@ -3543,7 +3722,7 @@ func runJoin(args []string) {
 		fmt.Fprintf(os.Stderr, "systemctl restart: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("orch: joined " + url)
+	fmt.Println("orch: joined " + relayArg)
 }
 
 func main() {
@@ -3608,6 +3787,17 @@ func main() {
 		cfg.GitHub.InboxRepo, strings.Join(tnames, ","), len(cfg.VMs), interval, len(st.Jobs))
 
 	if cfg.Orch.HTTPAddr != "" {
+		// The http_secret gates every dashboard endpoint and is the only
+		// barrier between the public internet (when relay-fronted) and
+		// arbitrary tmux paste / config rewrites. A short, guessable
+		// secret means everyone on the network owns this orchestrator.
+		// install.sh ships 16-byte hex; warn loudly if the operator
+		// reduced it.
+		if s := cfg.Orch.HTTPSecret; s == "" {
+			log.Printf("SECURITY: orchestrator.http_secret is empty — dashboard is OPEN to anyone who can reach %s. Set http_secret to a 32+ char random string (openssl rand -hex 32).", cfg.Orch.HTTPAddr)
+		} else if len(s) < 16 {
+			log.Printf("SECURITY: orchestrator.http_secret is only %d chars — trivially brute-forceable. Replace with at least 32 hex chars (openssl rand -hex 32).", len(s))
+		}
 		go func() {
 			log.Printf("http ui on http://%s/", cfg.Orch.HTTPAddr)
 			if err := http.ListenAndServe(cfg.Orch.HTTPAddr, httpHandler(&cfg, st)); err != nil {

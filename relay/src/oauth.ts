@@ -19,6 +19,13 @@ interface Session {
 }
 
 const COOKIE = 'orchid_session'
+// Short-lived cookie that binds an in-flight OAuth state to the browser
+// that started the flow. Defends against login-CSRF: an attacker who
+// initiates /login can obtain a state value, but without the matching
+// `orchid_oauth_state` cookie on the victim's browser, the callback will
+// not accept a stolen authorization code submitted from the victim's
+// session. Cleared by handleOAuthCallback on completion.
+const STATE_COOKIE = 'orchid_oauth_state'
 
 function callbackURL(req: Request): string {
   // Use the request's origin so localhost dev round-trips through the
@@ -27,9 +34,31 @@ function callbackURL(req: Request): string {
   return `${u.protocol}//${u.host}/oauth/callback`
 }
 
+// Reject `next=` redirects that aren't same-origin paths. Without this,
+// attackers can craft /login?next=//evil.com/ to bounce a freshly
+// authenticated user off to a phishing site that mimics the relay.
+function safeNext(raw: string | null): string {
+  if (!raw || !raw.startsWith('/') || raw.startsWith('//')) return '/dashboard'
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw.charCodeAt(i)
+    if (c < 0x20 || c === 0x7f) return '/dashboard'
+  }
+  return raw
+}
+
+// Constant-time equality for two equal-length strings. Returns false when
+// the lengths differ so length-based timing leaks are absorbed by the
+// caller (we compare equal-length hex/base64 tokens in practice).
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
 export async function handleLogin(env: Env, req: Request): Promise<Response> {
   const state = crypto.randomUUID()
-  const next = new URL(req.url).searchParams.get('next') ?? '/dashboard'
+  const next = safeNext(new URL(req.url).searchParams.get('next'))
   await env.OAUTH.put(`state:${state}`, JSON.stringify({ next }), { expirationTtl: 600 })
 
   const callback = callbackURL(req)
@@ -38,7 +67,11 @@ export async function handleLogin(env: Env, req: Request): Promise<Response> {
   url.searchParams.set('redirect_uri', callback)
   url.searchParams.set('scope', 'read:user user:email')
   url.searchParams.set('state', state)
-  return Response.redirect(url.toString(), 302)
+  const headers = new Headers()
+  headers.set('set-cookie',
+    `${STATE_COOKIE}=${state}; Domain=.${env.ROOT_DOMAIN}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`)
+  headers.set('location', url.toString())
+  return new Response(null, { status: 302, headers })
 }
 
 export async function handleOAuthCallback(env: Env, req: Request): Promise<Response> {
@@ -47,10 +80,21 @@ export async function handleOAuthCallback(env: Env, req: Request): Promise<Respo
   const state = url.searchParams.get('state')
   if (!code || !state) return new Response('missing code/state', { status: 400 })
 
+  // Bind the OAuth state to the browser that began the flow. Without
+  // this, an attacker can prime KV with a state and trick the victim
+  // into completing the callback, ending up signed in as the attacker's
+  // GitHub account (login-CSRF). With the cookie binding, the callback
+  // only completes for the original requester.
+  const cookieState = readCookie(req, STATE_COOKIE)
+  if (!cookieState || !constantTimeEqual(cookieState, state)) {
+    return new Response('state mismatch', { status: 400 })
+  }
+
   const stateRow = await env.OAUTH.get(`state:${state}`)
   if (!stateRow) return new Response('invalid state', { status: 400 })
   await env.OAUTH.delete(`state:${state}`)
-  const { next } = JSON.parse(stateRow) as { next: string }
+  const { next: rawNext } = JSON.parse(stateRow) as { next: string }
+  const next = safeNext(rawNext)
 
   // Exchange code → access token.
   const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
@@ -96,13 +140,17 @@ export async function handleOAuthCallback(env: Env, req: Request): Promise<Respo
 
   const cookie = await signSession(env.SESSION_KEY, session)
   const headers = new Headers()
-  headers.set('set-cookie',
+  headers.append('set-cookie',
     `${COOKIE}=${cookie}; Domain=.${env.ROOT_DOMAIN}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`)
+  // Burn the one-shot state cookie — it's no longer useful and would
+  // linger as an idle target for the next CSRF attempt.
+  headers.append('set-cookie',
+    `${STATE_COOKIE}=; Domain=.${env.ROOT_DOMAIN}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`)
   headers.set('location', next)
   return new Response(null, { status: 302, headers })
 }
 
-export async function currentUser(env: Env, req: Request): Promise<Session | null> {
+function readCookie(req: Request, name: string): string | null {
   // The cookie value is base64 + '.' + sig — base64 padding contains '='
   // characters, so we can't naively split on '='. Take everything after
   // the first '=' as the value.
@@ -112,7 +160,12 @@ export async function currentUser(env: Env, req: Request): Promise<Session | nul
       const i = p.indexOf('=')
       return i < 0 ? [p, ''] : [p.slice(0, i), p.slice(i + 1)]
     })
-    .find((p) => p[0] === COOKIE)?.[1]
+    .find((p) => p[0] === name)?.[1]
+  return raw ?? null
+}
+
+export async function currentUser(env: Env, req: Request): Promise<Session | null> {
+  const raw = readCookie(req, COOKIE)
   if (!raw) return null
   try {
     return await verifySession(env.SESSION_KEY, raw)
@@ -132,7 +185,10 @@ async function verifySession(secret: string, cookie: string): Promise<Session> {
   const [body, sig] = cookie.split('.')
   if (!body || !sig) throw new Error('bad cookie')
   const expect = await hmac(secret, body)
-  if (sig !== expect) throw new Error('bad sig')
+  // Constant-time compare to defeat signature-forgery probes that rely
+  // on the early-exit timing of `!==` to learn the expected sig
+  // byte-by-byte.
+  if (!constantTimeEqual(sig, expect)) throw new Error('bad sig')
   return JSON.parse(atob(body)) as Session
 }
 async function hmac(secret: string, data: string): Promise<string> {
