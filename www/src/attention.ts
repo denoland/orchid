@@ -46,9 +46,9 @@ export function attention(job: Job): Attention {
   return { level: 'quiet', reason: '', score: 0 }
 }
 
-export const LEVEL_COLOR: Record<AttentionLevel, { bar: string; chip: string; text: string }> = {
-  'needs-you': { bar: 'bg-rose-500',  chip: 'bg-rose-50 text-rose-700 ring-rose-200',     text: 'text-rose-600' },
-  'watching':  { bar: 'bg-amber-500', chip: 'bg-amber-50 text-amber-700 ring-amber-200',  text: 'text-amber-600' },
-  'working':   { bar: 'bg-emerald-500', chip: 'bg-emerald-50 text-emerald-700 ring-emerald-200', text: 'text-emerald-600' },
-  'quiet':     { bar: 'bg-zinc-300', chip: 'bg-zinc-100 text-zinc-600 ring-zinc-200',     text: 'text-zinc-500' },
+export const LEVEL_COLOR: Record<AttentionLevel, { bar: string }> = {
+  'needs-you': { bar: 'bg-rose-500' },
+  'watching':  { bar: 'bg-amber-500' },
+  'working':   { bar: 'bg-emerald-500' },
+  'quiet':     { bar: 'bg-zinc-300' },
 }

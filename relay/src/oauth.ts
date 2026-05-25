@@ -20,7 +20,7 @@ interface Session {
 
 const COOKIE = 'orchid_session'
 
-function callbackURL(env: Env, req: Request): string {
+function callbackURL(req: Request): string {
   // Use the request's origin so localhost dev round-trips through the
   // same host; prod requests come in on ROOT_DOMAIN already.
   const u = new URL(req.url)
@@ -32,7 +32,7 @@ export async function handleLogin(env: Env, req: Request): Promise<Response> {
   const next = new URL(req.url).searchParams.get('next') ?? '/dashboard'
   await env.OAUTH.put(`state:${state}`, JSON.stringify({ next }), { expirationTtl: 600 })
 
-  const callback = callbackURL(env, req)
+  const callback = callbackURL(req)
   const url = new URL('https://github.com/login/oauth/authorize')
   url.searchParams.set('client_id', env.GH_CLIENT_ID)
   url.searchParams.set('redirect_uri', callback)
@@ -60,7 +60,7 @@ export async function handleOAuthCallback(env: Env, req: Request): Promise<Respo
       client_id: env.GH_CLIENT_ID,
       client_secret: env.GH_CLIENT_SECRET,
       code,
-      redirect_uri: callbackURL(env, req),
+      redirect_uri: callbackURL(req),
     }),
   })
   if (!tokenRes.ok) return new Response('github token exchange failed', { status: 502 })
