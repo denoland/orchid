@@ -28,13 +28,30 @@ function colorFor(id: string) {
 }
 function shortName(id: string): string { return id.slice(-4) }
 
+// Transport interface so the host app can wire collab into a shared
+// WebSocket bus instead of forcing useCollabSocket to open a second
+// connection. When `opts.transport` is provided, frames flow through
+// the host's existing WS — typically the per-tab session WS used for
+// state pushes too. Without it, the hook falls back to its own
+// `/api/canvas/ws` socket (legacy / standalone consumers).
+export interface CollabTransport {
+  subscribe: (handler: (msg: any) => void) => () => void
+  send: (msg: any) => void
+  peerId?: () => string | null
+}
+
 /// Realtime collab over WebSocket. The server is expected to be a dumb
 /// relay — every client receives every other client's messages.
 /// `cursor` / `hello` / `leave` are handled internally; anything else
 /// is forwarded to the caller for state reconciliation.
+///
+/// Frames carry a discriminator field that historically was `type` (on
+/// the legacy /api/canvas/ws path) and is `t` on the new shared bus.
+/// We read either so both transports work.
 export function useCollabSocket(opts?: {
   url?: string                          // default `${proto}://${host}/api/canvas/ws`
   onMessage?: (msg: CollabMsg) => void
+  transport?: CollabTransport | null    // shared bus; opens own WS if absent
 }): {
   cursors: Map<string, Cursor>
   myId: string | null
@@ -49,8 +66,55 @@ export function useCollabSocket(opts?: {
   const sendImplRef = useRef<(m: CollabMsg) => void>(() => {})
   const onMessageRef = useRef(opts?.onMessage)
   onMessageRef.current = opts?.onMessage
+  const transport = opts?.transport ?? null
 
   useEffect(() => {
+    if (!transport) return
+    // Shared-bus path: piggyback on the host's existing WS. No own
+    // connection, no reconnect logic — the host handles all of that.
+    sendImplRef.current = (m: CollabMsg) => {
+      const t = (m as any).type ?? (m as any).t
+      transport.send({ ...m, t })
+    }
+    const initialId = transport.peerId?.() ?? null
+    if (initialId) { myIdRef.current = initialId; setMyId(initialId) }
+    const unsub = transport.subscribe((msg: any) => {
+      const kind = msg.t ?? msg.type
+      switch (kind) {
+        case 'hello':
+          if (msg.userId) { myIdRef.current = msg.userId; setMyId(msg.userId) }
+          break
+        case 'cursor': {
+          const id = msg.userId
+          if (!id || id === myIdRef.current) break
+          const x = msg.x as number, y = msg.y as number
+          setCursors((prev) => {
+            const next = new Map(prev)
+            next.set(id, { x, y, color: colorFor(id), name: shortName(id), updatedAt: Date.now() })
+            return next
+          })
+          break
+        }
+        case 'leave':
+          if (msg.userId) {
+            setCursors((prev) => {
+              if (!prev.has(msg.userId!)) return prev
+              const next = new Map(prev); next.delete(msg.userId!); return next
+            })
+          }
+          break
+        default:
+          if (kind && kind !== 'state' && kind !== 'relay-info') {
+            onMessageRef.current?.(msg)
+          }
+          break
+      }
+    })
+    return unsub
+  }, [transport])
+
+  useEffect(() => {
+    if (transport) return
     let alive = true
     let retry = 0
     function connect() {
@@ -102,7 +166,7 @@ export function useCollabSocket(opts?: {
     connect()
     return () => { alive = false; wsRef.current?.close() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [transport])
 
   // GC stale cursors (no update in 5s = disconnected).
   useEffect(() => {
