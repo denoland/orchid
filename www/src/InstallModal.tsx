@@ -49,7 +49,7 @@ export function InstallModal() {
   // location.hostname which gets confused by 3+ label setups.
   const root = info.root
   const relayURL = `wss://${sub}.${root}/agent`
-  const install = `curl -fsSL https://${root}/install.sh | sh`
+  const install = `curl -fsSL https://${root}/install.sh | bash`
   const join = `orch join ${relayURL} ${info.token}`
 
   return (

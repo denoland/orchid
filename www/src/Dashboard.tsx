@@ -2064,7 +2064,7 @@ function JoinCommandCard({ info }: { info: RelayInfo | null | 'unavailable' }) {
   // naive slice(-2). Falls back to hostname for older relays missing
   // the field.
   const root = info.root ?? location.hostname.split('.').slice(-2).join('.')
-  const install = `curl -fsSL https://${root}/install.sh | sh`
+  const install = `curl -fsSL https://${root}/install.sh | bash`
   const join = `orch join wss://${sub}.${root}/agent ${info.token}`
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 p-6 space-y-5">
