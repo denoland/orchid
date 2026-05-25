@@ -1,5 +1,5 @@
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -37,6 +37,7 @@ import {
 } from '@orchid/whiteboard'
 
 import type { RelayInfo } from './App'
+import { WSBusContext } from './App'
 
 interface Props { state: State; relay: RelayInfo | null }
 
@@ -967,7 +968,8 @@ function DashboardInner({ state, relay }: Props) {
     }
   }, [applyStrokeAdd, applyStrokeRemove, applyEdgeAdd, setNodes, setEdges, persist, makeNoteNode, makeLinkNode, makeTextNode, makePaneNode])
 
-  const { cursors, sendCursor, send } = useCollabSocket({ onMessage: handleRemote })
+  const bus = useContext(WSBusContext)
+  const { cursors, sendCursor, send } = useCollabSocket({ onMessage: handleRemote, transport: bus })
   useEffect(() => { sendRef.current = send }, [send])
 
   useEffect(() => {

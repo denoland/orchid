@@ -262,16 +262,42 @@ export class UserSession {
   // same handler the old addEventListener path used.
   async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer) {
     try {
-      // /_events_ws subscribers are read-only — drop any inbound
-      // traffic so they can't be used as a back-channel into the
-      // agent stream. Wrapped defensively so an unexpected getTags
-      // failure can't take down the agent WS via CF's
-      // unhandled-error-closes-the-socket behaviour.
       const tags = this.state.getTags(ws) ?? []
-      if (tags.includes('events')) return
+      // /_events_ws subscribers send a narrow set of frames — cursor
+      // moves get broadcast to every other subscriber in the same DO
+      // so collab cursors never have to round-trip through orch.
+      // Anything else from an events WS is silently dropped to keep
+      // the channel from becoming a back-door into the agent.
+      if (tags.includes('events')) {
+        if (typeof data !== 'string') return
+        let f: any
+        try { f = JSON.parse(data) } catch { return }
+        if (f && f.t === 'cursor') {
+          const id = this.wsId(ws)
+          const out = JSON.stringify({
+            t: 'cursor', userId: id, x: f.x, y: f.y,
+          })
+          for (const peer of this.state.getWebSockets('events')) {
+            if (peer === ws) continue
+            try { peer.send(out) } catch {}
+          }
+        }
+        return
+      }
       if (this.agentWS == null) this.agentWS = ws
       this.onAgentMessage({ data } as MessageEvent)
     } catch {}
+  }
+
+  // Stable per-WS identity so peer cursors line up across messages.
+  // We stash it in the WS attachment on accept; if it's missing
+  // (older accepted sockets), we mint one lazily and stick it back.
+  private wsId(ws: WebSocket): string {
+    const a = ws.deserializeAttachment() as { id?: string } | null
+    if (a?.id) return a.id
+    const id = crypto.randomUUID().replaceAll('-', '').slice(0, 12)
+    try { ws.serializeAttachment({ id }) } catch {}
+    return id
   }
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean) {
     const wasAgent = this.agentWS === ws
@@ -282,7 +308,23 @@ export class UserSession {
       try { s.ws?.close(1011, 'agent disconnected') } catch {}
     }
     this.streams.clear()
-    if (wasAgent) this.broadcastRelayInfo()
+    if (wasAgent) {
+      this.broadcastRelayInfo()
+    } else {
+      // events-WS departure → tell remaining peers so they can drop
+      // the stale cursor from their map without waiting for GC.
+      try {
+        const a = ws.deserializeAttachment() as { id?: string } | null
+        const id = a?.id
+        if (id) {
+          const out = JSON.stringify({ t: 'leave', userId: id })
+          for (const peer of this.state.getWebSockets('events')) {
+            if (peer === ws) continue
+            try { peer.send(out) } catch {}
+          }
+        }
+      } catch {}
+    }
   }
   async webSocketError(ws: WebSocket, _err: unknown) {
     if (this.agentWS === ws) this.agentWS = null
@@ -334,9 +376,12 @@ export class UserSession {
     const server = pair[1]
     const tags = isOwner ? ['events', 'owner'] : ['events', 'collab']
     this.state.acceptWebSocket(server, tags)
-    try {
-      server.send(JSON.stringify(this.relayInfoFrame(isOwner)))
-    } catch {}
+    // Mint a stable peer id and stash it in the WS attachment. Used
+    // for the cursor channel so other tabs can tell our moves apart.
+    const id = crypto.randomUUID().replaceAll('-', '').slice(0, 12)
+    try { server.serializeAttachment({ id }) } catch {}
+    try { server.send(JSON.stringify({ t: 'hello', userId: id })) } catch {}
+    try { server.send(JSON.stringify(this.relayInfoFrame(isOwner))) } catch {}
     if (this.lastState) {
       try { server.send(JSON.stringify({ t: 'state', state: JSON.parse(this.lastState) })) } catch {}
     }
