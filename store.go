@@ -207,6 +207,33 @@ func upsertKVTx(tx *sql.Tx, key string, value []byte) error {
 
 // GetSnap returns the opaque dashboard layout blob (whatever the canvas
 // last PUT to /api/snap), or nil if no snap has been saved yet.
+// GetKV reads an arbitrary kv row. Returns (nil, nil) when the key is
+// absent — callers that need to distinguish should check len(value).
+// Public counterpart to getKV for use by other watchers (assignment
+// poller, future mention extensions, …) that want a free-form
+// per-orch persistence slot without inventing a new table.
+func (s *Store) GetKV(key string) ([]byte, error) {
+	b, _, err := s.getKV(key)
+	return b, err
+}
+
+// PutKV writes an arbitrary kv row, overwriting any prior value.
+// Same idempotent semantics as PutSnap's underlying ON CONFLICT DO
+// UPDATE — callers don't need a sentinel for "first write vs update".
+func (s *Store) PutKV(key string, value []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if err := upsertKVTx(tx, key, value); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) GetSnap() ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

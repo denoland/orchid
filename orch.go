@@ -2793,6 +2793,145 @@ func dispatchMention(cfg *Config, st *State, m Mention) {
 	log.Printf("mentions: replied to external @%s in %s#%d", m.Author, m.Repo, m.Number)
 }
 
+// assignedIssue is one row from `gh search issues assignee:<bot>`. The
+// node_id is what we dedupe against — GitHub recycles issue numbers per
+// repo, but node ids are globally unique and stable across renames.
+type assignedIssue struct {
+	NodeID    string
+	Repo      string
+	Number    int
+	Title     string
+	Body      string
+	URL       string
+	Author    string
+	UpdatedAt time.Time
+}
+
+// searchAssignments returns open issues in `repo` currently assigned to
+// `bot`. Same gh search surface mentions uses, just filtered on
+// `assignee:` instead of comment-mention. Caller dedupes via node id
+// so a re-poll never re-creates the inbox issue.
+func searchAssignments(repo, bot string) ([]assignedIssue, error) {
+	out, errStr, err := run("gh", "api",
+		"-H", "Accept: application/vnd.github+json",
+		"--paginate",
+		fmt.Sprintf("/search/issues?q=repo:%s+assignee:%s+is:issue+is:open&per_page=50", repo, bot),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(errStr))
+	}
+	var resp struct {
+		Items []struct {
+			NodeID    string    `json:"node_id"`
+			Number    int       `json:"number"`
+			Title     string    `json:"title"`
+			Body      string    `json:"body"`
+			HTMLURL   string    `json:"html_url"`
+			User      struct{ Login string } `json:"user"`
+			UpdatedAt time.Time `json:"updated_at"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		return nil, err
+	}
+	res := make([]assignedIssue, 0, len(resp.Items))
+	for _, it := range resp.Items {
+		res = append(res, assignedIssue{
+			NodeID:    it.NodeID,
+			Repo:      repo,
+			Number:    it.Number,
+			Title:     it.Title,
+			Body:      it.Body,
+			URL:       it.HTMLURL,
+			Author:    it.User.Login,
+			UpdatedAt: it.UpdatedAt,
+		})
+	}
+	return res, nil
+}
+
+// assignmentTick scans every target repo for issues newly assigned to
+// one of orchid's bots and opens a corresponding inbox issue so the
+// swarm picks them up. Dedupes against a seen-node-id set stored in
+// the kv table — a re-poll, a restart, or an unassign+reassign never
+// double-files. Same cadence as the mention poller; both run from the
+// same outer loop in main.
+func assignmentTick(cfg *Config, st *State) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	// Load the persisted seen-set. Cap to ~5000 entries so a long-lived
+	// orch doesn't bloat the kv row indefinitely.
+	seen := map[string]bool{}
+	if b, err := st.store.GetKV("assignments_seen"); err == nil && len(b) > 0 {
+		var ids []string
+		if json.Unmarshal(b, &ids) == nil {
+			for _, id := range ids {
+				seen[id] = true
+			}
+		}
+	}
+
+	bots := botLogins(cfg)
+	added := false
+	for _, t := range cfg.Targets {
+		if t.Repo == cfg.GitHub.InboxRepo {
+			continue
+		}
+		label := targetLabelFor(cfg, t.Repo)
+		if label == "" {
+			continue
+		}
+		for _, bot := range bots {
+			issues, err := searchAssignments(t.Repo, bot)
+			if err != nil {
+				log.Printf("assignments: search %s × %s failed: %v", t.Repo, bot, err)
+				continue
+			}
+			for _, it := range issues {
+				if seen[it.NodeID] {
+					continue
+				}
+				title := fmt.Sprintf("[%s#%d] %s", it.Repo, it.Number, it.Title)
+				body := fmt.Sprintf(
+					"Triggered by assignment of [%s#%d](%s) to @%s.\n\nOpened by @%s.\n\n---\n\n%s",
+					it.Repo, it.Number, it.URL, bot, it.Author, oneLine(it.Body, 2000),
+				)
+				out, errStr, err := run("gh", "issue", "create",
+					"--repo", cfg.GitHub.InboxRepo,
+					"--label", label,
+					"--title", title,
+					"--body", body)
+				if err != nil {
+					log.Printf("assignments: gh issue create failed for %s#%d: %v: %s",
+						it.Repo, it.Number, err, strings.TrimSpace(errStr))
+					continue
+				}
+				seen[it.NodeID] = true
+				added = true
+				log.Printf("assignments: opened inbox issue for %s#%d (assignee=%s) → %s",
+					it.Repo, it.Number, bot, strings.TrimSpace(out))
+			}
+		}
+	}
+
+	if added {
+		ids := make([]string, 0, len(seen))
+		for id := range seen {
+			ids = append(ids, id)
+		}
+		// Trim oldest if we ever grow beyond the cap — simple slice cut,
+		// no need for an ordered structure for what's effectively a
+		// bloom filter at this scale.
+		if len(ids) > 5000 {
+			ids = ids[len(ids)-5000:]
+		}
+		if b, err := json.Marshal(ids); err == nil {
+			_ = st.store.PutKV("assignments_seen", b)
+		}
+	}
+}
+
 // mentionTick runs one polling cycle: refresh the cache if stale, then
 // search each (target.repo × bot) pair for new mentions and dispatch.
 func mentionTick(cfg *Config, st *State) {
@@ -4816,12 +4955,14 @@ func main() {
 			mt := time.NewTicker(mentionInterval)
 			defer mt.Stop()
 			mentionTick(&cfg, st)
+			assignmentTick(&cfg, st)
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-mt.C:
 					mentionTick(&cfg, st)
+					assignmentTick(&cfg, st)
 				}
 			}
 		}()
