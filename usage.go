@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
+	"log"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -98,13 +98,18 @@ func usageForIssue(n int) *usageState {
 }
 
 // latestQuota returns the most recent five-hour + seven-day reading
-// across every session we've seen. The values are global across the
-// account, so any session's last sample is authoritative.
+// across every session that actually carried rate_limits data. The
+// field is documented but flaky on some Claude Max OAuth setups
+// (anthropics/claude-code#40094) — when it's missing we don't lie
+// to the dashboard with a 0% bar.
 func latestQuota() (RateLimit, RateLimit, bool) {
 	usageMu.RLock()
 	defer usageMu.RUnlock()
 	var latest *usageState
 	for _, s := range usageBySession {
+		if s.RateLimits.FiveHour.ResetsAt == 0 && s.RateLimits.SevenDay.ResetsAt == 0 {
+			continue
+		}
 		if latest == nil || s.UpdatedAt.After(latest.UpdatedAt) {
 			latest = s
 		}
@@ -121,7 +126,21 @@ func latestQuota() (RateLimit, RateLimit, bool) {
 // error so a transient pipe break (claude restart, log rotate, ssh
 // disconnect) doesn't permanently lose the data feed.
 func tailStatusLine(ctx context.Context, vm VMBlock, bcast chan<- struct{}) {
-	path := fmt.Sprintf("/home/%s/.claude/statusline.jsonl", vm.User)
+	// Pick the home dir of the user that actually runs claude on this
+	// VM. session_home wins (operator's authoritative answer); else
+	// fall back to /home/<vm.user>, else /home/orchid as a last
+	// resort. Without this dance, vm "local" blocks that leave both
+	// user= and session_home= unset produce "/home//.claude/…" and
+	// silently never read anything.
+	home := vm.SessionHome
+	if home == "" && vm.User != "" {
+		home = "/home/" + vm.User
+	}
+	if home == "" {
+		home = "/home/orchid"
+	}
+	path := home + "/.claude/statusline.jsonl"
+	log.Printf("usage: tailing %s on %s", path, vm.Name)
 	for ctx.Err() == nil {
 		var cmd *exec.Cmd
 		if isLocal(vm) {
