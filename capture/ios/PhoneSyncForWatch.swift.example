@@ -1,0 +1,84 @@
+// PhoneSyncForWatch.swift — drop into the iOS main app target.
+//
+// This is the iPhone side of the watch pairing handshake. The watchOS
+// app expects endpoint + token to arrive via
+// WCSession.updateApplicationContext (or sendUserInfo for one-shot
+// pushes). Without this snippet on the phone, the watch app stays
+// stuck on "Open iPhone app to pair".
+//
+// File is suffixed `.example` so XcodeGen/SwiftPM doesn't try to
+// compile it into the watch target. Rename to `.swift` and add to the
+// iOS app target (OrchidCapture / OrchidCaptureSources) when the iOS
+// app source tree is back in place.
+//
+// Keys MUST match `WatchSettings.phoneEndpointKey` /
+// `WatchSettings.phoneTokenKey` in
+// `OrchidCaptureWatchSources/WatchSettings.swift`.
+
+import Foundation
+import WatchConnectivity
+
+@MainActor
+final class PhoneSyncForWatch: NSObject, ObservableObject {
+    static let shared = PhoneSyncForWatch()
+
+    @Published private(set) var isPaired: Bool = false
+    @Published private(set) var isWatchAppInstalled: Bool = false
+
+    private override init() {
+        super.init()
+        activate()
+    }
+
+    private func activate() {
+        guard WCSession.isSupported() else { return }
+        let s = WCSession.default
+        s.delegate = self
+        s.activate()
+    }
+
+    /// Push the current settings to the watch. Call this whenever the
+    /// user changes Endpoint or rotates the Capture Token in iOS
+    /// Settings. Idempotent — WCSession dedupes identical contexts.
+    func pushToWatch(endpoint: URL?, token: String) {
+        guard WCSession.isSupported() else { return }
+        let s = WCSession.default
+        var ctx: [String: Any] = [:]
+        if let endpoint { ctx["endpoint"] = endpoint.absoluteString }
+        if !token.isEmpty { ctx["token"] = token }
+        do {
+            try s.updateApplicationContext(ctx)
+        } catch {
+            // updateApplicationContext only fails for malformed payloads,
+            // which we control; nothing actionable for the user.
+        }
+        // Also send via transferUserInfo so a powered-down watch picks
+        // it up on next wake. App context covers the typical case; the
+        // user-info queue handles the cold-boot edge.
+        s.transferUserInfo(ctx)
+    }
+}
+
+extension PhoneSyncForWatch: WCSessionDelegate {
+    nonisolated func session(_ session: WCSession,
+                             activationDidCompleteWith state: WCSessionActivationState,
+                             error: Error?) {
+        Task { @MainActor in
+            self.isPaired = session.isPaired
+            self.isWatchAppInstalled = session.isWatchAppInstalled
+        }
+    }
+
+    nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
+    nonisolated func sessionDidDeactivate(_ session: WCSession) {
+        // Re-activate to handle quick watch switches.
+        WCSession.default.activate()
+    }
+
+    nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
+        Task { @MainActor in
+            self.isPaired = session.isPaired
+            self.isWatchAppInstalled = session.isWatchAppInstalled
+        }
+    }
+}
