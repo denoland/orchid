@@ -364,16 +364,14 @@ type relayResponseWriter struct {
 	status int
 	sent   bool
 	stream bool
-	rd, wr *io.PipeReader
 	mu     sync.Mutex
 }
 
 func newRelayResponseWriter(id uint32, a *agent, ctx context.Context) *relayResponseWriter {
-	rw := &relayResponseWriter{
+	return &relayResponseWriter{
 		id: id, agent: a, ctx: ctx,
 		header: http.Header{}, status: 200,
 	}
-	return rw
 }
 
 func (w *relayResponseWriter) Header() http.Header { return w.header }

@@ -93,39 +93,9 @@ or CI results arrive. Address them, push fixes, stop again.
 The session ends automatically when the PR merges or closes.
 EOT
 
-# vm "tiger-fusion" {
-#   host = "tiger-fusion.exe.xyz"
-#   user = "exedev"
-#   key  = "~/.ssh/id_ed25519"
-# }
-
-# vm "divybot1" {
-#   host = "divybot1.exe.xyz"
-#   user = "exedev"
-#   key  = "~/.ssh/id_ed25519"
-# }
-
-# vm "divybot2" {
-#   host = "divybot2.exe.xyz"
-#   user = "exedev"
-#   key  = "~/.ssh/id_ed25519"
-# }
-
-# vm "divybot3" {
-#   host = "divybot3.exe.xyz"
-#   user = "exedev"
-#   key  = "~/.ssh/id_ed25519"
-# }
-
-# vm "divybot4" {
-#   host = "divybot4.exe.xyz"
-#   user = "exedev"
-#   key  = "~/.ssh/id_ed25519"
-# }
-
 vm "local" {
-  host        = "localhost"
-  capacity    = 30
+  host         = "localhost"
+  capacity     = 30
   session_cmd  = "runuser -u orchid -- env XDG_RUNTIME_DIR=/run/user/1001 GIT_AUTHOR_NAME=divybot GIT_AUTHOR_EMAIL=divybot@users.noreply.github.com GIT_COMMITTER_NAME=divybot GIT_COMMITTER_EMAIL=divybot@users.noreply.github.com claude --dangerously-skip-permissions"
   session_home = "/home/orchid"
 }

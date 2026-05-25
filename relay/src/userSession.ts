@@ -369,8 +369,8 @@ export async function mintAgentToken(
   return j.token
 }
 
-/// Helper: the proxy worker turns the inbound Request into a stripped-down
-/// inner Request that the DO sends across the tunnel. Used by proxy.ts.
+// Reconstructs the original Request from the sidecar headers added by the
+// outer proxy worker before forwarding to the DO.
 async function innerRequestFromProxyBody(req: Request): Promise<Request> {
   const inner = req.headers.get('x-orchid-inner-url')
   if (!inner) throw new Error('missing inner url')

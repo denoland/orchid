@@ -13,8 +13,6 @@ import {
   useEdgesState,
   applyNodeChanges,
   applyEdgeChanges,
-  addEdge,
-  useViewport,
   useReactFlow,
   type Node,
   type Edge,
@@ -32,8 +30,8 @@ import { Composer } from './Composer'
 import {
   NoteNode, LinkNode, TextNode, StrokeNode,
   PenLayer, CollabLayer, useCollabSocket,
-  detectVariant, fetchGitHubSnippet, fetchOG, pointsToPath,
-  type Cursor, type Stroke, type UserNode,
+  detectVariant, fetchGitHubSnippet, fetchOG,
+  type Stroke, type UserNode,
   type NoteData, type TextData, type LinkData, type StrokeData, type LinkVariant,
   NOTE_W, NOTE_H, LINK_W, LINK_H,
 } from '@orchid/whiteboard'
@@ -45,7 +43,6 @@ const CARD_H = 96
 const COLS = 4
 const GAP = 18
 const HEADER_OFFSET = 220
-const STORAGE_KEY = 'orchid.canvas.v12'
 
 type Tool = 'select' | 'box' | 'pen' | 'eraser' | 'note' | 'text'
 
@@ -157,8 +154,6 @@ function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
   if (lastPing && Date.now() - lastPing < ACTIVITY_HOLD_MS) {
     attn = { ...attn, level: 'working', reason: 'active' }
   }
-  const c = LEVEL_COLOR[attn.level]
-  const ci = ciStatus(job.last_check_conclusions ?? {})
   const ringClass = 'ring-zinc-200/80 dark:ring-zinc-700/70 ' + (
     attn.level === 'needs-you' ? 'card-status-needs '
     : attn.level === 'working' ? 'card-status-working '
@@ -188,7 +183,7 @@ function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
         position={Position.Right}
         style={{ background: '#a78bfa', width: 8, height: 8, border: '1.5px solid white' }}
       />
-      <CardCompact job={job} fact={factFor(job, attn, ci)} dot={c.bar} factColor={c.text} />
+      <CardCompact job={job} />
     </div>
   )
 }
@@ -205,7 +200,7 @@ type PaneNodeData = {
   onClose: (tmux: string) => void
 }
 
-function PaneWindowNode({ data, id, selected }: NodeProps<Node<PaneNodeData, 'pane'>>) {
+function PaneWindowNode({ data, selected }: NodeProps<Node<PaneNodeData, 'pane'>>) {
   const job = data.jobRef.current.get(data.tmux)
   const ci = job ? ciStatus(job.last_check_conclusions ?? {}) : 'pending'
   const title = job?.issue_title || data.tmux
@@ -246,7 +241,6 @@ function PaneWindowNode({ data, id, selected }: NodeProps<Node<PaneNodeData, 'pa
       </div>
     </div>
   )
-  void id
 }
 
 function PRBadge({ repo, pr, ci }: { repo: string; pr: number; ci: 'fail' | 'pass' | 'pending' }) {
@@ -999,7 +993,7 @@ function DashboardInner({ state }: Props) {
         />
       )}
       {showSettings && <SettingsPage jobs={jobs} state={state} onClose={() => setShowSettings(false)} />}
-      {showCapture && <CapturePage jobs={jobs} onClose={() => setShowCapture(false)} />}
+      {showCapture && <CapturePage jobs={jobs} inbox={inbox} onClose={() => setShowCapture(false)} />}
       {view === 'canvas' && !showSettings && !showCapture && (
         <FloatingToolbar tool={tool} setTool={setTool} addNote={addNote} />
       )}
@@ -1171,7 +1165,7 @@ function CaptureButton({ onClick }: { onClick: () => void }) {
   )
 }
 
-function CapturePage({ jobs, onClose }: { jobs: Job[]; onClose: () => void }) {
+function CapturePage({ jobs, inbox, onClose }: { jobs: Job[]; inbox: string; onClose: () => void }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
@@ -1215,7 +1209,7 @@ function CapturePage({ jobs, onClose }: { jobs: Job[]; onClose: () => void }) {
             )}
             <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
               {recent.map((j) => (
-                <RecentCaptureRow key={j.issue} job={j} />
+                <RecentCaptureRow key={j.issue} job={j} inbox={inbox} />
               ))}
             </div>
           </div>
@@ -1225,12 +1219,11 @@ function CapturePage({ jobs, onClose }: { jobs: Job[]; onClose: () => void }) {
   )
 }
 
-function RecentCaptureRow({ job }: { job: Job }) {
+function RecentCaptureRow({ job, inbox }: { job: Job; inbox: string }) {
   const attn = attention(job)
   const color = LEVEL_COLOR[attn.level]
   const repo = job.target_repo ? job.target_repo.split('/')[1] : job.target || '—'
-  const inboxRepo = 'denoland/orchid' // best-effort hint; real value is in state.inbox
-  const issueURL = `https://github.com/${inboxRepo}/issues/${job.issue}`
+  const issueURL = inbox ? `https://github.com/${inbox}/issues/${job.issue}` : `#${job.issue}`
   return (
     <a
       href={issueURL}
@@ -2668,7 +2661,7 @@ function IconNote() {
   )
 }
 
-function CardCompact({ job }: { job: Job; fact: string; dot: string; factColor: string }) {
+function CardCompact({ job }: { job: Job }) {
   const repo = job.target_repo ? job.target_repo.split('/')[1] : job.target || '—'
   const agent = detectAgent(job)
   return (
@@ -2729,77 +2722,3 @@ function AgentMark({ agent }: { agent: Agent }) {
   )
 }
 
-function CardExpanded({ job, fact, attnText, onClose }: { job: Job; fact: string; attnText: string; onClose: () => void }) {
-  const repo = job.target_repo
-  const issueURL = job.issue ? `https://github.com/denoland/orchid/issues/${job.issue}` : null
-  const prURL = job.pr ? `https://github.com/${repo}/pull/${job.pr}` : null
-  return (
-    <div className="h-full flex flex-col p-3 nodrag">
-      <div className="flex items-start gap-3 mb-2">
-        <div className="flex-1 min-w-0">
-          <div className="text-[14px] text-zinc-900 dark:text-zinc-100 font-medium truncate">
-            {job.issue_title || job.tmux || '—'}
-          </div>
-          <div className="mono text-[10.5px] text-zinc-400 dark:text-zinc-500 truncate">
-            {repo} · {job.tmux} {job.branch && `· ${job.branch}`}
-          </div>
-        </div>
-        <span className={`mono text-[11px] ${attnText}`}>{fact}</span>
-        <button
-          onClick={(e) => { e.stopPropagation(); onClose() }}
-          className="text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 rounded p-0.5"
-          title="close (esc)"
-        >
-          <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
-            <path d="M18 6L6 18M6 6l12 12" />
-          </svg>
-        </button>
-      </div>
-      <div className="flex items-center gap-x-3 gap-y-1 flex-wrap mb-2">
-        {issueURL && <Link href={issueURL}>issue #{job.issue}</Link>}
-        {prURL && <Link href={prURL}>pr #{job.pr}</Link>}
-        {repo && <Link href={`https://github.com/${repo}`}>{repo}</Link>}
-      </div>
-      <div className="flex-1 min-h-0 rounded-lg overflow-hidden ring-1 ring-zinc-200/80 dark:ring-zinc-700/80">
-        {job.tmux && <Pane session={job.tmux} />}
-      </div>
-    </div>
-  )
-}
-
-function Link({ href, children }: { href: string; children: React.ReactNode }) {
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      onClick={(e) => e.stopPropagation()}
-      className="mono text-[11px] text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
-    >
-      {children}
-    </a>
-  )
-}
-
-function Dot({ dotBg, pulse }: { dotBg: string; pulse: boolean }) {
-  return (
-    <span className="relative inline-flex w-2 h-2 flex-shrink-0">
-      {pulse && <span className={`absolute inline-flex h-full w-full rounded-full ${dotBg} opacity-50 animate-ping`} />}
-      <span className={`relative w-2 h-2 rounded-full ${dotBg}`} />
-    </span>
-  )
-}
-
-function factFor(
-  job: Job,
-  attn: ReturnType<typeof attention>,
-  ci: 'fail' | 'pass' | 'pending'
-): string {
-  if (attn.level === 'needs-you' && ci === 'fail') return 'CI fail'
-  if (attn.level === 'needs-you') return 'idle'
-  if (job.pr && ci === 'pass') return 'review'
-  if (job.pr && ci === 'pending') return 'checking'
-  if (job.pr) return 'PR'
-  if (attn.level === 'working') return 'active'
-  return ''
-}

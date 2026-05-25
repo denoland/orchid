@@ -76,9 +76,6 @@ type DraftTarget struct {
 	Labels []string `json:"labels,omitempty"`
 }
 
-// captureAssetsDir resolves the asset directory, creating it if needed.
-// Defaults to <dir of state_file>/captures when AssetsDir isn't configured,
-// so a fresh `capture`-block-only install Just Works.
 // captureAssetsDirOrPlaceholder is the startup log's best effort at showing
 // where assets will land. It doesn't fail-fast on permission errors — the
 // per-request handler does that.
@@ -92,6 +89,9 @@ func captureAssetsDirOrPlaceholder(cfg *Config) string {
 	return "(unset)"
 }
 
+// captureAssetsDir resolves the asset directory, creating it if needed.
+// Defaults to <dir of state_file>/captures when AssetsDir isn't configured,
+// so a fresh `capture`-block-only install Just Works.
 func captureAssetsDir(cfg *Config) (string, error) {
 	dir := cfg.Orch.Capture.AssetsDir
 	if dir == "" {
