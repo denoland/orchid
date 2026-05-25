@@ -230,6 +230,16 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 // dashboard within a poll window. Errors are logged but don't kill
 // the loop — a partial scan is better than no scan.
 func runUsageScanLoop(ctx context.Context, projectsRoot string, store *Store, interval time.Duration) {
+	// One-shot backfill: walk every project dir, derive session_id
+	// from the jsonl filename, issue from the parent dir, and update
+	// any usage_daily rows that landed before the issue column
+	// existed (or before the cwd-issue regex was added). Cheap — no
+	// content read, just directory listing.
+	if n, err := backfillIssue(projectsRoot, store); err != nil {
+		log.Printf("usage_history: backfill: %v", err)
+	} else {
+		log.Printf("usage_history: backfilled issue on %d rows", n)
+	}
 	prog := newScanProgress()
 	if err := scanUsageHistory(ctx, projectsRoot, store, prog); err != nil {
 		log.Printf("usage_history: initial scan: %v", err)
@@ -248,6 +258,39 @@ func runUsageScanLoop(ctx context.Context, projectsRoot string, store *Store, in
 			}
 		}
 	}
+}
+
+// backfillIssue walks projectsRoot once and maps every jsonl filename
+// (the claude session UUID) to its parent-dir issue number, then
+// updates usage_daily rows where issue is still 0. Idempotent.
+func backfillIssue(projectsRoot string, store *Store) (int, error) {
+	sessionToIssue := map[string]int{}
+	err := filepath.WalkDir(projectsRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(path, ".jsonl") {
+			return nil
+		}
+		// session UUID is the basename without extension.
+		base := filepath.Base(path)
+		sid := strings.TrimSuffix(base, ".jsonl")
+		parent := filepath.Base(filepath.Dir(path))
+		m := cwdIssueRe.FindStringSubmatch(parent)
+		if len(m) == 0 {
+			return nil
+		}
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			return nil
+		}
+		sessionToIssue[sid] = n
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return store.BackfillUsageIssue(sessionToIssue)
 }
 
 // projectsRootFor resolves the ~/.claude/projects directory for the

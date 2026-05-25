@@ -224,6 +224,43 @@ func upsertKVTx(tx *sql.Tx, key string, value []byte) error {
 
 // GetSnap returns the opaque dashboard layout blob (whatever the canvas
 // last PUT to /api/snap), or nil if no snap has been saved yet.
+// BackfillUsageIssue maps every existing usage_daily row whose issue
+// column is still 0 (rows scanned before the column existed, or
+// scanned from a path that didn't carry an issue number) to whatever
+// (session_id → issue) pairs the caller hands us. Idempotent — only
+// touches rows that don't already have a non-zero issue.
+func (s *Store) BackfillUsageIssue(sessionToIssue map[string]int) (int, error) {
+	if len(sessionToIssue) == 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	stmt, err := tx.Prepare(`UPDATE usage_daily SET issue = ? WHERE session_id = ? AND issue = 0`)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	defer stmt.Close()
+	updated := 0
+	for sid, issue := range sessionToIssue {
+		res, err := stmt.Exec(issue, sid)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		n, _ := res.RowsAffected()
+		updated += int(n)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return updated, nil
+}
+
 // GetKV reads an arbitrary kv row. Returns (nil, nil) when the key is
 // absent — callers that need to distinguish should check len(value).
 // Public counterpart to getKV for use by other watchers (assignment
