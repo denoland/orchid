@@ -12,6 +12,7 @@ export interface Job {
   next_fire_at: string
   last_check_conclusions: Record<string, string>
   activity?: number[]
+  needs_input?: boolean
 }
 
 export interface VM {

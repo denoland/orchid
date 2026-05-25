@@ -169,9 +169,12 @@ function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
   let attn = attention(job)
   // Push-driven override: if the relay pinged us recently for this tmux,
   // treat the card as working for the next few seconds regardless of
-  // what the slower polled activity array says.
+  // what the slower polled activity array says. A pending prompt outranks
+  // it though — the activity ping fires once on the busy→prompted screen
+  // redraw, but the dialog is sitting there waiting on a human and the
+  // card should stay red until the prompt clears.
   const lastPing = activity.at.get(job.tmux)
-  if (lastPing && Date.now() - lastPing < ACTIVITY_HOLD_MS) {
+  if (lastPing && Date.now() - lastPing < ACTIVITY_HOLD_MS && !job.needs_input) {
     attn = { ...attn, level: 'working', reason: 'active' }
   }
   const ringClass = 'ring-zinc-200/80 dark:ring-zinc-700/70 ' + (
@@ -2480,7 +2483,7 @@ const GROUP_LABEL: Record<AttentionLevel, string> = {
 
 function ListRow({ job, onOpen, activityAt }: { job: Job; onOpen: (tmux: string) => void; activityAt?: number }) {
   let attn = attention(job)
-  if (activityAt && Date.now() - activityAt < ACTIVITY_HOLD_MS) {
+  if (activityAt && Date.now() - activityAt < ACTIVITY_HOLD_MS && !job.needs_input) {
     attn = { ...attn, level: 'working', reason: 'active' }
   }
   const color = LEVEL_COLOR[attn.level]

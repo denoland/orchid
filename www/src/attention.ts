@@ -25,6 +25,12 @@ export function attention(job: Job): Attention {
   const hasPR = job.pr > 0
   const hasTmux = job.tmux !== ''
 
+  // Positive signal from the pane sampler: the agent is showing a modal
+  // dialog (Yes/No, plan approval, …) and is blocked on a human. Outranks
+  // CI-failing because the dialog is right now, on screen, waiting.
+  if (hasTmux && job.needs_input) {
+    return { level: 'needs-you', reason: 'awaiting your answer', score: 110 }
+  }
   if (hasPR && ci === 'fail') {
     return { level: 'needs-you', reason: 'CI failing', score: 100 }
   }
