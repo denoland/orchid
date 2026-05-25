@@ -1690,8 +1690,12 @@ function SettingsPage({ jobs, state, relay, onClose }: {
       return
     }
     setOriginal({ cfg: { ...cfg }, gh: { ...gh }, targets: [...targets] })
-    setStatus('saved — restart orchid to apply')
-    setTimeout(() => setStatus(''), 4000)
+    // Access (allowed_logins) hot-applies via the live relay agent —
+    // no restart needed. Everything else (poll interval, http_addr,
+    // bot identity, target/VM blocks) is still read once at orch
+    // startup, so a bounce is required for those.
+    setStatus('saved · Access applies now, other fields on next orch restart')
+    setTimeout(() => setStatus(''), 6000)
   }
 
   const setField = <K extends keyof OrchestratorCfg>(k: K, v: OrchestratorCfg[K]) => {
