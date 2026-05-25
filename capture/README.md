@@ -9,26 +9,32 @@ single JSON draft format.
 ## End-to-end at a glance
 
 ```
-┌──────────────────────┐    ┌──────────────────────┐
-│  macOS menu bar app  │    │     iOS voice app    │
-│  (capture/macos/)    │    │     + share ext      │
-│                      │    │     (capture/ios/)   │
-└──────────┬───────────┘    └──────────┬───────────┘
-           │ POST /api/drafts          │
-           │ X-Capture-Token: ...      │
-           ▼                           ▼
-   ┌───────────────────────────────────────────┐
-   │      orch  -capture-only  (or full)       │
-   │                                           │
-   │   /api/drafts  → gh issue create          │
-   │   /captures/*  → serve image + voice      │
-   └───────────────────┬───────────────────────┘
-                       │
-                       ▼
-              GitHub issue in
-              denoland/orchid
-              (or any target repo)
+┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│  macOS menu bar app  │    │     iOS voice app    │    │   watchOS hold-to-   │
+│  (capture/macos/)    │    │     + share ext      │    │   capture companion  │
+│                      │    │     (capture/ios/)   │    │   (capture/ios/      │
+│                      │    │                      │    │    OrchidCaptureWatch│
+│                      │    │                      │    │    Sources/)         │
+└──────────┬───────────┘    └──────────┬───────────┘    └──────────┬───────────┘
+           │ POST /api/drafts          │                           │
+           │ X-Capture-Token: ...      │                           │
+           ▼                           ▼                           ▼
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                  orch  -capture-only  (or full)                     │
+   │                                                                     │
+   │     /api/drafts  → gh issue create                                  │
+   │     /captures/*  → serve image + voice                              │
+   └────────────────────────────┬────────────────────────────────────────┘
+                                │
+                                ▼
+                       GitHub issue in
+                       denoland/orchid
+                       (or any target repo)
 ```
+
+The watchOS app pairs to the iOS app over WatchConnectivity: the phone
+pushes endpoint + token, and from then on the watch posts directly to
+`/api/drafts` without round-tripping through the phone.
 
 **To run the whole thing locally on your Mac**, see
 [`END_TO_END.md`](./END_TO_END.md). Three commands, two terminal tabs.
@@ -57,9 +63,9 @@ capture/
 │       ├── FloatingComposerPanel.swift hotkey-summoned NSPanel
 │       ├── DraftStore.swift            queue + HTTP submit
 │       └── Draft.swift
-└── ios/                            Swift Playgrounds App + Share Extension
+└── ios/                            Swift Playgrounds App + Share Extension + Watch
     ├── README.md
-    ├── project.yml                 XcodeGen spec (app + extension)
+    ├── project.yml                 XcodeGen spec (app + extension + watch)
     ├── OrchidCaptureIOS.swiftpm/   main app sources (.swiftpm format)
     │   ├── Package.swift
     │   ├── MyApp.swift
@@ -75,8 +81,19 @@ capture/
     │   ├── ShareViewController.swift
     │   ├── ShareComposer.swift
     │   └── ShareDraftSubmitter.swift
+    ├── OrchidCaptureWatchSources/      watchOS companion (SwiftUI, watchOS 10+)
+    │   ├── WatchApp.swift              app entry
+    │   ├── CaptureScreen.swift         hold-to-record screen
+    │   ├── SettingsView.swift          paired endpoint + queue actions
+    │   ├── Recorder.swift              AVAudioRecorder + level meter
+    │   ├── Transcriber.swift           on-device SFSpeechRecognizer
+    │   ├── WatchSettings.swift         WCSession receiver
+    │   ├── DraftStore.swift            queue + submit
+    │   └── Draft.swift
+    ├── PhoneSyncForWatch.swift.example iPhone-side WCSession push
     └── SupportingFiles/
         ├── AppInfo.plist
+        ├── WatchInfo.plist
         ├── OrchidCapture.entitlements
         └── ShareExtension.entitlements
 ```

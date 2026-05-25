@@ -1,50 +1,33 @@
 import SwiftUI
 
-/// Orchid Capture for watchOS. Companion to the iPhone app — same
-/// "hold to capture a voice note" affordance you see in the landing
-/// page illustration. Drafts get queued locally and (in a follow-up)
-/// will sync to the phone via WCSession for transcription + upload.
+/// Orchid Capture for watchOS. The wrist-side surface of the "On the
+/// go" feature drawn on the landing page (www landing.html, "On the go"
+/// section): hold the dot, speak a thought, lift to ship it as a draft
+/// to your orch capture endpoint.
+///
+/// The hold-to-record affordance lives in `CaptureScreen`. Audio,
+/// transcription, queue, and submit are split into their own files so
+/// each piece is small enough to reason about on its own. The paired
+/// iPhone provides endpoint + token over WatchConnectivity — see
+/// `WatchSettings`.
 @main
 struct OrchidCaptureWatchApp: App {
+    @StateObject private var settings: WatchSettings
+    @StateObject private var store:    DraftStore
+
+    init() {
+        // DraftStore takes a reference to settings, so they have to be
+        // wired together up-front rather than lazily inside the scene.
+        let s = WatchSettings()
+        _settings = StateObject(wrappedValue: s)
+        _store    = StateObject(wrappedValue: DraftStore(settings: s))
+    }
+
     var body: some Scene {
         WindowGroup {
-            CaptureRing()
+            CaptureScreen()
+                .environmentObject(settings)
+                .environmentObject(store)
         }
-    }
-}
-
-private struct CaptureRing: View {
-    @State private var pressed = false
-    @State private var status: String = "Hold to capture"
-
-    var body: some View {
-        ZStack {
-            // Outer ring pulses while holding, matching the iPhone mock.
-            Circle()
-                .stroke(Color.purple.opacity(pressed ? 0.9 : 0.35),
-                        lineWidth: pressed ? 6 : 3)
-                .scaleEffect(pressed ? 1.05 : 1.0)
-                .animation(.easeInOut(duration: 0.25), value: pressed)
-
-            VStack(spacing: 6) {
-                Image(systemName: pressed ? "waveform" : "mic.fill")
-                    .font(.system(size: 28, weight: .medium))
-                    .foregroundStyle(pressed ? .red : .primary)
-                Text(status)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .contentShape(Circle())
-        .onLongPressGesture(
-            minimumDuration: 0.1,
-            maximumDistance: .infinity,
-            perform: { /* end handled by onLongPressGesture pressing */ },
-            onPressingChanged: { isPressing in
-                pressed = isPressing
-                status = isPressing ? "Recording…" : "Hold to capture"
-            }
-        )
     }
 }
