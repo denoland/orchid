@@ -3179,6 +3179,10 @@ type apiJobEntry struct {
 	// since the previous tick). The dashboard uses the last N values to
 	// drive the "working / idle / needs-you" attention indicators.
 	Activity []int `json:"activity,omitempty"`
+	// Usage is the latest Claude statusline reading for this session,
+	// keyed off the claude session UUID resolved from the worktree cwd.
+	// Omitted when no statusline event has landed yet.
+	Usage *apiPaneUsage `json:"usage,omitempty"`
 	// NeedsInput is true when the agent's TUI is showing a modal/dialog
 	// awaiting a human response (Claude's "Do you want to proceed? ❯ 1.
 	// Yes / 2. No" permission dialogs, plan approval, etc.). The dashboard
@@ -3200,6 +3204,24 @@ type apiStateResp struct {
 	VMs      []apiVMEntry  `json:"vms"`
 	Inbox    string        `json:"inbox"`
 	Operator string        `json:"operator"` // tmux session name if alive, "" if dead
+	// Quota carries the most recent Claude subscription rate-limit
+	// snapshot we've observed. Used by the dashboard's header strip
+	// (5-hour + 7-day usage bars + reset countdown). Omitted on a
+	// fresh install before any statusline event has landed.
+	Quota *apiQuota `json:"quota,omitempty"`
+}
+
+type apiPaneUsage struct {
+	Model      string   `json:"model,omitempty"`
+	CostUSD    float64  `json:"cost_usd,omitempty"`
+	ContextPct *float64 `json:"context_pct,omitempty"`
+}
+
+type apiQuota struct {
+	FiveHourPct      float64 `json:"five_hour_pct"`
+	FiveHourResetsAt int64   `json:"five_hour_resets_at"`
+	SevenDayPct      float64 `json:"seven_day_pct"`
+	SevenDayResetsAt int64   `json:"seven_day_resets_at"`
 }
 
 // lookupPaneVM resolves a tmux session id to the VM it's running on.
@@ -3236,12 +3258,20 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 	load := map[string]int{}
 	jobs := make([]apiJobEntry, 0, len(snap))
 	for issue, j := range snap {
-		jobs = append(jobs, apiJobEntry{
+		entry := apiJobEntry{
 			Issue:      issue,
 			Job:        j,
 			Activity:   paneActivitySnapshot(j.Tmux),
 			NeedsInput: paneNeedsInputSnapshot(j.Tmux),
-		})
+		}
+		if u := usageForIssue(issue); u != nil {
+			entry.Usage = &apiPaneUsage{
+				Model:      u.Model.DisplayName,
+				CostUSD:    u.Cost.TotalCostUSD,
+				ContextPct: u.ContextWindow.UsedPct,
+			}
+		}
+		jobs = append(jobs, entry)
 		load[j.VM]++
 	}
 	sort.Slice(jobs, func(a, b int) bool { return jobs[a].Tmux < jobs[b].Tmux })
@@ -3262,12 +3292,21 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 	if operatorAlive(cfg) {
 		op = operatorTmux
 	}
-	body, _ := json.Marshal(apiStateResp{
+	resp := apiStateResp{
 		Jobs:     jobs,
 		VMs:      vms,
 		Inbox:    cfg.GitHub.InboxRepo,
 		Operator: op,
-	})
+	}
+	if five, seven, ok := latestQuota(); ok {
+		resp.Quota = &apiQuota{
+			FiveHourPct:      five.UsedPct,
+			FiveHourResetsAt: five.ResetsAt,
+			SevenDayPct:      seven.UsedPct,
+			SevenDayResetsAt: seven.ResetsAt,
+		}
+	}
+	body, _ := json.Marshal(resp)
 	return body
 }
 
@@ -4746,6 +4785,14 @@ func main() {
 		} else {
 			log.Printf("vm %s: bootstrapped (github ssh ok)", cfg.VMs[i].Name)
 		}
+	}
+
+	// Tail each VM's Claude statusline.jsonl in the background. Feeds
+	// the in-memory usage map that /api/state exposes. Self-restarts
+	// on EOF, so a transient ssh blip just means we miss a few ticks.
+	for i := range cfg.VMs {
+		vm := cfg.VMs[i]
+		go tailStatusLine(context.Background(), vm, st.Bcast)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
