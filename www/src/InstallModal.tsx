@@ -5,6 +5,7 @@ interface RelayInfo {
   connected: boolean
   token: string | null
   login: string | null
+  root: string
 }
 
 /// When the dashboard is hosted via the orchid.com relay and the user's
@@ -13,7 +14,10 @@ interface RelayInfo {
 /// install command so the user can wire it up.
 export function InstallModal() {
   const [info, setInfo] = useState<RelayInfo | null>(null)
-  const [hidden, setHidden] = useState(false)
+  // Once dismissed, stay dismissed — a flaky DO sometimes reports
+  // connected:false even when the agent's WS is alive, and we don't
+  // want the modal to keep popping back over the dashboard.
+  const [hidden, setHidden] = useState<boolean>(() => localStorage.getItem('orchid.installSeen') === '1')
 
   useEffect(() => {
     let cancelled = false
@@ -40,7 +44,9 @@ export function InstallModal() {
   if (!info || info.connected || hidden) return null
 
   const sub = info.login?.toLowerCase().replace(/[^a-z0-9-]/g, '') ?? 'me'
-  const root = location.hostname.split('.').slice(-2).join('.')
+  // Authoritative root from the relay's ROOT_DOMAIN — beats parsing
+  // location.hostname which gets confused by 3+ label setups.
+  const root = info.root
   const relayURL = `wss://${sub}.${root}/agent`
   const install = `curl -fsSL https://${root}/install.sh | sh`
   const join = `orch join ${relayURL} ${info.token}`
@@ -50,7 +56,7 @@ export function InstallModal() {
       <OrchidArt opacity={0.28} />
       <div className="relative bg-white dark:bg-zinc-900 rounded-2xl ring-1 ring-zinc-200 dark:ring-zinc-700 shadow-2xl p-10 max-w-2xl w-full">
         <button
-          onClick={() => setHidden(true)}
+          onClick={() => { setHidden(true); localStorage.setItem('orchid.installSeen', '1') }}
           title="Close"
           className="absolute top-3 right-3 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 rounded p-1"
         >
