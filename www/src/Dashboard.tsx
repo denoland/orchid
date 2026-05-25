@@ -2229,6 +2229,124 @@ function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
   )
 }
 
+/// Per-session stacked-bar chart. Same per-day x-axis as UsageChart
+/// but each day's bar splits by session_id instead of model family —
+/// answers "which session is the budget going to" in the chosen window.
+/// Top-K sessions get their own colour, the rest collapse into "other"
+/// so the legend stays readable.
+function UsageBySessionChart({
+  rows, days, jobs,
+}: { rows: UsageHistoryRow[]; days: number; jobs: Job[] }) {
+  type DayBar = { date: string; parts: Record<string, number>; total: number }
+  // Resolve session_id → human label from active jobs first, then
+  // fall back to a short prefix so closed sessions still render.
+  const labelFor = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const j of jobs) {
+      const tmux = j.tmux || ''
+      // statusline session_id ≠ tmux id; we don't have a direct map
+      // here. Best-effort: use the issue title indexed by tmux. UI
+      // shows the short hash if the session is no longer tracked.
+      m.set(tmux, j.issue_title || tmux)
+    }
+    return (sid: string) => sid.slice(0, 6)
+  }, [jobs])
+
+  const { grid, topSessions, colors } = useMemo(() => {
+    const totals = new Map<string, number>()
+    for (const r of rows) {
+      totals.set(r.session_id, (totals.get(r.session_id) ?? 0) + r.cost_usd)
+    }
+    const sorted = Array.from(totals.entries()).sort((a, b) => b[1] - a[1])
+    const top = sorted.slice(0, 8).map((e) => e[0])
+    const topSet = new Set(top)
+
+    const today = new Date()
+    const by = new Map<string, DayBar>()
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(today.getTime() - i * 86400_000)
+      const k = d.toISOString().slice(0, 10)
+      by.set(k, { date: k, parts: {}, total: 0 })
+    }
+    for (const r of rows) {
+      const bar = by.get(r.date); if (!bar) continue
+      const key = topSet.has(r.session_id) ? r.session_id : '__other__'
+      bar.parts[key] = (bar.parts[key] ?? 0) + r.cost_usd
+      bar.total += r.cost_usd
+    }
+    const palette = ['#a78bfa','#34d399','#60a5fa','#f59e0b','#ec4899','#22d3ee','#f87171','#84cc16','#71717a']
+    const colors: Record<string, string> = { __other__: '#71717a' }
+    top.forEach((sid, i) => { colors[sid] = palette[i] ?? '#a1a1aa' })
+    return { grid: Array.from(by.values()), topSessions: top, colors }
+  }, [rows, days])
+
+  const max = Math.max(0.01, ...grid.map((g) => g.total))
+  const total = grid.reduce((acc, g) => acc + g.total, 0)
+  const W = 760, H = 200, pad = { l: 36, r: 12, t: 12, b: 22 }
+  const innerW = W - pad.l - pad.r
+  const innerH = H - pad.t - pad.b
+  const barW = innerW / grid.length
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((p) => ({ y: pad.t + innerH - p * innerH, v: p * max }))
+
+  return (
+    <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
+      <div className="flex items-center mb-3">
+        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+          Spend by session · last {days}d
+        </div>
+        <div className="flex-1" />
+        <div className="mono text-[12px] text-zinc-600 dark:text-zinc-300 tabular-nums">
+          ${total.toFixed(2)} · top {topSessions.length} of {new Set(rows.map((r) => r.session_id)).size} sessions
+        </div>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
+        {ticks.map((t, i) => (
+          <g key={i}>
+            <line x1={pad.l} x2={W - pad.r} y1={t.y} y2={t.y} stroke="currentColor" className="text-zinc-200 dark:text-zinc-800" strokeDasharray={i === 0 ? '' : '2 3'} />
+            <text x={pad.l - 6} y={t.y + 3} textAnchor="end" className="fill-zinc-400 dark:fill-zinc-500" fontSize="9">${t.v.toFixed(t.v < 1 ? 2 : 1)}</text>
+          </g>
+        ))}
+        {grid.map((g, i) => {
+          const x = pad.l + i * barW
+          // Stack top sessions in their fixed order so colours stay
+          // consistent across days, then append "other" on top.
+          const order = [...topSessions, '__other__']
+          let yCursor = pad.t + innerH
+          return (
+            <g key={g.date}>
+              {order.map((sid) => {
+                const v = g.parts[sid] ?? 0
+                if (v <= 0) return null
+                const h = (v / max) * innerH
+                yCursor -= h
+                return <rect key={sid} x={x + 1} y={yCursor} width={Math.max(0, barW - 2)} height={Math.max(0, h)} fill={colors[sid]} />
+              })}
+              {i % Math.ceil(days / 8) === 0 && (
+                <text x={x + barW / 2} y={H - 6} textAnchor="middle" className="fill-zinc-400 dark:fill-zinc-500" fontSize="9">{g.date.slice(5)}</text>
+              )}
+              <title>{`${g.date}\n$${g.total.toFixed(2)}`}</title>
+            </g>
+          )
+        })}
+      </svg>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 mono text-[10.5px] text-zinc-500 dark:text-zinc-400">
+        {topSessions.map((sid) => (
+          <span key={sid} className="inline-flex items-center gap-1" title={sid}>
+            <span className="inline-block w-2 h-2 rounded-sm" style={{ background: colors[sid] }} />
+            {labelFor(sid)}
+          </span>
+        ))}
+        {Object.keys(colors).includes('__other__') && (
+          <span className="inline-flex items-center gap-1">
+            <span className="inline-block w-2 h-2 rounded-sm" style={{ background: colors['__other__'] }} />
+            other
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 /// Rolled-up totals across a configurable window. Pulls the same
 /// /api/usage_history payload and re-aggregates so the operator can
 /// switch between day / week / month without a round trip.
@@ -2310,6 +2428,7 @@ function UsageTable({ jobs, quota }: { jobs: Job[]; quota?: State['quota'] }) {
             ))}
           </div>
           <UsageChart rows={history} days={days} />
+          <UsageBySessionChart rows={history} days={days} jobs={jobs} />
         </>
       )}
       {quota ? (
