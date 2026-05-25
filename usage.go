@@ -63,7 +63,10 @@ var (
 	usageByIssue   = map[int]*usageState{}
 )
 
-var cwdIssueRe = regexp.MustCompile(`orch-work/issue-(\d+)`)
+// Matches both the statusline payload's cwd (with real slashes) and
+// the cwd-encoded project directory name (slashes turned into dashes)
+// — claude uses `-home-orchid-orch-work-issue-N` for project dirs.
+var cwdIssueRe = regexp.MustCompile(`orch-work[/-]issue-(\d+)`)
 
 // ingestStatusLine parses one jsonl line and updates the in-memory
 // indexes. Silent on malformed input — the tail loop should never die

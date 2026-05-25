@@ -116,8 +116,13 @@ export function Pane({ session }: Props) {
         } else {
           bytes = decodeBytes(raw)
         }
-        term.clear()
-        term.write(decoder.decode(bytes))
+        // Clear + redraw as a single write so xterm processes the
+        // reset and the new frame within one render tick. The
+        // previous `term.clear() + term.write(...)` split kicked a
+        // browser paint between them, which showed up as a perceptible
+        // black flash every 200ms.
+        // CSI \x1b[H = cursor home, \x1b[2J = erase entire screen.
+        term.write('\x1b[H\x1b[2J' + decoder.decode(bytes))
       } catch { /* malformed frame, ignore */ }
     }
 
