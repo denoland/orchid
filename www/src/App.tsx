@@ -3,8 +3,16 @@ import { Dashboard } from './Dashboard'
 import { InstallModal } from './InstallModal'
 import type { State } from './types'
 
+export interface RelayInfo {
+  connected: boolean
+  root: string | null
+  login: string | null
+  token: string | null
+}
+
 export default function App() {
   const [state, setState] = useState<State>({ jobs: [], vms: [], inbox: '', operator: '' })
+  const [relay, setRelay] = useState<RelayInfo | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -58,23 +66,29 @@ export default function App() {
       }
       let firstMsgTimer: ReturnType<typeof setTimeout> | undefined
       ws.onopen = () => {
-        // WS up — reset reconnect backoff. The relay's lastState cache
-        // primes new subscribers, but if orch hasn't pushed yet (e.g.
-        // it just started) the relay has nothing to send. Kick a
-        // one-shot fetch after 2s of silence so the dashboard doesn't
-        // sit blank waiting for the first push.
+        // Reset reconnect backoff. Relay caches the latest state and
+        // pushes it on accept; if orch hasn't pushed yet (fresh boot),
+        // arm a one-shot fetch so the dashboard doesn't sit blank.
         reopenDelay = 1000
         firstMsgTimer = setTimeout(() => { fetchOnce() }, 2000)
       }
       ws.onmessage = (ev) => {
         if (cancelled) return
         if (firstMsgTimer) { clearTimeout(firstMsgTimer); firstMsgTimer = undefined }
-        // First real message means push is working — fallback poll
-        // would be wasted DO requests, so drop it.
         stopFallback()
         try {
-          const data = JSON.parse(ev.data) as State
-          setState(data)
+          const f = JSON.parse(ev.data) as
+            | { t: 'state'; state: State }
+            | { t: 'relay-info'; connected: boolean; root: string | null; login: string | null; token: string | null }
+          if (f.t === 'state') setState(f.state)
+          else if (f.t === 'relay-info') {
+            setRelay({
+              connected: f.connected,
+              root: f.root,
+              login: f.login,
+              token: f.token,
+            })
+          }
         } catch { /* ignore */ }
       }
       ws.onclose = () => {
@@ -105,8 +119,8 @@ export default function App() {
 
   return (
     <>
-      <Dashboard state={state} />
-      <InstallModal />
+      <Dashboard state={state} relay={relay} />
+      <InstallModal relay={relay} />
     </>
   )
 }

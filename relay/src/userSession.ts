@@ -30,6 +30,7 @@ function decodeBinary(buf: ArrayBuffer): { streamId: number; chunk: Uint8Array }
 
 interface Env {
   USER: DurableObjectNamespace
+  ROOT_DOMAIN: string
 }
 
 interface PendingStream {
@@ -249,6 +250,10 @@ export class UserSession {
     this.state.acceptWebSocket(server, ['agent'])
     this.agentWS = server
     server.send(JSON.stringify({ t: 'hello', userId: this.uid ?? 0, login: this.login ?? '' } satisfies Frame))
+    // Dashboards subscribed via /_events_ws used to poll
+    // /api/_relay/info to detect the "agent online" transition. Push
+    // it instead so the install modal hides the moment orch dials in.
+    this.broadcastRelayInfo()
     return new Response(null, { status: 101, webSocket: client })
   }
 
@@ -269,13 +274,15 @@ export class UserSession {
     } catch {}
   }
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean) {
-    if (this.agentWS === ws) this.agentWS = null
+    const wasAgent = this.agentWS === ws
+    if (wasAgent) this.agentWS = null
     for (const s of this.streams.values()) {
       s.res.reject(new Error('agent disconnected'))
       try { s.body?.controller.close() } catch {}
       try { s.ws?.close(1011, 'agent disconnected') } catch {}
     }
     this.streams.clear()
+    if (wasAgent) this.broadcastRelayInfo()
   }
   async webSocketError(ws: WebSocket, _err: unknown) {
     if (this.agentWS === ws) this.agentWS = null
@@ -305,26 +312,60 @@ export class UserSession {
     }
   }
 
-  // Read-only state-event channel. Browsers open one WS here on
-  // dashboard mount and receive every /api/state push the agent emits.
-  // Accepted via state.acceptWebSocket so CF hibernates idle sockets —
-  // a backgrounded tab costs zero DO CPU until the next state change.
-  // We don't expect any inbound traffic from the browser; webSocketMessage
-  // ignores frames from these WSs.
+  // Read-only event channel for the dashboard. One WS per tab, accepted
+  // via state.acceptWebSocket so CF hibernates idle sockets — a
+  // backgrounded tab costs zero DO CPU until the next state change.
+  // Multiplexes two frame kinds:
+  //   {t:'state', state}       — full /api/state body, fanned out on
+  //                               every orch push
+  //   {t:'relay-info', ...}    — connectivity status + (owner-only)
+  //                               agent token, replaces the old
+  //                               /api/_relay/info polling endpoint
+  //
+  // The owner tag controls whether the agent token shows up in
+  // relay-info frames — collaborators see connected/root/login only.
   private async handleEventsWS(req: Request): Promise<Response> {
     if (req.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('expected websocket', { status: 426 })
     }
+    const isOwner = req.headers.get('x-orchid-owner') === '1'
     const pair = new WebSocketPair()
     const client = pair[0]
     const server = pair[1]
-    this.state.acceptWebSocket(server, ['events'])
-    // Prime the new subscriber with the latest cached state so the
-    // dashboard can render without a separate /api/state fetch.
+    const tags = isOwner ? ['events', 'owner'] : ['events', 'collab']
+    this.state.acceptWebSocket(server, tags)
+    try {
+      server.send(JSON.stringify(this.relayInfoFrame(isOwner)))
+    } catch {}
     if (this.lastState) {
-      try { server.send(this.lastState) } catch {}
+      try { server.send(JSON.stringify({ t: 'state', state: JSON.parse(this.lastState) })) } catch {}
     }
     return new Response(null, { status: 101, webSocket: client })
+  }
+
+  private relayInfoFrame(isOwner: boolean) {
+    return {
+      t: 'relay-info',
+      connected: !!this.agentWS,
+      root: this.env.ROOT_DOMAIN,
+      login: this.login,
+      // The token grants full agent impersonation. Only the subdomain
+      // owner ever gets it — collab WSs get it as null.
+      token: isOwner ? this.agentToken : null,
+    }
+  }
+
+  // Broadcast a relay-info frame to every subscriber. Owner and collab
+  // groups get separate payloads because the token field is privileged.
+  private broadcastRelayInfo() {
+    const ownerFrame = JSON.stringify(this.relayInfoFrame(true))
+    const collabFrame = JSON.stringify(this.relayInfoFrame(false))
+    for (const ws of this.state.getWebSockets('owner')) {
+      try { ws.send(ownerFrame) } catch {}
+    }
+    for (const ws of this.state.getWebSockets('collab')) {
+      try { ws.send(collabFrame) } catch {}
+    }
   }
 
   private async handleProxyWS(req: Request): Promise<Response> {
@@ -423,8 +464,11 @@ export class UserSession {
           // saves N sends across all hibernated subs for no-op ticks.
           if (body === this.lastState) return
           this.lastState = body
+          // Wrap as a discriminated frame so the same WS can carry
+          // state pushes and relay-info events to the dashboard.
+          const wrapped = `{"t":"state","state":${body}}`
           for (const sub of this.state.getWebSockets('events')) {
-            try { sub.send(body) } catch {}
+            try { sub.send(wrapped) } catch {}
           }
         } catch {}
         return

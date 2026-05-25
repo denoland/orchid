@@ -1,56 +1,26 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { OrchidArt } from './OrchidArt'
-
-interface RelayInfo {
-  connected: boolean
-  token: string | null
-  login: string | null
-  root: string
-}
+import type { RelayInfo } from './App'
 
 /// When the dashboard is hosted via the orchid.com relay and the user's
-/// orch instance hasn't dialed in yet, the relay returns `connected:
-/// false` and the agent token. We show this modal with the one-liner
-/// install command so the user can wire it up.
-export function InstallModal() {
-  const [info, setInfo] = useState<RelayInfo | null>(null)
+/// orch instance hasn't dialed in yet, the relay broadcasts a
+/// relay-info frame with connected:false + the agent token. We show
+/// this modal with the one-liner install command so the user can wire
+/// it up. Relay info arrives via the events WS in App.tsx — no
+/// separate polling endpoint here.
+export function InstallModal({ relay }: { relay: RelayInfo | null }) {
   // Once dismissed, stay dismissed — a flaky DO sometimes reports
   // connected:false even when the agent's WS is alive, and we don't
   // want the modal to keep popping back over the dashboard.
   const [hidden, setHidden] = useState<boolean>(() => localStorage.getItem('orchid.installSeen') === '1')
 
-  useEffect(() => {
-    let cancelled = false
-    let id: ReturnType<typeof setInterval> | undefined
-    async function poll() {
-      if (document.hidden) return
-      try {
-        const res = await fetch('/api/_relay/info', { credentials: 'same-origin' })
-        if (!res.ok) { if (id) clearInterval(id); return }
-        const j = (await res.json()) as RelayInfo
-        if (cancelled) return
-        setInfo(j)
-        // Once the agent is connected we don't need to keep polling —
-        // the install modal only exists to surface the join command
-        // while orch is offline. If it later goes down, /api/state's
-        // 503 + browser refresh will bring this back.
-        if (j.connected && id) { clearInterval(id); id = undefined }
-      } catch { /* swallow */ }
-    }
-    poll()
-    id = setInterval(poll, 10000)
-    return () => { cancelled = true; if (id) clearInterval(id) }
-  }, [])
+  if (!relay || relay.connected || hidden || !relay.token || !relay.root) return null
 
-  if (!info || info.connected || hidden) return null
-
-  const sub = info.login?.toLowerCase().replace(/[^a-z0-9-]/g, '') ?? 'me'
-  // Authoritative root from the relay's ROOT_DOMAIN — beats parsing
-  // location.hostname which gets confused by 3+ label setups.
-  const root = info.root
+  const sub = relay.login?.toLowerCase().replace(/[^a-z0-9-]/g, '') ?? 'me'
+  const root = relay.root
   const relayURL = `wss://${sub}.${root}/agent`
   const install = `curl -fsSL https://${root}/install.sh | bash`
-  const join = `orch join ${relayURL} ${info.token}`
+  const join = `orch join ${relayURL} ${relay.token}`
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-zinc-900/40 backdrop-blur-sm p-6">

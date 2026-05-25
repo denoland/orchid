@@ -192,18 +192,25 @@ app.use('*', async (c, next) => {
     return do_.fetch(new Request('https://internal/_gh_repos'))
   }
 
-  // Push channel for /api/state. The DO holds a hibernated WS per
-  // browser tab; orch sends an update frame on every state change.
-  // Bypasses the agent-tunnel path entirely so an idle subscriber
-  // costs zero DO CPU/requests after the initial open.
+  // Push channel for /api/state + relay-info. The DO holds a hibernated
+  // WS per browser tab; orch + relay broadcast frames as conditions
+  // change. Bypasses the agent-tunnel path entirely so an idle
+  // subscriber costs zero DO CPU/requests after the initial open.
   if (url.pathname === '/api/events/ws') {
     if (c.req.raw.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('expected websocket', { status: 426 })
     }
     const do_ = c.env.USER.get(c.env.USER.idFromName(sub))
+    // The owner flag controls whether relay-info frames sent on this WS
+    // include the agent token. checked here against the same
+    // user.subdomain test the rest of the middleware uses.
+    const isOwner = !!user && user.subdomain === sub
     return do_.fetch(new Request('https://internal/_events_ws', {
       method: 'GET',
-      headers: { 'upgrade': 'websocket' },
+      headers: {
+        'upgrade': 'websocket',
+        'x-orchid-owner': isOwner ? '1' : '0',
+      },
     }))
   }
 
