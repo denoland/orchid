@@ -533,7 +533,7 @@ func TestPatchHCLAddsVMBlock(t *testing.T) {
 
 orchestrator {
   poll_interval = "30s"
-  state_file    = "/root/orch/state.json"
+  state_db      = "/root/orch/state.db"
   branch_prefix = "orch/"
   workdir_root  = "/home/orchid/orch-work"
 }

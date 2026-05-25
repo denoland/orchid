@@ -4,7 +4,7 @@ github {
 
 orchestrator {
   poll_interval = "30s"
-  state_file    = "/root/orch/state.json"
+  state_db      = "/root/orch/state.db"
   branch_prefix = "orch/issue-"
   workdir_root  = "/home/orchid/orch-work"
   http_addr     = ":8000"

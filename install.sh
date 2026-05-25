@@ -27,7 +27,7 @@
 #   INSTALL_DIR    $HOME/.orch
 #   BIN_DIR        $HOME/.local/bin
 #   SRC_DIR        $INSTALL_DIR/src
-#   GO_VERSION     1.23.4 (only downloaded if system go is absent/older)
+#   GO_VERSION     1.25.0 (only downloaded if system go is absent/older)
 #   ORCHID_REPO    denoland/orchid (source repo to build from)
 #   INBOX_REPO     prompted          (e.g. denoland/orchid; central only)
 #   HTTP_SECRET    auto              (32-hex random; gates the dashboard)
@@ -47,7 +47,8 @@ set -euo pipefail
 INSTALL_DIR=${INSTALL_DIR:-$HOME/.orch}
 BIN_DIR=${BIN_DIR:-$HOME/.local/bin}
 SRC_DIR=${SRC_DIR:-$INSTALL_DIR/src}
-GO_VERSION=${GO_VERSION:-1.23.4}
+# modernc.org/sqlite v1.50+ (used for state.db) needs go 1.25.
+GO_VERSION=${GO_VERSION:-1.25.0}
 WORKER=${WORKER:-0}
 ORCHID_REPO=${ORCHID_REPO:-denoland/orchid}
 
@@ -109,7 +110,8 @@ GO_BIN=$(command -v go || true)
 GO_OK=0
 if [ -n "$GO_BIN" ]; then
   GO_VER=$("$GO_BIN" env GOVERSION 2>/dev/null | sed 's/go//' | head -c4)
-  [ -n "$GO_VER" ] && [ "$GO_VER" \> "1.22" ] && GO_OK=1
+  # modernc.org/sqlite (state.db driver) requires go 1.25+.
+  [ -n "$GO_VER" ] && [ "$GO_VER" \> "1.24" ] && GO_OK=1
 fi
 if [ "$GO_OK" -ne 1 ]; then
   say "installing go $GO_VERSION into \$HOME/.local/go"
@@ -211,7 +213,7 @@ github {
 
 orchestrator {
   poll_interval = "30s"
-  state_file    = "$INSTALL_DIR/state.json"
+  state_db      = "$INSTALL_DIR/state.db"
   branch_prefix = "orch/"
   workdir_root  = "$INSTALL_DIR/orch-work"
   http_addr     = ":8000"

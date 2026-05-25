@@ -22,7 +22,7 @@ github {
 
 orchestrator {
   poll_interval = "30s"
-  state_file    = "/tmp/orchid-capture-state.json"
+  state_db      = "/tmp/orchid-capture-state.db"
   branch_prefix = "capture/"
   workdir_root  = "/tmp/orchid-capture-work"
   http_addr     = "127.0.0.1:8787"
@@ -30,7 +30,7 @@ orchestrator {
 
   capture {
     auth_token = "local-dev-token"
-    // Drop image/voice blobs here. Defaults to <state_file dir>/captures.
+    // Drop image/voice blobs here. Defaults to <state_db dir>/captures.
     assets_dir = "/tmp/orchid-capture-assets"
     // Leave public_url empty when running locally — issues will link to the
     // on-disk path with a note instead of trying to embed an unreachable URL.

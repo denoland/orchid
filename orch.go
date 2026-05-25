@@ -112,9 +112,13 @@ type TargetBlock struct {
 }
 
 type OrchBlock struct {
-	PollInterval  string         `hcl:"poll_interval" json:"poll_interval"`
-	StateFile     string         `hcl:"state_file" json:"state_file"`
-	BranchPrefix  string         `hcl:"branch_prefix" json:"branch_prefix"`
+	PollInterval string `hcl:"poll_interval" json:"poll_interval"`
+	// StateDB is the path to the sqlite database file that holds every
+	// piece of orchid state that survives a restart: tracked jobs, the
+	// mention watcher's cursor + maintainer cache, and the dashboard's
+	// opaque layout blob. Replaced the old state_file / snap.json pair.
+	StateDB      string `hcl:"state_db" json:"state_db"`
+	BranchPrefix string `hcl:"branch_prefix" json:"branch_prefix"`
 	WorkdirRoot   string         `hcl:"workdir_root" json:"workdir_root"`
 	HTTPAddr      string         `hcl:"http_addr,optional" json:"http_addr,omitempty"`
 	HTTPSecret    string         `hcl:"http_secret,optional" json:"http_secret,omitempty"`
@@ -225,9 +229,10 @@ type Job struct {
 
 type State struct {
 	mu            sync.Mutex
-	Jobs          map[int]*Job     `json:"jobs"`
-	MentionCursor *time.Time       `json:"mention_cursor,omitempty"` // last "updated" timestamp seen by the mention poller
-	Maintainers   *MaintainerCache `json:"maintainers,omitempty"`    // cached org member list
+	Jobs          map[int]*Job     // active jobs, keyed by inbox issue number
+	MentionCursor *time.Time       // last "updated" timestamp seen by the mention poller
+	Maintainers   *MaintainerCache // cached org member list
+	store         *Store           // sqlite persistence backing all three fields above
 	httpSnap      atomic.Value     // stores map[int]Job; refreshed at tick start, lock-free reads
 	// Bcast is a coalescing change signal. saveState non-blocking-sends
 	// here so any subscriber goroutine (the relay agent's state pusher)
@@ -1774,38 +1779,44 @@ func renderBootstrap(tmpl string, is Issue, branch, targetName, targetRepo, inbo
 	).Replace(tmpl)
 }
 
-func loadState(path string) (*State, error) {
-	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return &State{Jobs: map[int]*Job{}, Bcast: make(chan struct{}, 1)}, nil
-	}
+// loadState opens the sqlite store at dbPath and reads any existing
+// persisted state. If a legacy state.json (or snap.json siblings) lives
+// alongside an empty DB, they're imported once and renamed with a
+// .migrated suffix so we don't re-import them on the next boot. This
+// keeps an in-flight orchestrator's tracked jobs intact across the
+// json→sqlite cutover.
+func loadState(dbPath string) (*State, error) {
+	store, err := openStore(dbPath)
 	if err != nil {
 		return nil, err
 	}
-	var s State
-	if err := json.Unmarshal(b, &s); err != nil {
+	legacyState := filepath.Join(filepath.Dir(dbPath), "state.json")
+	legacySnap := filepath.Join(filepath.Dir(dbPath), "snap.json")
+	if err := store.migrateLegacyJSON(legacyState, legacySnap); err != nil {
+		_ = store.Close()
 		return nil, err
 	}
-	if s.Jobs == nil {
-		s.Jobs = map[int]*Job{}
+	jobs, cursor, maint, err := store.LoadState()
+	if err != nil {
+		_ = store.Close()
+		return nil, err
 	}
-	s.Bcast = make(chan struct{}, 1)
-	return &s, nil
+	s := &State{
+		Jobs:          jobs,
+		MentionCursor: cursor,
+		Maintainers:   maint,
+		store:         store,
+		Bcast:         make(chan struct{}, 1),
+	}
+	return s, nil
 }
 
-func saveState(path string, s *State) error {
-	b, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
+// saveState writes the in-memory State back to sqlite and refreshes the
+// lock-free HTTP snapshot. Caller must hold s.mu.
+func saveState(s *State) error {
+	if err := s.store.SaveState(s.Jobs, s.MentionCursor, s.Maintainers); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	// refresh HTTP snapshot after every state write (caller holds s.mu)
 	snap := make(map[int]Job, len(s.Jobs))
 	for n, j := range s.Jobs {
 		snap[n] = *j
@@ -2330,7 +2341,7 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 			n, j.Schedule, cron.ScheduleStr, j.Timeout, cron.TimeoutStr)
 		j.Schedule = cron.ScheduleStr
 		j.Timeout = cron.TimeoutStr
-		_ = saveState(cfg.Orch.StateFile, st)
+		_ = saveState(st)
 	}
 	now := time.Now()
 	if j.Tmux != "" {
@@ -2350,7 +2361,7 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 					j.Tmux = ""
 					j.VM = ""
 					j.FireStartedAt = time.Time{}
-					_ = saveState(cfg.Orch.StateFile, st)
+					_ = saveState(st)
 				}
 				return
 			}
@@ -2359,7 +2370,7 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 			j.Tmux = ""
 			j.VM = ""
 			j.FireStartedAt = time.Time{}
-			_ = saveState(cfg.Orch.StateFile, st)
+			_ = saveState(st)
 		}
 	}
 	if now.Before(j.NextFireAt) {
@@ -2381,7 +2392,7 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 	fireDoneAt := time.Now()
 	j.NextFireAt = fireDoneAt.Add(cron.Schedule)
 	j.FireStartedAt = fireDoneAt
-	_ = saveState(cfg.Orch.StateFile, st)
+	_ = saveState(st)
 }
 
 // --- mention watcher ---
@@ -2497,7 +2508,7 @@ func refreshMaintainers(cfg *Config, st *State, ttl time.Duration) error {
 	st.Maintainers = &MaintainerCache{FetchedAt: time.Now(), Members: humans}
 	log.Printf("mentions: refreshed maintainer cache for %s (%d humans, %d bots filtered)",
 		cfg.Orch.Mentions.Org, len(humans), len(members)-len(humans))
-	_ = saveState(cfg.Orch.StateFile, st)
+	_ = saveState(st)
 	return nil
 }
 
@@ -2837,7 +2848,7 @@ func mentionTick(cfg *Config, st *State) {
 	}
 	if maxSeen.After(since) {
 		st.MentionCursor = &maxSeen
-		_ = saveState(cfg.Orch.StateFile, st)
+		_ = saveState(st)
 	}
 }
 
@@ -2903,7 +2914,7 @@ func tick(cfg *Config, st *State) {
 			}
 			log.Printf("issue #%d: registered cron job (target=%s, schedule=%s, timeout=%s)",
 				n, r.target.Name, cron.ScheduleStr, cron.TimeoutStr)
-			_ = saveState(cfg.Orch.StateFile, st)
+			_ = saveState(st)
 			continue
 		}
 		// Oneshot: spawn immediately.
@@ -2916,7 +2927,7 @@ func tick(cfg *Config, st *State) {
 			log.Printf("issue #%d: spawn failed on %s: %v", n, vm.Name, err)
 			continue
 		}
-		_ = saveState(cfg.Orch.StateFile, st)
+		_ = saveState(st)
 	}
 
 	// Bound how many dead-session respawns we issue per tick. Each respawn
@@ -2941,7 +2952,7 @@ func tick(cfg *Config, st *State) {
 				log.Printf("issue #%d: lifecycle drift (have=%q want=%s) — dropping for re-registration",
 					n, j.Lifecycle, map[bool]string{true: "cron", false: "oneshot"}[wantCron])
 				tearDown(cfg, st, n)
-				_ = saveState(cfg.Orch.StateFile, st)
+				_ = saveState(st)
 				continue
 			}
 		} else if _, stillOpen := allOpen[n]; !stillOpen {
@@ -2949,7 +2960,7 @@ func tick(cfg *Config, st *State) {
 			// (Or its target label was removed; in that case allOpen
 			// would still contain it and we'd keep the job running.)
 			tearDown(cfg, st, n)
-			_ = saveState(cfg.Orch.StateFile, st)
+			_ = saveState(st)
 			continue
 		}
 		// Cron lifecycle: fire ephemeral sessions on schedule, no PR watch.
@@ -2962,7 +2973,7 @@ func tick(cfg *Config, st *State) {
 				// issue's still open — drop the Job either way.
 				log.Printf("issue #%d: cron job no longer in open list, dropping", n)
 				tearDown(cfg, st, n)
-				_ = saveState(cfg.Orch.StateFile, st)
+				_ = saveState(st)
 				continue
 			}
 			tickCron(cfg, st, n, j, r.is, r.target)
@@ -2972,7 +2983,7 @@ func tick(cfg *Config, st *State) {
 		if vm == nil {
 			log.Printf("issue #%d: vm %q gone from config, dropping", n, j.VM)
 			delete(st.Jobs, n)
-			_ = saveState(cfg.Orch.StateFile, st)
+			_ = saveState(st)
 			continue
 		}
 		alive, err := tmuxHasSession(*vm, j.Tmux)
@@ -2998,7 +3009,7 @@ func tick(cfg *Config, st *State) {
 				log.Printf("issue #%d: tmux session %q gone, tearing down", n, j.Tmux)
 				tearDown(cfg, st, n)
 			}
-			_ = saveState(cfg.Orch.StateFile, st)
+			_ = saveState(st)
 			continue
 		}
 		if j.PR == 0 {
@@ -3025,7 +3036,7 @@ func tick(cfg *Config, st *State) {
 						if strings.Contains(err.Error(), "already exists") {
 							log.Printf("issue #%d: branch %s already has a PR by another account, tearing down", n, j.Branch)
 							tearDown(cfg, st, n)
-							_ = saveState(cfg.Orch.StateFile, st)
+							_ = saveState(st)
 							continue
 						}
 						log.Printf("issue #%d: auto-create PR: %v", n, err)
@@ -3044,7 +3055,7 @@ func tick(cfg *Config, st *State) {
 				fmt.Sprintf("PR opened: issue #%d", n),
 				fmt.Sprintf("%s\n%s", j.Branch, prURL),
 				prURL)
-			_ = saveState(cfg.Orch.StateFile, st)
+			_ = saveState(st)
 		}
 		v, err := ghPRView(j.TargetRepo, j.PR)
 		viewedAt := time.Now()
@@ -3061,7 +3072,7 @@ func tick(cfg *Config, st *State) {
 					prURL)
 			}
 			tearDown(cfg, st, n)
-			_ = saveState(cfg.Orch.StateFile, st)
+			_ = saveState(st)
 			continue
 		}
 		botLogin, _ := vmBotIdentity(cfg.Orch, *vm)
@@ -3082,7 +3093,7 @@ func tick(cfg *Config, st *State) {
 				j.SeenReviewIDs = append(j.SeenReviewIDs, sr...)
 				j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, st_...)
 				j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, si...)
-				_ = saveState(cfg.Orch.StateFile, st)
+				_ = saveState(st)
 			}
 			continue
 		}
@@ -3101,7 +3112,7 @@ func tick(cfg *Config, st *State) {
 				if _, _, e := sshExec(*vm, fmt.Sprintf("tmux rename-session -t %s %s", j.Tmux, want)); e == nil {
 					log.Printf("issue #%d: tmux renamed %s → %s (detected %s in pane)", n, j.Tmux, want, detected)
 					j.Tmux = want
-					_ = saveState(cfg.Orch.StateFile, st)
+					_ = saveState(st)
 				}
 			}
 		}
@@ -3122,7 +3133,7 @@ func tick(cfg *Config, st *State) {
 			} else if fresh.State == "MERGED" || fresh.State == "CLOSED" {
 				log.Printf("issue #%d: PR %s between view and poke — skipping poke and tearing down", n, fresh.State)
 				tearDown(cfg, st, n)
-				_ = saveState(cfg.Orch.StateFile, st)
+				_ = saveState(st)
 				continue
 			}
 		}
@@ -3151,7 +3162,7 @@ func tick(cfg *Config, st *State) {
 				j.LastCheckConclusions[c.Name] = c.Conclusion
 			}
 		}
-		_ = saveState(cfg.Orch.StateFile, st)
+		_ = saveState(st)
 		log.Printf("issue #%d: poked PR #%d", n, j.PR)
 	}
 }
@@ -3283,7 +3294,7 @@ func describe(cfg *Config, st *State, hostname string) string {
 	}
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "- Branch:       %s<N>\n", cfg.Orch.BranchPrefix)
-	fmt.Fprintf(&b, "- State:        %s\n", cfg.Orch.StateFile)
+	fmt.Fprintf(&b, "- State:        %s\n", cfg.Orch.StateDB)
 	fmt.Fprintf(&b, "- Workdir root: %s\n", cfg.Orch.WorkdirRoot)
 	fmt.Fprintf(&b, "- Poll:         %s\n", cfg.Orch.PollInterval)
 	if cfg.Orch.HTTPAddr != "" {
@@ -3837,22 +3848,21 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 	}))
 
 	// GET/PUT /api/snap — opaque dashboard layout state (card positions,
-	// notes, links, strokes). Persisted alongside state.json so the canvas
-	// survives across browsers; replaces the localStorage scheme.
-	snapPath := filepath.Join(filepath.Dir(cfg.Orch.StateFile), "snap.json")
+	// notes, links, strokes). Persisted in the sqlite state DB so the
+	// canvas survives across browsers; replaces the localStorage scheme.
+	// PutSnap also rotates the prior value into a snap.bak row so a buggy
+	// client clobbering positions doesn't destroy the last good layout.
 	mux.HandleFunc("/api/snap", auth(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			w.Header().Set("Cache-Control", "no-store")
-			b, err := os.ReadFile(snapPath)
+			b, err := st.store.GetSnap()
 			if err != nil {
-				if os.IsNotExist(err) {
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write([]byte("{}"))
-					return
-				}
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
+			}
+			if b == nil {
+				b = []byte("{}")
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(b)
@@ -3866,18 +3876,7 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				http.Error(w, "invalid json", http.StatusBadRequest)
 				return
 			}
-			tmp := snapPath + ".tmp"
-			if err := os.WriteFile(tmp, body, 0o644); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			// Keep the previous good snap as .bak before overwriting —
-			// if a buggy client (or future code) clobbers positions, the
-			// most recent prior layout is still recoverable from disk.
-			if prev, err := os.ReadFile(snapPath); err == nil && len(prev) > 0 {
-				_ = os.WriteFile(snapPath+".bak", prev, 0o644)
-			}
-			if err := os.Rename(tmp, snapPath); err != nil {
+			if err := st.store.PutSnap(body); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -4594,7 +4593,7 @@ func main() {
 	if err := hclsimple.DecodeFile(*cfgPath, nil, &cfg); err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	st, err := loadState(cfg.Orch.StateFile)
+	st, err := loadState(cfg.Orch.StateDB)
 	if err != nil {
 		log.Fatalf("state: %v", err)
 	}
@@ -4721,9 +4720,12 @@ func main() {
 		if *relayToken == "" {
 			log.Fatalf("-relay requires -relay-token (issued by the relay on signup)")
 		}
-		snapPath := filepath.Join(filepath.Dir(cfg.Orch.StateFile), "snap.json")
+		// snapRead/snapWrite back the events-WS snap channel. Source of
+		// truth is the sqlite store — same rows the /api/snap HTTP
+		// handler reads from, so a browser writing layout via the WS
+		// and another viewing it via the HTTP path see the same data.
 		snapRead := func() []byte {
-			b, err := os.ReadFile(snapPath)
+			b, err := st.store.GetSnap()
 			if err != nil {
 				return nil
 			}
@@ -4733,14 +4735,7 @@ func main() {
 			if !json.Valid(body) {
 				return fmt.Errorf("invalid json")
 			}
-			tmp := snapPath + ".tmp"
-			if err := os.WriteFile(tmp, body, 0o644); err != nil {
-				return err
-			}
-			if prev, err := os.ReadFile(snapPath); err == nil && len(prev) > 0 {
-				_ = os.WriteFile(snapPath+".bak", prev, 0o644)
-			}
-			return os.Rename(tmp, snapPath)
+			return st.store.PutSnap(body)
 		}
 		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st), st.Bcast, func() []byte { return buildAPIStateJSON(&cfg, st) }, snapRead, snapWrite, func(s string) *VMBlock { return lookupPaneVM(&cfg, st, s) })
 	}

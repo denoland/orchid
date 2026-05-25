@@ -4,10 +4,20 @@
 /orch-linux.gz
 orch-chunk-*
 notes.txt
+state.db
+state.db-shm
+state.db-wal
+# Pre-sqlite state files — left here so dev clones with an old runtime
+# directory don't accidentally commit them. The runtime renames them to
+# <name>.migrated on first import.
 state.json
 state.json.tmp
+state.json.migrated
 snap.json
 snap.json.tmp
+snap.json.bak
+snap.json.migrated
+snap.json.bak.migrated
 /logs/
 dinner.py
 
