@@ -65,6 +65,14 @@ export class UserSession {
       this.uid = (await state.storage.get('uid')) ?? null
       this.login = (await state.storage.get('login')) ?? null
       this.ghToken = (await state.storage.get('ghToken')) ?? null
+      // Resurrect the agent WS that Cloudflare held open across DO
+      // eviction. Without this, every cold start reports
+      // `connected: false` until the agent's next reconnect — which
+      // can be minutes away if the original socket is still alive.
+      const existing = state.getWebSockets('agent')
+      if (existing.length > 0) {
+        this.agentWS = existing[0] as unknown as WebSocket
+      }
     })
   }
 
@@ -192,23 +200,37 @@ export class UserSession {
     const pair = new WebSocketPair()
     const client = pair[0]
     const server = pair[1]
-    server.accept()
     if (this.agentWS) {
       try { this.agentWS.close(4000, 'replaced by new agent') } catch {}
     }
+    // Tag the WS so the constructor can find it again via
+    // state.getWebSockets('agent') after CF evicts this DO instance.
+    // The class-level webSocketMessage/webSocketClose hooks below
+    // replace the per-instance addEventListener pattern.
+    this.state.acceptWebSocket(server, ['agent'])
     this.agentWS = server
-    server.addEventListener('message', (ev) => this.onAgentMessage(ev))
-    server.addEventListener('close', () => {
-      if (this.agentWS === server) this.agentWS = null
-      for (const s of this.streams.values()) {
-        s.res.reject(new Error('agent disconnected'))
-        try { s.body?.controller.close() } catch {}
-        try { s.ws?.close(1011, 'agent disconnected') } catch {}
-      }
-      this.streams.clear()
-    })
     server.send(JSON.stringify({ t: 'hello', userId: this.uid ?? 0, login: this.login ?? '' } satisfies Frame))
     return new Response(null, { status: 101, webSocket: client })
+  }
+
+  // Class-level hibernation hooks. CF calls these for any WS the DO
+  // accepted via state.acceptWebSocket. Routes everything through the
+  // same handler the old addEventListener path used.
+  async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer) {
+    if (this.agentWS == null) this.agentWS = ws
+    this.onAgentMessage({ data } as MessageEvent)
+  }
+  async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean) {
+    if (this.agentWS === ws) this.agentWS = null
+    for (const s of this.streams.values()) {
+      s.res.reject(new Error('agent disconnected'))
+      try { s.body?.controller.close() } catch {}
+      try { s.ws?.close(1011, 'agent disconnected') } catch {}
+    }
+    this.streams.clear()
+  }
+  async webSocketError(ws: WebSocket, _err: unknown) {
+    if (this.agentWS === ws) this.agentWS = null
   }
 
   private async handleProxy(req: Request): Promise<Response> {
