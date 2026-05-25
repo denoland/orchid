@@ -146,9 +146,11 @@ app.use('*', async (c, next) => {
       // the "online/offline" pill, never the token.
       const r = await do_.fetch(new Request('https://internal/_info'))
       const j = (await r.json()) as { connected?: boolean }
-      return Response.json({ connected: !!j.connected })
+      return Response.json({ connected: !!j.connected, root: c.env.ROOT_DOMAIN })
     }
-    return do_.fetch(new Request('https://internal/_info'))
+    const r = await do_.fetch(new Request('https://internal/_info'))
+    const j = (await r.json()) as Record<string, any>
+    return Response.json({ ...j, root: c.env.ROOT_DOMAIN })
   }
 
   // Owner-initiated agent-token reset. Wipes the DO-side token and
