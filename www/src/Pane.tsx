@@ -102,13 +102,30 @@ export function Pane({ session }: Props) {
       )
       es.onopen = () => setStatus('live')
       const decoder = new TextDecoder('utf-8')
-      es.onmessage = (ev) => {
+      const decodeBytes = (data: string) => {
+        const bin = atob(data)
+        const out = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
+        return out
+      }
+      es.onmessage = async (ev) => {
         try {
-          // atob produces a binary string where each char is a raw byte;
-          // decode to real UTF-8 so multi-byte glyphs survive.
-          const bin = atob(ev.data)
-          const bytes = new Uint8Array(bin.length)
-          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+          let raw: string = ev.data
+          let bytes: Uint8Array
+          if (raw.startsWith('z:')) {
+            // Per-frame gzip: orch packs each tmux snapshot through
+            // gzip, base64-encodes the bytes, and tags them `z:` so we
+            // know to inflate via the platform DecompressionStream API.
+            // Done at the app layer because Content-Encoding doesn't
+            // pass cleanly through the relay tunnel.
+            const gz = decodeBytes(raw.slice(2))
+            const stream = new Blob([gz as BlobPart]).stream()
+              .pipeThrough(new DecompressionStream('gzip'))
+            const buf = await new Response(stream).arrayBuffer()
+            bytes = new Uint8Array(buf)
+          } else {
+            bytes = decodeBytes(raw)
+          }
           term.clear()
           term.write(decoder.decode(bytes))
         } catch { /* malformed frame, ignore */ }

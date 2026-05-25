@@ -3513,29 +3513,7 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.Header().Set("Connection", "keep-alive")
-		// Pane frames are ANSI-saturated tmux output — 5-10× compressible
-		// with gzip. Browsers + the relay tunnel pass Content-Encoding
-		// through transparently, and EventSource auto-decodes. Saves a
-		// chunk of egress + DO ingress bytes per second of streaming.
-		acceptsGzip := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
-		var out io.Writer = w
-		var gw *gzip.Writer
-		if acceptsGzip {
-			w.Header().Set("Content-Encoding", "gzip")
-			gw = gzip.NewWriter(w)
-			out = gw
-			defer gw.Close()
-		}
 		fl.Flush()
-		flush := func() error {
-			if gw != nil {
-				if err := gw.Flush(); err != nil {
-					return err
-				}
-			}
-			fl.Flush()
-			return nil
-		}
 
 		// Resize the tmux window to match the client's xterm dimensions
 		// so claude's TUI lays out exactly to the visible pane. Defaults
@@ -3559,13 +3537,13 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		}
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			fmt.Fprintf(out, "event: error\ndata: %s\n\n", err.Error())
-			_ = flush()
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+			fl.Flush()
 			return
 		}
 		if err := cmd.Start(); err != nil {
-			fmt.Fprintf(out, "event: error\ndata: %s\n\n", err.Error())
-			_ = flush()
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+			fl.Flush()
 			return
 		}
 		defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
@@ -3596,6 +3574,23 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			}
 		}()
 
+		// Per-frame compression: we wrap each pane snapshot in a gzip
+		// stream, base64-encode the result, and prefix the SSE data
+		// with "z:" so the browser knows to ungzip via DecompressionStream.
+		// Doing this at the application layer (rather than via
+		// Content-Encoding) sidesteps the relay tunnel — which doesn't
+		// guarantee transparent passthrough of the encoding header — and
+		// avoids any chance of CF double-encoding the response.
+		gzbuf := new(bytes.Buffer)
+		gzwriter := gzip.NewWriter(gzbuf)
+		gzipFrame := func(s string) string {
+			gzbuf.Reset()
+			gzwriter.Reset(gzbuf)
+			_, _ = gzwriter.Write([]byte(s))
+			_ = gzwriter.Close()
+			return "z:" + base64.StdEncoding.EncodeToString(gzbuf.Bytes())
+		}
+
 		keepalive := time.NewTicker(20 * time.Second)
 		defer keepalive.Stop()
 		var last string
@@ -3610,20 +3605,15 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 					continue
 				}
 				last = snap
-				enc := base64.StdEncoding.EncodeToString([]byte(snap))
-				if _, err := fmt.Fprintf(out, "data: %s\n\n", enc); err != nil {
+				if _, err := fmt.Fprintf(w, "data: %s\n\n", gzipFrame(snap)); err != nil {
 					return
 				}
-				if err := flush(); err != nil {
-					return
-				}
+				fl.Flush()
 			case <-keepalive.C:
-				if _, err := fmt.Fprintf(out, ": ping\n\n"); err != nil {
+				if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
 					return
 				}
-				if err := flush(); err != nil {
-					return
-				}
+				fl.Flush()
 			}
 		}
 	}))
