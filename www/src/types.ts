@@ -1,3 +1,15 @@
+export interface UsageHistoryRow {
+  date: string
+  session_id: string
+  model: string
+  issue?: number
+  input_tokens: number
+  cache_creation: number
+  cache_read: number
+  output_tokens: number
+  cost_usd: number
+}
+
 export interface PaneUsage {
   model?: string
   cost_usd?: number

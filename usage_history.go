@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -97,8 +98,14 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 	type bucket struct {
 		in, cc, cr, out int64
 		cost            float64
+		issue           int
 	}
 	buckets := map[bucketKey]*bucket{}
+	// Parent directory of every jsonl is the cwd-encoded project, like
+	// `-home-orchid-orch-work-issue-230`. Pull the issue number once
+	// per file so we can group by repo on the dashboard side without
+	// re-parsing every transcript line.
+	pathIssueRe := cwdIssueRe
 
 	err := filepath.WalkDir(projectsRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -126,6 +133,16 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 		if start > 0 {
 			if _, err := f.Seek(start, 0); err != nil {
 				return nil
+			}
+		}
+		// Decode the issue number from the parent directory once per
+		// file. claude encodes the cwd as the dir name with slashes
+		// turned into dashes — `/home/orchid/orch-work/issue-N`
+		// becomes `-home-orchid-orch-work-issue-N`.
+		issueNum := 0
+		if m := pathIssueRe.FindStringSubmatch(filepath.Base(filepath.Dir(path))); len(m) > 0 {
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				issueNum = n
 			}
 		}
 		sc := bufio.NewScanner(f)
@@ -162,6 +179,9 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 			b.cr += u.CacheReadInputTokens
 			b.out += u.OutputTokens
 			b.cost += cost
+			if issueNum > 0 {
+				b.issue = issueNum
+			}
 		}
 		prog.set(path, consumed)
 		return nil
@@ -186,17 +206,19 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 		}
 		var in, cc, cr, out int64
 		var cost float64
+		issue := b.issue
 		if ex != nil {
 			in, cc, cr, out, cost = ex.InputTokens, ex.CacheCreation, ex.CacheRead, ex.OutputTokens, ex.CostUSD
+			if issue == 0 {
+				issue = ex.Issue
+			}
 		}
-		// Bucket holds tokens accumulated since last scan position;
-		// add them to whatever was already in the row.
 		in += b.in
 		cc += b.cc
 		cr += b.cr
 		out += b.out
 		cost += b.cost
-		if err := store.UpsertUsageDaily(k.date, k.session, k.model, in, cc, cr, out, cost); err != nil {
+		if err := store.UpsertUsageDaily(k.date, k.session, k.model, issue, in, cc, cr, out, cost); err != nil {
 			log.Printf("usage_history: upsert %s/%s failed: %v", k.date, k.session, err)
 		}
 	}
