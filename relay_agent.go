@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -28,14 +29,20 @@ import (
 // stream that lets the dashboard drop its 3s poll loop — relay
 // broadcasts each new body to all subscribed browsers and a hibernated
 // DO costs nothing when nothing's changing.
-func runRelayAgent(parent context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler, stateWake <-chan struct{}, statePush func() []byte) {
+//
+// snapRead returns the current snap.json bytes for the initial push
+// after every reconnect; snapWrite receives layout payloads from the
+// dashboard and persists them. Together they replace the /api/snap
+// HTTP path so card drags don't fan out into one DO+tunnel round-trip
+// per debounce.
+func runRelayAgent(parent context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler, stateWake <-chan struct{}, statePush func() []byte, snapRead func() []byte, snapWrite func([]byte) error) {
 	backoff := 500 * time.Millisecond
 	for {
 		if parent.Err() != nil {
 			return
 		}
 		sessionStart := time.Now()
-		err := relayAgentSession(parent, relayURL, token, httpSecret, localAddr, allowedLogins, handler, stateWake, statePush)
+		err := relayAgentSession(parent, relayURL, token, httpSecret, localAddr, allowedLogins, handler, stateWake, statePush, snapRead, snapWrite)
 		// A long-lived session means the connection was healthy — reset
 		// the backoff so a single hiccup later doesn't park us at 30s.
 		// Otherwise grow exponentially (capped) to avoid hammering CF
@@ -56,7 +63,7 @@ func runRelayAgent(parent context.Context, relayURL, token, httpSecret, localAdd
 	}
 }
 
-func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler, stateWake <-chan struct{}, statePush func() []byte) error {
+func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAddr string, allowedLogins []string, handler http.Handler, stateWake <-chan struct{}, statePush func() []byte, snapRead func() []byte, snapWrite func([]byte) error) error {
 	u, err := url.Parse(relayURL)
 	if err != nil {
 		return fmt.Errorf("parse relay url: %w", err)
@@ -93,6 +100,21 @@ func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAd
 		localAddr:  localAddr,
 		streams:    map[uint32]*agentStream{},
 		wsStreams:  map[uint32]*wsStream{},
+		snapWrite:  snapWrite,
+		subs:       make(chan int, 1),
+	}
+	// Assume subscribers until the relay tells us otherwise. The relay
+	// pushes a `subs` frame immediately on agent connect, but if it
+	// arrives late we'd rather waste one or two state-update frames
+	// than starve a dashboard that loaded right before the agent did.
+	a.subsActive.Store(true)
+
+	// Bootstrap the relay's snap cache so newly-arriving dashboard tabs
+	// can render the canvas layout without a separate HTTP fetch.
+	if snapRead != nil {
+		if b := snapRead(); len(b) > 0 && json.Valid(b) {
+			_ = a.sendCtl(ctx, ctlFrame{T: "snap", Snap: json.RawMessage(b)})
+		}
 	}
 
 	// Keep the relay connection warm. Cloudflare closes idle WebSockets
@@ -128,16 +150,19 @@ func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAd
 			// change → saveState → identical JSON). Hashing dodges
 			// both the WS write and the resulting DO wake on relay.
 			var lastHash uint64
-			emit := func() {
+			emit := func(force bool) {
+				if !force && !a.subsActive.Load() {
+					return
+				}
 				body := statePush()
 				h := fnv64(string(body))
-				if h == lastHash {
+				if h == lastHash && !force {
 					return
 				}
 				lastHash = h
 				_ = a.sendCtl(pingCtx, ctlFrame{T: "state-update", State: json.RawMessage(body)})
 			}
-			emit()
+			emit(false)
 			// 2s throttle keeps the dashboard near-real-time while
 			// folding sub-second bursts into a single frame.
 			throttle := time.NewTicker(2 * time.Second)
@@ -149,10 +174,20 @@ func relayAgentSession(ctx context.Context, relayURL, token, httpSecret, localAd
 					return
 				case <-stateWake:
 					pending = true
+				case n := <-a.subs:
+					// Subscriber count crossed a threshold. On a
+					// rising edge (0 → N) force a fresh push so the
+					// new dashboard renders immediately. On a falling
+					// edge (→ 0) the gate inside emit() will short-
+					// circuit subsequent attempts.
+					if n > 0 {
+						pending = false
+						emit(true)
+					}
 				case <-throttle.C:
 					if pending {
 						pending = false
-						emit()
+						emit(false)
 					}
 				}
 			}
@@ -172,6 +207,14 @@ type agent struct {
 	handler    http.Handler
 	httpSecret string
 	localAddr  string // host:port of orch's local http listener, used for WS bridging
+	snapWrite  func([]byte) error
+
+	// Sub-count signal from the relay. When zero, the state-pusher
+	// goroutine pauses emits — no point shipping state-update frames
+	// across the WS when nothing on the other end is going to read
+	// them. The channel coalesces (cap 1) and emits on every transition.
+	subs       chan int
+	subsActive atomic.Bool
 
 	mu        sync.Mutex
 	streams   map[uint32]*agentStream
@@ -197,10 +240,14 @@ type ctlFrame struct {
 	Data    string          `json:"data,omitempty"`
 	Code    int             `json:"code,omitempty"`
 	Reason  string          `json:"reason,omitempty"`
+	Count   int             `json:"count,omitempty"`
 	// State carries an /api/state payload on a "state-update" frame.
 	// Raw so we don't pay for double-JSON-encoding a body that's
 	// already JSON.
 	State json.RawMessage `json:"state,omitempty"`
+	// Snap carries the dashboard layout payload on "snap" (orch →
+	// relay → browser) and "snap-put" (browser → relay → orch) frames.
+	Snap json.RawMessage `json:"snap,omitempty"`
 }
 
 func (a *agent) sendCtl(ctx context.Context, f ctlFrame) error {
@@ -287,6 +334,23 @@ func (a *agent) onCtl(ctx context.Context, f *ctlFrame) {
 		a.mu.Unlock()
 		if ws != nil {
 			_ = ws.conn.Write(ctx, websocket.MessageText, []byte(f.Data))
+		}
+	case "subs":
+		// Relay's running sub count. Pause emits when nobody is
+		// watching; resume + force an immediate fresh push when the
+		// first subscriber arrives so they don't sit blank.
+		active := f.Count > 0
+		a.subsActive.Store(active)
+		select {
+		case a.subs <- f.Count:
+		default:
+		}
+	case "snap-put":
+		// Layout push from a dashboard tab via the events WS. Persist
+		// it to disk; the relay has already broadcast to other tabs
+		// in the same DO so we don't fan out further.
+		if a.snapWrite != nil && len(f.Snap) > 0 {
+			_ = a.snapWrite([]byte(f.Snap))
 		}
 	case "ws-close":
 		a.mu.Lock()

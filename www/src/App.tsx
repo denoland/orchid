@@ -1,5 +1,5 @@
 import { createContext, useEffect, useRef, useState } from 'react'
-import { Dashboard } from './Dashboard'
+import { Dashboard, setSnapBusSender } from './Dashboard'
 import { InstallModal } from './InstallModal'
 import type { State } from './types'
 
@@ -119,11 +119,22 @@ export default function App() {
 
     openWS()
 
+    // Route module-level snap saves through this WS so card drags
+    // never hit /api/snap HTTP. Cleared on unmount so the dashboard
+    // falls back to fetch keepalive in any teardown race.
+    setSnapBusSender((msg) => {
+      const w = wsRef.current
+      if (w && w.readyState === WebSocket.OPEN) {
+        try { w.send(JSON.stringify(msg)) } catch {}
+      }
+    })
+
     return () => {
       cancelled = true
       if (wsRef.current) { try { wsRef.current.close() } catch {} }
       stopFallback()
       if (reopenTimer) clearTimeout(reopenTimer)
+      setSnapBusSender(null)
     }
   }, [])
 
