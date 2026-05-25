@@ -1038,6 +1038,7 @@ function DashboardInner({ state, relay }: Props) {
         <Header
           inbox={inbox}
           count={jobs.length}
+          quota={state.quota}
           showComposer={!headerComposerDismissed && jobs.length === 0}
           view={view}
           setView={(v) => {
@@ -1153,9 +1154,10 @@ function DashboardInner({ state, relay }: Props) {
 }
 
 function Header({
-  count, showComposer, view, setView, onOpenSettings, onOpenCapture,
+  count, quota, showComposer, view, setView, onOpenSettings, onOpenCapture,
 }: {
   inbox: string; count: number; showComposer: boolean
+  quota?: State['quota']
   view: 'canvas' | 'list'; setView: (v: 'canvas' | 'list') => void
   onOpenSettings: () => void
   onOpenCapture: () => void
@@ -1174,6 +1176,7 @@ function Header({
             Orchid
           </h1>
           <span className="mono text-[12px] text-zinc-400 dark:text-zinc-500">{count}</span>
+          {quota && <QuotaStrip quota={quota} />}
           <div className="flex-1" />
           <HeaderBtnBar>
             <CaptureButton onClick={onOpenCapture} />
@@ -1193,6 +1196,51 @@ function Header({
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+/// Compact two-bar quota readout sourced from Claude Code's
+/// statusline.jsonl feed. Bar widths track used_percentage; the
+/// trailing label is the time to reset (4h12m / 2d3h). When usage
+/// outpaces elapsed-time we tint amber to flag burn faster than
+/// sustainable. Hidden entirely until the agent has reported once.
+function QuotaStrip({ quota }: { quota: NonNullable<State['quota']> }) {
+  const now = Math.floor(Date.now() / 1000)
+  const fmt = (secs: number) => {
+    if (secs <= 0) return 'now'
+    const h = Math.floor(secs / 3600)
+    const m = Math.floor((secs % 3600) / 60)
+    const d = Math.floor(h / 24)
+    if (d > 0) return `${d}d${h % 24}h`
+    if (h > 0) return `${h}h${m}m`
+    return `${m}m`
+  }
+  const bar = (label: string, pct: number, resets: number, window: number) => {
+    const elapsedPct = Math.min(100, Math.max(0, (1 - Math.max(0, resets - now) / window) * 100))
+    const hot = pct > elapsedPct + 5
+    const trackColor = hot ? 'bg-amber-200/60 dark:bg-amber-900/40' : 'bg-zinc-200 dark:bg-zinc-800'
+    const fillColor = hot ? 'bg-amber-500' : 'bg-emerald-500/80 dark:bg-emerald-400/80'
+    return (
+      <div className="flex items-center gap-1.5">
+        <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500 w-[18px]">{label}</span>
+        <div className={'relative h-1.5 w-20 rounded-full overflow-hidden ' + trackColor}>
+          <div className={'absolute inset-y-0 left-0 ' + fillColor} style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} />
+        </div>
+        <span className="mono text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">{Math.round(pct)}%</span>
+        <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500">{fmt(resets - now)}</span>
+      </div>
+    )
+  }
+  return (
+    <div
+      className="pointer-events-auto ml-3 flex items-center gap-3 bg-white/80 dark:bg-zinc-900/80 backdrop-blur ring-1 ring-zinc-200 dark:ring-zinc-700 rounded-md px-2.5 py-1"
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+      title="Claude subscription usage: 5-hour session window and 7-day cap. Amber = burning faster than elapsed time would sustain."
+    >
+      {bar('5h', quota.five_hour_pct, quota.five_hour_resets_at, 5 * 3600)}
+      {bar('7d', quota.seven_day_pct, quota.seven_day_resets_at, 7 * 24 * 3600)}
     </div>
   )
 }
@@ -2792,9 +2840,23 @@ function CardCompact({ job }: { job: Job }) {
           <span className="mono text-[10px] text-violet-500">cron</span>
         )}
       </div>
-      <div className="text-[13px] text-zinc-900 dark:text-zinc-100 leading-snug line-clamp-4 flex-1">
+      <div className="text-[13px] text-zinc-900 dark:text-zinc-100 leading-snug line-clamp-3 flex-1">
         {job.issue_title || '—'}
       </div>
+      {job.usage && (
+        <div className="flex items-center gap-1.5 mt-auto pt-0.5">
+          {typeof job.usage.context_pct === 'number' && (
+            <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500 tabular-nums" title="context window used">
+              ctx {Math.round(job.usage.context_pct)}%
+            </span>
+          )}
+          {typeof job.usage.cost_usd === 'number' && job.usage.cost_usd > 0 && (
+            <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500 tabular-nums" title="reported session cost">
+              ${job.usage.cost_usd < 1 ? job.usage.cost_usd.toFixed(2) : job.usage.cost_usd.toFixed(1)}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   )
 }

@@ -1,3 +1,9 @@
+export interface PaneUsage {
+  model?: string
+  cost_usd?: number
+  context_pct?: number
+}
+
 export interface Job {
   issue: number
   vm: string
@@ -13,6 +19,7 @@ export interface Job {
   last_check_conclusions: Record<string, string>
   activity?: number[]
   needs_input?: boolean
+  usage?: PaneUsage
 }
 
 export interface VM {
@@ -24,9 +31,17 @@ export interface VM {
   agent?: string
 }
 
+export interface Quota {
+  five_hour_pct: number
+  five_hour_resets_at: number
+  seven_day_pct: number
+  seven_day_resets_at: number
+}
+
 export interface State {
   jobs: Job[]
   vms: VM[]
   inbox: string
   operator: string
+  quota?: Quota
 }
