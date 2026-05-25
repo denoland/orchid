@@ -1088,6 +1088,11 @@ func tmuxKill(vm VMBlock, session string) {
 // We capture the entire visible pane (not `tail -N`) because some agents'
 // welcome screens leave trailing blank rows below the footer; a small tail
 // window would miss the marker and falsely report not-idle.
+//
+// A pane showing a permission/decision dialog (Yes/No, plan approval, etc.)
+// is NOT idle — it's blocked on a human. We detect this via the agent's
+// promptMarkers and refuse to treat it as a "safe to poke" idle state, so
+// orch never pastes a review summary on top of an open Yes/No prompt.
 func tmuxIdle(vm VMBlock, session string) (idle bool, detected string, err error) {
 	out, _, e := sshExec(vm, fmt.Sprintf("tmux capture-pane -p -t %s", session))
 	if e != nil {
@@ -1101,7 +1106,33 @@ func tmuxIdle(vm VMBlock, session string) (idle bool, detected string, err error
 	if spec.busyMarker != "" && strings.Contains(out, spec.busyMarker) {
 		return false, detected, nil
 	}
+	if panePrompted(out, spec) {
+		return false, detected, nil
+	}
 	return true, detected, nil
+}
+
+// panePrompted reports whether the pane content shows a modal/dialog the
+// agent is blocked on (Claude's "Do you want to proceed? ❯ 1. Yes / 2. No"
+// permission dialogs, plan approval, etc.). The check is a substring match
+// against the agent's promptMarkers — a single hit is enough.
+//
+// Tool calls in flight (Bash, WebFetch, Read, …) render the footer as
+// "(esc to interrupt)" which matches busyMarker but NOT promptMarker
+// ("Esc to cancel" — capital E, distinct phrasing). To be safe against
+// ever observing both simultaneously during a screen redraw, we treat a
+// busy pane as never-prompted: the user can't answer a dialog that isn't
+// blocking the agent yet.
+func panePrompted(pane string, spec agentSpec) bool {
+	if spec.busyMarker != "" && strings.Contains(pane, spec.busyMarker) {
+		return false
+	}
+	for _, m := range spec.promptMarkers {
+		if m != "" && strings.Contains(pane, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // detectAgentFromPane reads the pane content and returns the agent name
@@ -1172,6 +1203,52 @@ func paneActivityPrune(live map[string]bool) {
 	for k := range paneActivity {
 		if !live[k] {
 			delete(paneActivity, k)
+		}
+	}
+}
+
+// Per-session "needs human input" state. Updated by the pane sampler from
+// the same capture it uses for activity ticks, read by /api/state so the
+// dashboard's attention model can elevate a card to "Needs you" the moment
+// claude shows a Yes/No permission dialog — without waiting for the slower
+// activity-trailing-edge heuristic to kick in (which also misses the case
+// where a PR is already open).
+var (
+	paneNeedsInputMu sync.Mutex
+	paneNeedsInput   = map[string]bool{}
+)
+
+func paneNeedsInputSnapshot(tmux string) bool {
+	paneNeedsInputMu.Lock()
+	defer paneNeedsInputMu.Unlock()
+	return paneNeedsInput[tmux]
+}
+
+// paneNeedsInputSet stores the current prompt-pending state for tmux and
+// returns true if the state changed from the previous tick. Callers use the
+// transition to fire a single WS notification per state change rather than
+// re-broadcasting every sample.
+func paneNeedsInputSet(tmux string, needs bool) (changed bool) {
+	paneNeedsInputMu.Lock()
+	defer paneNeedsInputMu.Unlock()
+	prev, had := paneNeedsInput[tmux]
+	if needs {
+		paneNeedsInput[tmux] = true
+	} else {
+		delete(paneNeedsInput, tmux)
+	}
+	if !had {
+		return needs
+	}
+	return prev != needs
+}
+
+func paneNeedsInputPrune(live map[string]bool) {
+	paneNeedsInputMu.Lock()
+	defer paneNeedsInputMu.Unlock()
+	for k := range paneNeedsInput {
+		if !live[k] {
+			delete(paneNeedsInput, k)
 		}
 	}
 }
@@ -1525,10 +1602,11 @@ func vmByName(cfg *Config, name string) *VMBlock {
 // session: how to detect the TUI's idle/busy state by capturing the pane,
 // and how to transform a fresh start command into a resume command.
 type agentSpec struct {
-	name        string
-	idleMarker  string                         // substring present when the TUI is at its input prompt
-	busyMarker  string                         // substring present when the TUI is processing (empty = "busy iff !idle")
-	resumeXform func(sessionCmd string) string // returns a session_cmd that resumes the most recent conversation
+	name          string
+	idleMarker    string                         // substring present when the TUI is at its input prompt
+	busyMarker    string                         // substring present when the TUI is processing (empty = "busy iff !idle")
+	promptMarkers []string                       // substrings indicating the TUI is showing a modal/dialog awaiting user input
+	resumeXform   func(sessionCmd string) string // returns a session_cmd that resumes the most recent conversation
 }
 
 // agentSpecs are the built-in defaults; per-VM idle_marker/busy_marker can override.
@@ -1537,6 +1615,13 @@ var agentSpecs = map[string]agentSpec{
 		name:       "claude",
 		idleMarker: "bypass permissions",
 		busyMarker: "esc to interrupt",
+		// Claude's permission/decision dialogs render a footer of the form
+		// "Esc to cancel · Tab to amend · ctrl+e to explain". The exact tail
+		// rotates between variants ("Esc to cancel" / "Esc to interrupt and
+		// edit") but the leading "Esc to cancel" is stable and case-distinct
+		// from the busy marker "esc to interrupt". A pane with this footer is
+		// blocked on a human answering Yes/No/etc., not idle.
+		promptMarkers: []string{"Esc to cancel"},
 		resumeXform: func(s string) string {
 			return strings.Replace(s,
 				"claude --dangerously-skip-permissions",
@@ -3083,6 +3168,11 @@ type apiJobEntry struct {
 	// since the previous tick). The dashboard uses the last N values to
 	// drive the "working / idle / needs-you" attention indicators.
 	Activity []int `json:"activity,omitempty"`
+	// NeedsInput is true when the agent's TUI is showing a modal/dialog
+	// awaiting a human response (Claude's "Do you want to proceed? ❯ 1.
+	// Yes / 2. No" permission dialogs, plan approval, etc.). The dashboard
+	// elevates these cards to "Needs you" regardless of PR state.
+	NeedsInput bool `json:"needs_input,omitempty"`
 }
 
 type apiVMEntry struct {
@@ -3136,9 +3226,10 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 	jobs := make([]apiJobEntry, 0, len(snap))
 	for issue, j := range snap {
 		jobs = append(jobs, apiJobEntry{
-			Issue:    issue,
-			Job:      j,
-			Activity: paneActivitySnapshot(j.Tmux),
+			Issue:      issue,
+			Job:        j,
+			Activity:   paneActivitySnapshot(j.Tmux),
+			NeedsInput: paneNeedsInputSnapshot(j.Tmux),
 		})
 		load[j.VM]++
 	}
@@ -4604,8 +4695,25 @@ func main() {
 					})
 					globalCollabHub.broadcast(nil, msg)
 				}
+				// Prompt detection rides the same capture: when claude shows a
+				// permission/decision dialog the footer changes to "Esc to
+				// cancel · …", which tail -8 reliably catches. On transitions
+				// we kick the state broadcast so the next /api/state push (≤
+				// 500ms via the relay throttle) carries the new needs_input
+				// flag — the dashboard re-categorises the card to "Needs you"
+				// without waiting for the slow polling fallback.
+				needs := panePrompted(out, vmAgent(*vm))
+				if paneNeedsInputSet(j.Tmux, needs) {
+					if st.Bcast != nil {
+						select {
+						case st.Bcast <- struct{}{}:
+						default:
+						}
+					}
+				}
 			}
 			paneActivityPrune(live)
+			paneNeedsInputPrune(live)
 		}
 	}()
 

@@ -924,6 +924,123 @@ func TestDiffPRBotSelfFilter(t *testing.T) {
 	})
 }
 
+func TestPanePrompted(t *testing.T) {
+	claude := agentSpecs["claude"]
+	codex := agentSpecs["codex"]
+
+	cases := []struct {
+		name string
+		spec agentSpec
+		pane string
+		want bool
+	}{
+		{
+			name: "claude permission dialog (issue #227 sample)",
+			spec: claude,
+			pane: ` Bash command
+
+   rm tests/specs/check/brotli_compression_stream/*
+   Clear test dir
+
+ Dangerous rm operation on critical path: /home/orchid/orch-work/issue-220/tests/specs/check/brotli_compression_stream/*
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain`,
+			want: true,
+		},
+		{
+			name: "claude plan-mode approval",
+			spec: claude,
+			pane: `Plan ready.
+
+❯ 1. Yes, proceed
+  2. No, keep refining
+
+ Esc to cancel · Shift+Tab to switch modes`,
+			want: true,
+		},
+		{
+			name: "claude idle prompt (no dialog)",
+			spec: claude,
+			pane: `>
+
+? for shortcuts                                bypass permissions on`,
+			want: false,
+		},
+		{
+			name: "claude busy (esc to interrupt — distinct from prompt footer)",
+			spec: claude,
+			pane: `✱ Thinking… (esc to interrupt)
+
+>
+
+? for shortcuts                                bypass permissions on`,
+			want: false,
+		},
+		{
+			name: "claude busy Bash tool: even if a later redraw flashed prompt-looking text, busyMarker wins",
+			spec: claude,
+			pane: `⏺ Bash
+ ▶ Running rm Esc to cancel staging/foo
+
+ (esc to interrupt)`,
+			want: false,
+		},
+		{
+			name: "codex with no prompt markers configured stays not-prompted",
+			spec: codex,
+			pane: `Codex still chewing… (esc to interrupt)
+
+gpt-5.6 default · /workdir/issue-12`,
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := panePrompted(tc.pane, tc.spec); got != tc.want {
+				t.Errorf("panePrompted = %v, want %v\npane=%q", got, tc.want, tc.pane)
+			}
+		})
+	}
+}
+
+func TestPaneNeedsInputTransitions(t *testing.T) {
+	// Same tmux name across calls — paneNeedsInputSet must report a
+	// transition only when the prompted state actually flips.
+	const k = "claude-test-pneeds-1"
+	t.Cleanup(func() { paneNeedsInputSet(k, false) })
+
+	if changed := paneNeedsInputSet(k, false); changed {
+		t.Fatalf("first call with needs=false should not report a change")
+	}
+	if changed := paneNeedsInputSet(k, true); !changed {
+		t.Fatalf("false→true should report a change")
+	}
+	if !paneNeedsInputSnapshot(k) {
+		t.Fatalf("snapshot should be true after needs=true")
+	}
+	if changed := paneNeedsInputSet(k, true); changed {
+		t.Fatalf("true→true should not report a change")
+	}
+	if changed := paneNeedsInputSet(k, false); !changed {
+		t.Fatalf("true→false should report a change")
+	}
+	if paneNeedsInputSnapshot(k) {
+		t.Fatalf("snapshot should be false after needs=false")
+	}
+
+	// Prune drops sessions absent from the live set.
+	paneNeedsInputSet(k, true)
+	paneNeedsInputPrune(map[string]bool{}) // empty live set
+	if paneNeedsInputSnapshot(k) {
+		t.Fatalf("prune should have evicted absent session")
+	}
+}
+
 func TestIncludePatternMatches(t *testing.T) {
 	body := `Plain text.
 
