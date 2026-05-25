@@ -116,8 +116,14 @@ app.use('*', async (c, next) => {
   // X-Capture-Token header is the actual auth for these requests, and
   // the macOS / iOS apps don't carry a relay session cookie. Anything
   // unauthenticated still has to satisfy orch's per-endpoint check.
+  //
+  // /api/vm/join (worker joining a swarm) gets the same bypass: the
+  // worker only has the bearer invite token (= orch's http_secret), not
+  // a relay user session — orch's auth() still requires the bearer
+  // match, so this just lets the request reach the agent.
   const isCapture = c.req.raw.method === 'POST' &&
     (url.pathname === '/api/drafts' || url.pathname.startsWith('/captures/'))
+  const isVMJoin = c.req.raw.method === 'POST' && url.pathname === '/api/vm/join'
 
   // Everything else on a subdomain is private. Two ways in:
   //   1. Owner (cookie.subdomain === host's subdomain).
@@ -127,7 +133,7 @@ app.use('*', async (c, next) => {
   // The relay injects an Authorization header onto tunneled requests so
   // orch's own auth would let them through unconditionally — gate here.
   const user = await currentUser(c.env, c.req.raw)
-  let allowed = isCapture
+  let allowed = isCapture || isVMJoin
   if (!allowed && user) {
     allowed = user.subdomain === sub || await checkAllowed(c.env, sub, user.login)
   }
