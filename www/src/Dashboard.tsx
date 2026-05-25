@@ -1604,7 +1604,7 @@ function timeAgo(iso?: string | null): string {
   return `${Math.floor(mo / 12)}y`
 }
 
-type SectionId = 'orch' | 'access' | 'capture' | 'vms' | 'targets' | 'danger'
+type SectionId = 'orch' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
 
 function SettingsPage({ jobs, state, relay, onClose }: {
   jobs: Job[]
@@ -1722,6 +1722,7 @@ function SettingsPage({ jobs, state, relay, onClose }: {
     { id: 'capture', label: 'Capture' },
     { id: 'vms',     label: 'VMs' },
     { id: 'targets', label: 'Targets' },
+    { id: 'usage',   label: 'Usage' },
     { id: 'danger',  label: 'Danger zone' },
   ]
 
@@ -1891,6 +1892,15 @@ function SettingsPage({ jobs, state, relay, onClose }: {
                 subtitle="Inbox labels → work repos. Add a repo and the label defaults to its name (override if you want)."
               >
                 <TargetsList targets={targets} setTargets={setTargets} repos={repos} reposError={reposError} />
+              </Section>
+            )}
+
+            {section === 'usage' && (
+              <Section
+                title="Usage"
+                subtitle="Per-session Claude spend + context, pulled from each pane's statusline feed. Updates in near-real-time."
+              >
+                <UsageTable jobs={jobs} quota={state.quota} />
               </Section>
             )}
 
@@ -2097,6 +2107,100 @@ function VMJoinGuide({ vms, sessionsByVM, relay }: {
         </div>
         <div className="mt-2 px-1 text-[11.5px] text-zinc-400 dark:text-zinc-500">
           Per-VM SSH settings, capacity, agent, and bot overrides live in <code className="mono">swarm.hcl</code>.
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Settings → Usage tab. Sorted by spend desc so the most expensive
+// sessions float to the top. Quota strip up top mirrors the
+// (hidden-on-some-accounts) header chip so operators can see the
+// 5h / 7d numbers when their plan exposes them.
+function UsageTable({ jobs, quota }: { jobs: Job[]; quota?: State['quota'] }) {
+  const rows = useMemo(() => {
+    return jobs
+      .filter((j) => j.usage)
+      .slice()
+      .sort((a, b) => (b.usage?.cost_usd ?? 0) - (a.usage?.cost_usd ?? 0))
+  }, [jobs])
+  const totalSpend = useMemo(
+    () => rows.reduce((acc, j) => acc + (j.usage?.cost_usd ?? 0), 0),
+    [rows],
+  )
+  return (
+    <div className="space-y-6">
+      {quota ? (
+        <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
+          <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">
+            Subscription quota
+          </div>
+          <QuotaStrip quota={quota} />
+        </div>
+      ) : (
+        <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
+          <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-2">
+            Subscription quota
+          </div>
+          <div className="text-[12.5px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
+            Not reported by Claude on this account / plan. Per-session
+            spend and context still update below — they're parsed from
+            the same statusline feed but don't depend on the optional{' '}
+            <code className="mono">rate_limits</code> field.
+          </div>
+        </div>
+      )}
+      <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 overflow-hidden">
+        <div className="flex items-center px-4 py-3 bg-zinc-50 dark:bg-zinc-900/60 border-b border-zinc-200 dark:border-zinc-800">
+          <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+            Per-session spend
+          </div>
+          <div className="flex-1" />
+          <div className="mono text-[12px] text-zinc-600 dark:text-zinc-300 tabular-nums">
+            ${totalSpend.toFixed(2)} total · {rows.length} active
+          </div>
+        </div>
+        {rows.length === 0 && (
+          <div className="px-4 py-5 text-[13px] text-zinc-500 dark:text-zinc-400 text-center">
+            No statusline samples yet. Sessions report as soon as their next render tick lands.
+          </div>
+        )}
+        <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+          {rows.map((j) => {
+            const cost = j.usage?.cost_usd ?? 0
+            const ctx = j.usage?.context_pct
+            const repo = j.target_repo ? j.target_repo.split('/')[1] : j.target || '—'
+            return (
+              <div key={j.tmux} className="flex items-center gap-3 px-4 py-3">
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13px] text-zinc-900 dark:text-zinc-100 truncate">
+                    {j.issue_title || j.tmux}
+                  </div>
+                  <div className="mono text-[11px] text-zinc-500 dark:text-zinc-400 truncate">
+                    {repo} · {j.tmux}
+                    {j.usage?.model ? ' · ' + j.usage.model : ''}
+                  </div>
+                </div>
+                {typeof ctx === 'number' && (
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    <span className="mono text-[11px] text-zinc-400 dark:text-zinc-500">ctx</span>
+                    <div className="relative h-1.5 w-16 rounded-full overflow-hidden bg-zinc-200 dark:bg-zinc-800">
+                      <div
+                        className="absolute inset-y-0 left-0 bg-violet-500/80"
+                        style={{ width: `${Math.min(100, Math.max(0, ctx))}%` }}
+                      />
+                    </div>
+                    <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums w-8">
+                      {Math.round(ctx)}%
+                    </span>
+                  </div>
+                )}
+                <span className="mono text-[12.5px] text-zinc-900 dark:text-zinc-100 tabular-nums w-16 text-right flex-shrink-0">
+                  ${cost.toFixed(2)}
+                </span>
+              </div>
+            )
+          })}
         </div>
       </div>
     </div>
@@ -2840,23 +2944,9 @@ function CardCompact({ job }: { job: Job }) {
           <span className="mono text-[10px] text-violet-500">cron</span>
         )}
       </div>
-      <div className="text-[13px] text-zinc-900 dark:text-zinc-100 leading-snug line-clamp-3 flex-1">
+      <div className="text-[13px] text-zinc-900 dark:text-zinc-100 leading-snug line-clamp-4 flex-1">
         {job.issue_title || '—'}
       </div>
-      {job.usage && (
-        <div className="flex items-center gap-1.5 mt-auto pt-0.5">
-          {typeof job.usage.context_pct === 'number' && (
-            <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500 tabular-nums" title="context window used">
-              ctx {Math.round(job.usage.context_pct)}%
-            </span>
-          )}
-          {typeof job.usage.cost_usd === 'number' && job.usage.cost_usd > 0 && (
-            <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500 tabular-nums" title="reported session cost">
-              ${job.usage.cost_usd < 1 ? job.usage.cost_usd.toFixed(2) : job.usage.cost_usd.toFixed(1)}
-            </span>
-          )}
-        </div>
-      )}
     </div>
   )
 }
