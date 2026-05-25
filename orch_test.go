@@ -600,6 +600,107 @@ bootstrap_prompt = ""
 	}
 }
 
+// TestMergeableTransition pins down the rules for when a mergeable state
+// change is worth poking the worker. UNKNOWN is GitHub's "still computing"
+// state and must never trigger notifications — otherwise we'd spam the
+// worker on every PR open while GitHub catches up. The first observation
+// of MERGEABLE is a silent baseline so we don't re-notify after restart.
+// The first observation of CONFLICTING is loud — we may have just attached
+// to a PR that became conflicted before orch was watching.
+func TestMergeableTransition(t *testing.T) {
+	cases := []struct {
+		name string
+		prev string
+		cur  string
+		want string
+	}{
+		{"first MERGEABLE is silent baseline", "", "MERGEABLE", ""},
+		{"first CONFLICTING is loud", "", "CONFLICTING", "CONFLICTING"},
+		{"first UNKNOWN never notifies", "", "UNKNOWN", ""},
+		{"empty current never notifies", "MERGEABLE", "", ""},
+		{"current UNKNOWN never notifies", "MERGEABLE", "UNKNOWN", ""},
+		{"current UNKNOWN from CONFLICTING is silent", "CONFLICTING", "UNKNOWN", ""},
+		{"MERGEABLE → CONFLICTING (base moved)", "MERGEABLE", "CONFLICTING", "CONFLICTING"},
+		{"CONFLICTING → MERGEABLE (resolved)", "CONFLICTING", "MERGEABLE", "MERGEABLE"},
+		{"no change MERGEABLE", "MERGEABLE", "MERGEABLE", ""},
+		{"no change CONFLICTING (no re-spam)", "CONFLICTING", "CONFLICTING", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mergeableTransition(tc.prev, tc.cur)
+			if got != tc.want {
+				t.Errorf("mergeableTransition(%q,%q) = %q, want %q", tc.prev, tc.cur, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSummarizeMergeable verifies the worker-facing message embeds clear
+// resolution instructions when a PR is conflicting, and stays quiet when
+// nothing changed. The worker has no other UI — this string is the entire
+// signal — so the exact phrasing matters.
+func TestSummarizeMergeable(t *testing.T) {
+	v := &PRView{}
+
+	t.Run("conflicting includes git rebase guidance", func(t *testing.T) {
+		out := summarize(v, nil, nil, nil, false, nil, "CONFLICTING")
+		for _, want := range []string{
+			"CONFLICTS with the base branch",
+			"git fetch origin",
+			"git rebase origin/<base>",
+			"git push --force-with-lease",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("summarize CONFLICTING missing %q in:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("mergeable confirms resolution", func(t *testing.T) {
+		out := summarize(v, nil, nil, nil, false, nil, "MERGEABLE")
+		if !strings.Contains(out, "conflicts resolved") {
+			t.Errorf("summarize MERGEABLE missing resolution note:\n%s", out)
+		}
+	})
+
+	t.Run("empty mergeable: no conflict copy at all", func(t *testing.T) {
+		out := summarize(v, nil, nil, nil, false, nil, "")
+		if strings.Contains(out, "CONFLICT") || strings.Contains(out, "conflicts resolved") {
+			t.Errorf("summarize without mergeable transition leaked conflict copy:\n%s", out)
+		}
+	})
+}
+
+// TestDiffPRMergeable exercises the full diffPR seam: it must thread the
+// mergeable transition out alongside the existing review/comment/check
+// diffs, using the stored LastMergeable on the Job as the previous state.
+func TestDiffPRMergeable(t *testing.T) {
+	t.Run("MERGEABLE → CONFLICTING surfaced", func(t *testing.T) {
+		j := &Job{LastMergeable: "MERGEABLE"}
+		v := &PRView{Mergeable: "CONFLICTING"}
+		_, _, _, _, _, m := diffPR(j, v)
+		if m != "CONFLICTING" {
+			t.Errorf("got mergeable=%q, want CONFLICTING", m)
+		}
+	})
+	t.Run("UNKNOWN never bubbles up", func(t *testing.T) {
+		j := &Job{LastMergeable: "MERGEABLE"}
+		v := &PRView{Mergeable: "UNKNOWN"}
+		_, _, _, _, _, m := diffPR(j, v)
+		if m != "" {
+			t.Errorf("got mergeable=%q, want \"\" (UNKNOWN is transient)", m)
+		}
+	})
+	t.Run("stable MERGEABLE is silent", func(t *testing.T) {
+		j := &Job{LastMergeable: "MERGEABLE"}
+		v := &PRView{Mergeable: "MERGEABLE"}
+		_, _, _, _, _, m := diffPR(j, v)
+		if m != "" {
+			t.Errorf("got mergeable=%q, want \"\" (no transition)", m)
+		}
+	})
+}
+
 func TestIncludePatternMatches(t *testing.T) {
 	body := `Plain text.
 

@@ -215,6 +215,11 @@ type Job struct {
 	SeenIssueCommentIDs  []string          `json:"seen_issue_comment_ids,omitempty"`
 	LastHeadOID          string            `json:"last_head_oid,omitempty"`
 	LastCheckConclusions map[string]string `json:"last_check_conclusions,omitempty"`
+	// LastMergeable is the last MERGEABLE/CONFLICTING state we observed.
+	// Empty until the first non-UNKNOWN observation. Used to detect
+	// transitions (clean → conflicting, conflicting → clean) so workers
+	// learn about a base-branch conflict without a human nudge.
+	LastMergeable string `json:"last_mergeable,omitempty"`
 }
 
 type State struct {
@@ -824,12 +829,17 @@ type PRView struct {
 		Conclusion  string `json:"conclusion"`
 		CompletedAt string `json:"completedAt"` // RFC3339; latest run per name wins
 	} `json:"statusCheckRollup"`
+	// Mergeable: GitHub returns "MERGEABLE", "CONFLICTING", or "UNKNOWN".
+	// UNKNOWN means GitHub hasn't finished computing the merge — a few
+	// seconds after the PR is viewed it usually settles. Used to surface
+	// base-branch conflicts to the worker without manual nudging.
+	Mergeable string `json:"mergeable"`
 }
 
 func ghPRView(repo string, n int) (*PRView, error) {
 	out, errStr, err := run("gh", "pr", "view", fmt.Sprint(n),
 		"--repo", repo,
-		"--json", "state,headRefOid,reviews,comments,statusCheckRollup")
+		"--json", "state,headRefOid,reviews,comments,statusCheckRollup,mergeable")
 	if err != nil {
 		return nil, fmt.Errorf("gh pr view: %v: %s", err, errStr)
 	}
@@ -1772,7 +1782,30 @@ func pruneOrphanWorkdirs(cfg *Config, st *State) {
 	}
 }
 
-func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments []string, pushed bool, checkChanges []string) {
+// mergeableTransition returns the post-transition mergeable state we should
+// notify about, or "" if the change isn't worth surfacing. Rules:
+//   - UNKNOWN is transient (GitHub still computing): never notify on it,
+//     never set it as a baseline.
+//   - First observation of MERGEABLE: silent baseline (the expected case).
+//   - First observation of CONFLICTING: notify — we may have just discovered
+//     a PR that became conflicted before we attached to it.
+//   - MERGEABLE → CONFLICTING: notify (base branch moved, worker must rebase).
+//   - CONFLICTING → MERGEABLE: notify (resolved — worker pushed the fix or
+//     upstream backed out the change; useful confirmation either way).
+func mergeableTransition(prev, cur string) string {
+	if cur == "" || cur == "UNKNOWN" {
+		return ""
+	}
+	if prev == cur {
+		return ""
+	}
+	if prev == "" && cur == "MERGEABLE" {
+		return ""
+	}
+	return cur
+}
+
+func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments []string, pushed bool, checkChanges []string, mergeable string) {
 	seen := func(ids []string) map[string]bool {
 		m := map[string]bool{}
 		for _, id := range ids {
@@ -1822,6 +1855,7 @@ func diffPR(j *Job, v *PRView) (newReviews, newThreadComments, newIssueComments 
 			checkChanges = append(checkChanges, fmt.Sprintf("%s: %s", name, conclusion))
 		}
 	}
+	mergeable = mergeableTransition(j.LastMergeable, v.Mergeable)
 	return
 }
 
@@ -1854,7 +1888,7 @@ func oneLine(s string, max int) string {
 	return s
 }
 
-func summarize(v *PRView, nr, ntc, nic []string, pushed bool, checks []string) string {
+func summarize(v *PRView, nr, ntc, nic []string, pushed bool, checks []string, mergeable string) string {
 	var b strings.Builder
 	b.WriteString("PR update from orchestrator:\n\n")
 	for _, id := range nr {
@@ -1889,6 +1923,17 @@ func summarize(v *PRView, nr, ntc, nic []string, pushed bool, checks []string) s
 	}
 	if len(checks) > 0 {
 		b.WriteString(fmt.Sprintf("- CI status changes: %s\n", strings.Join(checks, ", ")))
+	}
+	switch mergeable {
+	case "CONFLICTING":
+		b.WriteString("- PR now CONFLICTS with the base branch. Resolve it before continuing:\n")
+		b.WriteString("    git fetch origin && git rebase origin/<base>   # or `git merge origin/<base>`\n")
+		b.WriteString("    # resolve conflicts, then:\n")
+		b.WriteString("    git add -A && git rebase --continue            # or `git commit` for merge\n")
+		b.WriteString("    git push --force-with-lease                    # rebase only; plain push for merge\n")
+		b.WriteString("  Replace <base> with the PR's base branch (usually main). Do not skip this — CI and review are blocked until the conflict clears.\n")
+	case "MERGEABLE":
+		b.WriteString("- PR conflicts resolved — mergeable again. No action required for this item.\n")
 	}
 	b.WriteString("\nAddress these, push fixes if needed, then stop and wait for the next message.")
 	return b.String()
@@ -2820,9 +2865,15 @@ func tick(cfg *Config, st *State) {
 			_ = saveState(cfg.Orch.StateFile, st)
 			continue
 		}
-		nr, ntc, nic, pushed, checks := diffPR(j, v)
-		if len(nr) == 0 && len(ntc) == 0 && len(nic) == 0 && !pushed && len(checks) == 0 {
+		nr, ntc, nic, pushed, checks, mergeable := diffPR(j, v)
+		if len(nr) == 0 && len(ntc) == 0 && len(nic) == 0 && !pushed && len(checks) == 0 && mergeable == "" {
 			j.LastHeadOID = v.HeadRefOid
+			// Record the mergeable baseline (silently) on no-diff ticks so
+			// the first MERGEABLE observation after PR open doesn't show up
+			// as a transition later. UNKNOWN is left out — it's transient.
+			if v.Mergeable != "" && v.Mergeable != "UNKNOWN" {
+				j.LastMergeable = v.Mergeable
+			}
 			continue
 		}
 		idle, detected, err := tmuxIdle(*vm, j.Tmux)
@@ -2865,7 +2916,7 @@ func tick(cfg *Config, st *State) {
 				continue
 			}
 		}
-		msg := summarize(v, nr, ntc, nic, pushed, checks)
+		msg := summarize(v, nr, ntc, nic, pushed, checks, mergeable)
 		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
 			log.Printf("issue #%d: poke failed: %v", n, err)
 			continue
@@ -2874,6 +2925,9 @@ func tick(cfg *Config, st *State) {
 		j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, ntc...)
 		j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, nic...)
 		j.LastHeadOID = v.HeadRefOid
+		if v.Mergeable != "" && v.Mergeable != "UNKNOWN" {
+			j.LastMergeable = v.Mergeable
+		}
 		if j.LastCheckConclusions == nil {
 			j.LastCheckConclusions = map[string]string{}
 		}
