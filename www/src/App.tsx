@@ -56,15 +56,22 @@ export default function App() {
         startFallback()
         return
       }
+      let firstMsgTimer: ReturnType<typeof setTimeout> | undefined
       ws.onopen = () => {
-        // WS up — drop the fallback polling and reset the reconnect
-        // backoff. Relay sends the cached state immediately so we get
-        // an initial render without a separate /api/state fetch.
+        // WS up — reset reconnect backoff. The relay's lastState cache
+        // primes new subscribers, but if orch hasn't pushed yet (e.g.
+        // it just started) the relay has nothing to send. Kick a
+        // one-shot fetch after 2s of silence so the dashboard doesn't
+        // sit blank waiting for the first push.
         reopenDelay = 1000
-        stopFallback()
+        firstMsgTimer = setTimeout(() => { fetchOnce() }, 2000)
       }
       ws.onmessage = (ev) => {
         if (cancelled) return
+        if (firstMsgTimer) { clearTimeout(firstMsgTimer); firstMsgTimer = undefined }
+        // First real message means push is working — fallback poll
+        // would be wasted DO requests, so drop it.
+        stopFallback()
         try {
           const data = JSON.parse(ev.data) as State
           setState(data)
@@ -72,6 +79,7 @@ export default function App() {
       }
       ws.onclose = () => {
         if (cancelled) return
+        if (firstMsgTimer) { clearTimeout(firstMsgTimer); firstMsgTimer = undefined }
         ws = null
         // Reconnect with capped exponential backoff. Falls back to
         // polling in the meantime so the dashboard never goes blank.
