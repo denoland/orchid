@@ -11,6 +11,16 @@ export default function App() {
     async function poll() {
       try {
         const res = await fetch('/api/state')
+        // Session cookie missing / expired — kick to OAuth so the
+        // browser doesn't sit on an empty dashboard forever.
+        if (res.status === 401 || res.status === 403) {
+          // /login lives on the apex. Strip the leftmost subdomain
+          // segment to reach it, then come back here after OAuth.
+          const apex = location.host.split('.').slice(1).join('.')
+          const next = encodeURIComponent(location.href)
+          location.href = `https://${apex}/login?next=${next}`
+          return
+        }
         if (!res.ok) return
         const data: State = await res.json()
         if (!cancelled) setState(data)
