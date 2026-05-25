@@ -74,14 +74,20 @@ export default function App() {
       }
       ws.onmessage = (ev) => {
         if (cancelled) return
-        if (firstMsgTimer) { clearTimeout(firstMsgTimer); firstMsgTimer = undefined }
-        stopFallback()
         try {
           const f = JSON.parse(ev.data) as
             | { t: 'state'; state: State }
             | { t: 'relay-info'; connected: boolean; root: string | null; login: string | null; token: string | null }
-          if (f.t === 'state') setState(f.state)
-          else if (f.t === 'relay-info') {
+          if (f.t === 'state') {
+            // Real state arrived — drop the safety fetch timer and any
+            // active fallback poll. relay-info on its own doesn't count,
+            // because a fresh DO sends relay-info before orch has had
+            // a chance to push state, and we don't want that to mask
+            // a missing state push.
+            if (firstMsgTimer) { clearTimeout(firstMsgTimer); firstMsgTimer = undefined }
+            stopFallback()
+            setState(f.state)
+          } else if (f.t === 'relay-info') {
             setRelay({
               connected: f.connected,
               root: f.root,
