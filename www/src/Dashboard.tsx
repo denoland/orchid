@@ -1166,17 +1166,21 @@ function Header({
   // toggle / link don't bubble through to the ReactFlow pane behind it.
   return (
     <div className="fixed top-0 inset-x-0 z-40 pointer-events-none">
-      <div className="px-8 pt-6 flex flex-col gap-3">
+      <div className="px-4 sm:px-8 pt-4 sm:pt-6 flex flex-col gap-3">
         <div
-          className="pointer-events-auto flex items-baseline gap-3"
+          className="pointer-events-auto flex flex-wrap items-baseline gap-x-3 gap-y-2"
           onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => e.stopPropagation()}
         >
-          <h1 className="serif text-[44px] font-medium leading-none text-zinc-900 dark:text-zinc-100 italic">
+          <h1 className="serif text-[32px] sm:text-[44px] font-medium leading-none text-zinc-900 dark:text-zinc-100 italic">
             Orchid
           </h1>
           <span className="mono text-[12px] text-zinc-400 dark:text-zinc-500">{count}</span>
-          {quota && <QuotaStrip quota={quota} />}
+          {quota && (
+            <div className="hidden sm:block">
+              <QuotaStrip quota={quota} />
+            </div>
+          )}
           <div className="flex-1" />
           <HeaderBtnBar>
             <CaptureButton onClick={onOpenCapture} />
@@ -1302,7 +1306,7 @@ function CapturePage({ jobs, inbox, onClose }: { jobs: Job[]; inbox: string; onC
       </div>
 
       <div className="flex-1 min-h-0 overflow-auto">
-        <div className="max-w-[720px] mx-auto px-8 py-12 space-y-10">
+        <div className="max-w-[720px] mx-auto px-4 sm:px-8 py-8 sm:py-12 space-y-10">
           <Composer autoFocus />
 
           <div>
@@ -1752,15 +1756,16 @@ function SettingsPage({ jobs, state, relay, onClose }: {
         >Save</button>
       </div>
 
-      <div className="flex-1 min-h-0 flex">
-        <aside className="w-48 flex-shrink-0 border-r border-zinc-200 dark:border-zinc-800 py-6 px-3 overflow-auto">
-          <nav className="flex flex-col gap-0.5">
+      <div className="flex-1 min-h-0 flex flex-col md:flex-row">
+        {/* mobile: horizontal scroll chip rail; desktop: left aside */}
+        <aside className="md:w-48 flex-shrink-0 border-b md:border-b-0 md:border-r border-zinc-200 dark:border-zinc-800 px-3 py-3 md:py-6 overflow-x-auto md:overflow-y-auto">
+          <nav className="flex md:flex-col gap-0.5 whitespace-nowrap">
             {navItems.map((it) => (
               <button
                 key={it.id}
                 onClick={() => setSection(it.id)}
                 className={
-                  'text-left px-3 py-1.5 rounded-md text-[13px] transition-colors ' +
+                  'text-left px-3 py-1.5 rounded-md text-[13px] transition-colors flex-shrink-0 ' +
                   (section === it.id
                     ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100'
                     : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100')
@@ -1771,7 +1776,7 @@ function SettingsPage({ jobs, state, relay, onClose }: {
         </aside>
 
         <main className="flex-1 min-w-0 overflow-auto">
-          <div className="max-w-[820px] mx-auto px-10 py-10 space-y-8">
+          <div className="max-w-[820px] mx-auto px-4 sm:px-8 md:px-10 py-6 md:py-10 space-y-8">
             {section === 'orch' && (
               <>
                 <Section title="GitHub">
@@ -3144,8 +3149,8 @@ function ListView({ jobs, onOpen }: { jobs: Job[]; onOpen: (tmux: string) => voi
   }, [jobs])
 
   return (
-    <div className="absolute inset-0 top-[96px] overflow-auto">
-      <div className="max-w-[1100px] mx-auto px-10 pb-16 space-y-8">
+    <div className="absolute inset-0 top-[84px] sm:top-[96px] overflow-auto">
+      <div className="max-w-[1100px] mx-auto px-4 sm:px-8 md:px-10 pb-16 space-y-8">
         {jobs.length === 0 && (
           <div className="py-24 text-center text-zinc-400 dark:text-zinc-500">
             <div className="serif italic text-[28px] mb-2">Empty</div>
@@ -3250,14 +3255,14 @@ function PaneModal({ tmux, jobsByTmuxRef, onClose }: {
   const title = job?.issue_title || tmux
   return (
     <div
-      className={`fixed inset-0 z-50 bg-black/40 backdrop-blur-sm ${zoom ? '' : 'flex items-center justify-center p-6'}`}
+      className={`fixed inset-0 z-50 bg-black/40 backdrop-blur-sm ${zoom ? '' : 'flex items-center justify-center p-2 sm:p-6'}`}
       onClick={zoom ? undefined : onClose}
     >
       <div
         className={
           zoom
             ? 'absolute inset-0 overflow-hidden shadow-2xl flex flex-col bg-[#0b0b0e]'
-            : 'relative w-full max-w-[1200px] h-[80vh] rounded-lg overflow-hidden shadow-2xl ring-1 ring-black/40 flex flex-col bg-[#0b0b0e]'
+            : 'relative w-full max-w-[1200px] h-[92vh] sm:h-[80vh] rounded-lg overflow-hidden shadow-2xl ring-1 ring-black/40 flex flex-col bg-[#0b0b0e]'
         }
         onClick={(e) => e.stopPropagation()}
       >
