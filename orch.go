@@ -4955,18 +4955,38 @@ func main() {
 			mt := time.NewTicker(mentionInterval)
 			defer mt.Stop()
 			mentionTick(&cfg, st)
-			assignmentTick(&cfg, st)
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-mt.C:
 					mentionTick(&cfg, st)
-					assignmentTick(&cfg, st)
 				}
 			}
 		}()
 		log.Printf("mentions: poller started, every %s, org=%s", mentionInterval, cfg.Orch.Mentions.Org)
+	}
+
+	// Assignment watcher runs unconditionally — only requires a
+	// bot_login (every orch has one), no org membership check. Polls
+	// every 60s; assignment is a low-frequency event so we don't pay
+	// much for the cadence and the latency-to-spawn matters when a
+	// human just assigned the issue and expects orchid to pick it up.
+	if len(botLogins(&cfg)) > 0 {
+		go func() {
+			at := time.NewTicker(60 * time.Second)
+			defer at.Stop()
+			assignmentTick(&cfg, st)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-at.C:
+					assignmentTick(&cfg, st)
+				}
+			}
+		}()
+		log.Printf("assignments: poller started, every 60s, bots=%v", botLogins(&cfg))
 	}
 
 	go func() {
