@@ -2,6 +2,7 @@ package orch
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -123,6 +124,34 @@ type State struct {
 	store         *Store
 	httpSnap      atomic.Value
 	Bcast         chan struct{} `json:"-"`
+
+	// VM reachability snapshot, updated by the SSH probe loop. Not
+	// persisted — a fresh process starts with everything unknown and
+	// fills in within one probe interval.
+	healthMu sync.RWMutex
+	health   map[string]VMHealth
+}
+
+// VMHealth is the in-memory liveness record for one configured VM.
+type VMHealth struct {
+	Online   bool
+	LastOK   time.Time
+	LastErr  string
+}
+
+func (s *State) SetVMHealth(name string, h VMHealth) {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	if s.health == nil {
+		s.health = map[string]VMHealth{}
+	}
+	s.health[name] = h
+}
+
+func (s *State) VMHealth(name string) VMHealth {
+	s.healthMu.RLock()
+	defer s.healthMu.RUnlock()
+	return s.health[name]
 }
 
 // MaintainerCache caches the configured org's member logins. Refreshed
@@ -720,6 +749,58 @@ func sessionName(issue int, agent string) string {
 	return fmt.Sprintf("%s-%d", agent, issue)
 }
 
+// runVMHealthLoop probes every configured VM over SSH every 15s and
+// updates the in-memory health map. A successful `true` from `tmux ls`
+// (or an exit code we recognise as "tmux ran") flips Online=true; any
+// other failure flips it false. Kicks the broadcast channel on
+// transitions so the dashboard re-renders immediately.
+func runVMHealthLoop(ctx context.Context, cfg *Config, st *State) {
+	probe := func() {
+		for i := range cfg.VMs {
+			vm := cfg.VMs[i]
+			if isLocal(vm) {
+				st.SetVMHealth(vm.Name, VMHealth{Online: true, LastOK: time.Now()})
+				continue
+			}
+			before := st.VMHealth(vm.Name)
+			_, errStr, err := sshExec(vm, "tmux ls 2>/dev/null; true")
+			now := VMHealth{LastOK: before.LastOK}
+			if err != nil {
+				now.Online = false
+				now.LastErr = strings.TrimSpace(errStr)
+				if now.LastErr == "" {
+					now.LastErr = err.Error()
+				}
+			} else {
+				now.Online = true
+				now.LastOK = time.Now()
+				now.LastErr = ""
+			}
+			if before.Online != now.Online {
+				log.Printf("vm %s: %s", vm.Name, map[bool]string{true: "online", false: "offline"}[now.Online])
+				if st.Bcast != nil {
+					select {
+					case st.Bcast <- struct{}{}:
+					default:
+					}
+				}
+			}
+			st.SetVMHealth(vm.Name, now)
+		}
+	}
+	probe()
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			probe()
+		}
+	}
+}
+
 func freeVM(cfg *Config, st *State) *VMBlock {
 	if len(cfg.VMs) == 0 {
 		return nil
@@ -736,6 +817,15 @@ func freeVM(cfg *Config, st *State) *VMBlock {
 		vm := &cfg.VMs[i]
 		if vm.Capacity > 0 && load[vm.Name] >= vm.Capacity {
 			continue
+		}
+		// Skip VMs the SSH probe has marked offline. The local
+		// bootstrap path (localhost) is always assumed reachable
+		// since there's no SSH to fail.
+		if !isLocal(*vm) {
+			h := st.VMHealth(vm.Name)
+			if !h.LastOK.IsZero() && !h.Online {
+				continue
+			}
 		}
 		idx = append(idx, i)
 	}

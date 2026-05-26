@@ -321,6 +321,12 @@ func tick(cfg *Config, st *State) {
 			_ = saveState(st)
 			continue
 		}
+		// VM is currently offline per probe — keep the job in state
+		// and render it greyed on the dashboard. Once it comes back
+		// the tmux check below decides resume vs tear-down.
+		if h := st.VMHealth(vm.Name); !h.LastOK.IsZero() && !h.Online {
+			continue
+		}
 		alive, err := tmuxHasSession(*vm, j.Tmux)
 		if err != nil {
 			log.Printf("issue #%d: tmux check failed: %v", n, err)

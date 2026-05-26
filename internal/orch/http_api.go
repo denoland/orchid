@@ -29,6 +29,7 @@ type apiJobEntry struct {
 	Activity   []int         `json:"activity,omitempty"`
 	Usage      *apiPaneUsage `json:"usage,omitempty"`
 	NeedsInput bool          `json:"needs_input,omitempty"`
+	VMOnline   bool          `json:"vm_online"`
 }
 
 type apiVMEntry struct {
@@ -38,6 +39,8 @@ type apiVMEntry struct {
 	Used     int    `json:"used"`
 	Bot      string `json:"bot"`
 	Agent    string `json:"agent"`
+	Online   bool   `json:"online"`
+	LastErr  string `json:"last_err,omitempty"`
 }
 
 type apiStateResp struct {
@@ -87,6 +90,14 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 	if v := st.httpSnap.Load(); v != nil {
 		snap = v.(map[int]Job)
 	}
+	// Per-VM online flag — unprobed VMs (LastOK zero) are treated as
+	// online so a freshly started orch doesn't grey the dashboard.
+	vmOnline := map[string]bool{}
+	for _, vm := range cfg.VMs {
+		h := st.VMHealth(vm.Name)
+		vmOnline[vm.Name] = h.Online || h.LastOK.IsZero() || isLocal(vm)
+	}
+
 	load := map[string]int{}
 	jobs := make([]apiJobEntry, 0, len(snap))
 	for issue, j := range snap {
@@ -95,6 +106,7 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 			Job:        j,
 			Activity:   paneActivitySnapshot(j.Tmux),
 			NeedsInput: paneNeedsInputSnapshot(j.Tmux),
+			VMOnline:   vmOnline[j.VM],
 		}
 		if u := usageForIssue(issue); u != nil {
 			entry.Usage = &apiPaneUsage{
@@ -111,6 +123,7 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 	vms := make([]apiVMEntry, 0, len(cfg.VMs))
 	for _, vm := range cfg.VMs {
 		bot, _ := vmBotIdentity(cfg.Orch, vm)
+		h := st.VMHealth(vm.Name)
 		vms = append(vms, apiVMEntry{
 			Name:     vm.Name,
 			Host:     vm.Host,
@@ -118,6 +131,8 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 			Used:     load[vm.Name],
 			Bot:      bot,
 			Agent:    vmAgent(vm).name,
+			Online:   vmOnline[vm.Name],
+			LastErr:  h.LastErr,
 		})
 	}
 	resp := apiStateResp{

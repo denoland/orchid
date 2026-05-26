@@ -31,6 +31,7 @@ export interface Job {
   last_check_conclusions: Record<string, string>
   activity?: number[]
   needs_input?: boolean
+  vm_online?: boolean
   usage?: PaneUsage
 }
 
@@ -41,6 +42,8 @@ export interface VM {
   used: number
   bot?: string
   agent?: string
+  online?: boolean
+  last_err?: string
 }
 
 export interface Quota {
