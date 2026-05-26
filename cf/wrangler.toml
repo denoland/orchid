@@ -19,6 +19,7 @@ routes = [
 [assets]
 directory = "./public"
 binding = "ASSETS"
+html_handling = "none"
 # Only the routes that require app logic invoke the Worker first; every
 # other path is served straight from CF's asset edge (no Worker request,
 # no CPU). The apex "/" must stay on this list — without it the dashboard
@@ -35,6 +36,8 @@ run_worker_first = [
   "/agent",
   "/api/*",
   "/captures/*",
+  "/docs",
+  "/docs/*",
 ]
 
 [[durable_objects.bindings]]
