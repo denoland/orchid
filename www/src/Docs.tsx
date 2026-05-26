@@ -139,21 +139,32 @@ export function Docs() {
     setMounts(next)
   }, [body])
 
+  const [navOpen, setNavOpen] = useState(false)
+
   const go = (to: string | null, e: React.MouseEvent) => {
     e.preventDefault()
     history.pushState({}, '', to ? `/docs/${to}` : '/docs')
     setSlug(to)
+    setNavOpen(false)
     window.scrollTo(0, 0)
   }
 
   const page = slug ? PAGES.find((p) => p.slug === slug) ?? null : null
 
   return (
-    <div className="docs-page">
+    <div className={'docs-page' + (navOpen ? ' nav-open' : '')}>
       <header className="docs-nav">
+        <button className="docs-burger" onClick={() => setNavOpen((v) => !v)} aria-label="Toggle sidebar">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <line x1="4" y1="7"  x2="20" y2="7"  />
+            <line x1="4" y1="12" x2="20" y2="12" />
+            <line x1="4" y1="17" x2="20" y2="17" />
+          </svg>
+        </button>
         <a href="/" className="docs-brand"><em>Orchid</em></a>
         <a className="docs-signin" href="/login">Sign in</a>
       </header>
+      <div className="docs-scrim" onClick={() => setNavOpen(false)} />
       <div className="docs-layout">
         <aside className="docs-sidebar">
           <a
