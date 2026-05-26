@@ -634,11 +634,12 @@ func Main() {
 				if vm == nil {
 					continue
 				}
-				out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s 2>/dev/null | tail -8", j.Tmux))
+				out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -S -120 2>/dev/null | tail -120", j.Tmux))
 				if err != nil {
 					continue
 				}
 				paneActivityRecordTick(j.Tmux, fnv64(out))
+				canvasInjectLinks(st, j.Tmux, out)
 				needs := panePrompted(out, vmAgent(*vm))
 				if paneNeedsInputSet(j.Tmux, needs) {
 					if st.Bcast != nil {
@@ -651,6 +652,7 @@ func Main() {
 			}
 			paneActivityPrune(live)
 			paneNeedsInputPrune(live)
+			seenLinksPrune(live)
 		}
 	}()
 
@@ -766,6 +768,8 @@ func Main() {
 			}
 		}
 	}()
+
+	go runVMHealthLoop(ctx, &cfg, st)
 
 	t := time.NewTicker(interval)
 	defer t.Stop()

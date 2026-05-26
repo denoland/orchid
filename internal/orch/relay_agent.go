@@ -626,3 +626,19 @@ func pushAllowedLogins(logins []string) {
 	defer cancel()
 	_ = c.Write(ctx, websocket.MessageText, b)
 }
+
+// pushSnap broadcasts a fresh canvas snap to every connected tab through
+// the relay. Called when orch mutates the snap server-side (e.g. a
+// pane-detected gist URL becomes a new link node).
+func pushSnap(body []byte) {
+	liveMu.Lock()
+	c := live
+	liveMu.Unlock()
+	if c == nil {
+		return
+	}
+	b, _ := json.Marshal(ctlFrame{T: "snap", Snap: json.RawMessage(body)})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = c.Write(ctx, websocket.MessageText, b)
+}

@@ -183,6 +183,7 @@ function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
     : attn.level === 'watching' ? 'card-status-watching '
     : ''
   )
+  const vmOffline = job.vm_online === false
   return (
     <div
       onClick={(e) => {
@@ -191,10 +192,12 @@ function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
         setExpanded(job.tmux)
       }}
       className={
-        'bg-white/95 dark:bg-zinc-900/95 backdrop-blur rounded-xl ring-1 shadow-sm hover:shadow-md cursor-pointer ' +
-        ringClass
+        'relative bg-white/95 dark:bg-zinc-900/95 backdrop-blur rounded-xl ring-1 shadow-sm hover:shadow-md cursor-pointer ' +
+        ringClass +
+        (vmOffline ? ' card-vm-offline' : '')
       }
-      style={{ width: CARD_W, height: CARD_H }}
+      style={{ width: CARD_W, height: CARD_H, opacity: vmOffline ? 0.55 : 1 }}
+      title={vmOffline ? `${job.vm} is offline — session paused` : undefined}
     >
       <Handle
         type="target"
@@ -207,6 +210,11 @@ function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
         style={{ background: '#a78bfa', width: 8, height: 8, border: '1.5px solid white' }}
       />
       <CardCompact job={job} />
+      {vmOffline && (
+        <div className="absolute top-1.5 right-2 text-[10px] mono text-zinc-400 dark:text-zinc-500">
+          {job.vm} offline
+        </div>
+      )}
     </div>
   )
 }
