@@ -37,6 +37,13 @@ a { color: inherit; }
   color: var(--ink);
   text-decoration: none;
 }
+.nav-link {
+  margin-left: auto; margin-right: 16px;
+  color: var(--ink); opacity: .7;
+  font-size: 14px; text-decoration: none;
+  transition: opacity .15s;
+}
+.nav-link:hover { opacity: 1; }
 .signin {
   display: inline-flex; align-items: center; gap: 8px;
   background: var(--ink); color: #fafaf9;

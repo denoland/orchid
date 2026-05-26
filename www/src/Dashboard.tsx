@@ -1178,6 +1178,7 @@ function Header({
           <HeaderBtnBar>
             <CaptureButton onClick={onOpenCapture} />
             <ViewToggle view={view} setView={setView} />
+            <DocsButton />
             <SettingsButton onClick={onOpenSettings} />
             <ThemeToggle />
             <LogoutButton />
@@ -1348,6 +1349,21 @@ function RecentCaptureRow({ job, inbox }: { job: Job; inbox: string }) {
           <polyline points="7 7 17 7 17 17" />
         </svg>
       </span>
+    </a>
+  )
+}
+
+function DocsButton() {
+  return (
+    <a
+      href="/docs"
+      title="Docs"
+      className="w-9 h-9 rounded-lg flex items-center justify-center transition-colors text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+    >
+      <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+      </svg>
     </a>
   )
 }
