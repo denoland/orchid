@@ -6,9 +6,12 @@ const OUT  = new URL('./', import.meta.url).pathname
 
 const shots = [
   { file: 'diagram-architecture.png', path: '/docs/architecture' },
+  { file: 'diagram-issue.png',        path: '/docs/architecture', which: 1 },
   { file: 'diagram-vms.png',          path: '/docs/vms' },
   { file: 'diagram-supervision.png',  path: '/docs/supervision' },
   { file: 'diagram-capture.png',      path: '/docs/capture' },
+  { file: 'diagram-journey.png',      path: '/docs/getting-started' },
+  { file: 'diagram-card-states.png',  path: '/docs/dashboard' },
 ]
 
 async function main() {
@@ -20,10 +23,9 @@ async function main() {
     console.log(`→ ${BASE + s.path}`)
     await page.goto(BASE + s.path, { waitUntil: 'networkidle' })
     await page.waitForTimeout(1200)
-    const diagram = await page.$('.docs-diagram')
-    if (diagram) {
-      await diagram.screenshot({ path: OUT + s.file })
-    }
+    const all = await page.$$('.docs-diagram')
+    const target = all[s.which ?? 0]
+    if (target) await target.screenshot({ path: OUT + s.file })
     await page.close()
   }
   await browser.close()
