@@ -20,10 +20,6 @@ type RateLimit struct {
 	ResetsAt int64   `json:"resets_at"`
 }
 
-// StatusLineEvent is the subset of fields we care about from each
-// statusline.jsonl line. Claude Code emits one of these per render
-// tick (~once a second while a session is interactive). The rest of
-// the payload (effort, thinking, etc.) is ignored.
 type StatusLineEvent struct {
 	SessionID string `json:"session_id"`
 	Cwd       string `json:"cwd"`
@@ -90,21 +86,12 @@ func ingestStatusLine(line []byte) {
 	}
 }
 
-// usageForIssue returns the latest statusline reading for the claude
-// session running the given inbox issue, or nil if we haven't seen
-// one. cwd → issue is matched via the standard orch-work/issue-N
-// worktree layout.
 func usageForIssue(n int) *usageState {
 	usageMu.RLock()
 	defer usageMu.RUnlock()
 	return usageByIssue[n]
 }
 
-// latestQuota returns the most recent five-hour + seven-day reading
-// across every session that actually carried rate_limits data. The
-// field is documented but flaky on some Claude Max OAuth setups
-// (anthropics/claude-code#40094) — when it's missing we don't lie
-// to the dashboard with a 0% bar.
 func latestQuota() (RateLimit, RateLimit, bool) {
 	usageMu.RLock()
 	defer usageMu.RUnlock()
@@ -123,18 +110,7 @@ func latestQuota() (RateLimit, RateLimit, bool) {
 	return latest.RateLimits.FiveHour, latest.RateLimits.SevenDay, true
 }
 
-// tailStatusLine runs `tail -F` against the claude statusline.jsonl
-// on the given VM and feeds each line into ingestStatusLine. Local
-// VMs read directly; remote VMs go through ssh. Restarts on EOF /
-// error so a transient pipe break (claude restart, log rotate, ssh
-// disconnect) doesn't permanently lose the data feed.
 func tailStatusLine(ctx context.Context, vm VMBlock, bcast chan<- struct{}) {
-	// Pick the home dir of the user that actually runs claude on this
-	// VM. session_home wins (operator's authoritative answer); else
-	// fall back to /home/<vm.user>, else /home/orchid as a last
-	// resort. Without this dance, vm "local" blocks that leave both
-	// user= and session_home= unset produce "/home//.claude/…" and
-	// silently never read anything.
 	home := vm.SessionHome
 	if home == "" && vm.User != "" {
 		home = "/home/" + vm.User
@@ -164,9 +140,6 @@ func tailStatusLine(ctx context.Context, vm VMBlock, bcast chan<- struct{}) {
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
 			ingestStatusLine(sc.Bytes())
-			// Nudge the relay state pusher so the dashboard sees the
-			// new usage/quota numbers within ~2s instead of waiting
-			// for the next tick.
 			if bcast != nil {
 				select {
 				case bcast <- struct{}{}:

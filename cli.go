@@ -23,11 +23,6 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsimple"
 )
 
-// CLI entry point + `orch join` subcommands + the matching server-side
-// /api/vm/join handler. Kept together because the request shape and the
-// SSH-material install have to stay in lockstep — touching one without
-// the other has burned us before.
-
 func runJoin(args []string) {
 	if len(args) >= 1 {
 		switch args[0] {
@@ -50,18 +45,12 @@ func runJoinRelay(args []string) {
 		os.Exit(2)
 	}
 	relayArg, token := args[0], args[1]
-	// Reject anything that could break out of the `KEY=VALUE` line in the
-	// systemd EnvironmentFile or smuggle additional vars. Newlines and NULs
-	// are the obvious attack; control chars are gratuitous and never
-	// legitimate in either a URL or a token.
 	for _, c := range relayArg + token {
 		if c == '\n' || c == '\r' || c == 0 || c < 0x20 || c == 0x7f {
 			fmt.Fprintln(os.Stderr, "orch join: url/token contains control characters")
 			os.Exit(2)
 		}
 	}
-	// Validate URL shape so a typo doesn't quietly point the agent at an
-	// attacker-controlled origin. wss:// in prod, ws:// only for dev.
 	u, perr := url.Parse(relayArg)
 	if perr != nil || (u.Scheme != "wss" && u.Scheme != "ws") || u.Host == "" {
 		fmt.Fprintf(os.Stderr, "orch join: bad relay url (expect wss://host/path): %v\n", perr)
@@ -88,10 +77,6 @@ func runJoinRelay(args []string) {
 		fmt.Fprintf(os.Stderr, "write %s: %v\n", envPath, err)
 		os.Exit(1)
 	}
-	// Systemd will expand the new RELAY_URL/RELAY_TOKEN values on the
-	// next restart. The ExecStart line installed by install.sh already
-	// uses -relay=${RELAY_URL} -relay-token=${RELAY_TOKEN}, so no unit
-	// rewrite is needed — daemon-reload + restart is enough.
 	_ = exec.Command("systemctl", "daemon-reload").Run()
 	if err := exec.Command("systemctl", "restart", "orchid").Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "systemctl restart: %v\n", err)
@@ -102,34 +87,21 @@ func runJoinRelay(args []string) {
 
 // vmJoinRequest is the payload `orch join vm` POSTs to /api/vm/join.
 type vmJoinRequest struct {
-	Name     string `json:"name,omitempty"`     // optional preferred VM name; central allocates if empty
-	Hostname string `json:"hostname"`           // public hostname/IP central will SSH to
-	SSHUser  string `json:"ssh_user"`           // user on this VM that central connects as (e.g. "orchid")
-	HostKey  string `json:"host_key,omitempty"` // optional: the worker's ssh-keyscan'd host key, helps central populate known_hosts
+	Name     string `json:"name,omitempty"`
+	Hostname string `json:"hostname"`
+	SSHUser  string `json:"ssh_user"`
+	HostKey  string `json:"host_key,omitempty"`
 }
 
 // vmJoinResponse is central's reply with the SSH material the worker
 // installs into the orchid user's ~/.ssh.
 type vmJoinResponse struct {
 	Name string `json:"name"`
-	// AccessPublicKey is the OpenSSH public key central uses for
-	// central→worker SSH. Worker appends it to
-	// ~<ssh_user>/.ssh/authorized_keys.
 	AccessPublicKey string `json:"access_public_key"`
-	// BotGithubPrivateKey / BotGithubPublicKey are the bot account's
-	// GitHub SSH keypair (when orchestrator.bot_github_key is configured
-	// or the default ~/.ssh/id_ed25519 exists). Worker writes them into
-	// ~<ssh_user>/.ssh/id_ed25519{,.pub} so claude can `git clone
-	// git@github.com:…` as the bot. Empty when the operator hasn't
-	// configured one.
 	BotGithubPrivateKey string `json:"bot_github_private_key,omitempty"`
 	BotGithubPublicKey  string `json:"bot_github_public_key,omitempty"`
 }
 
-// runJoinVM is invoked on a fresh worker host. It POSTs this VM's
-// network identity to central, then installs the SSH material central
-// returns so central can SSH in and so the bot can `git clone` as
-// itself.
 func runJoinVM(args []string) {
 	fs := flag.NewFlagSet("orch join vm", flag.ExitOnError)
 	hostname := fs.String("hostname", "", "public hostname/IP central will SSH to (default: first non-loopback address)")
@@ -207,12 +179,6 @@ func runJoinVM(args []string) {
 	}
 }
 
-// detectPublicAddr returns the first IPv4/IPv6 address bound to a
-// non-loopback, non-private interface, or empty when nothing fits. We
-// intentionally avoid hitting an external `curl ifconfig.me` service —
-// orch installs run on locked-down corporate boxes where outbound to
-// random services is blocked. Operators with NAT/no global IP pass
-// --hostname explicitly.
 func detectPublicAddr() string {
 	ifaces, err := net.InterfaceAddrs()
 	if err != nil {
@@ -226,7 +192,6 @@ func detectPublicAddr() string {
 		}
 		ip := ipnet.IP
 		if ip.To4() == nil && ip.To16() != nil {
-			// Skip IPv6 unless we have nothing else; v4 first.
 			if privateFallback == "" {
 				privateFallback = ip.String()
 			}
@@ -277,10 +242,6 @@ func installJoinMaterial(sshUser string, m vmJoinResponse) error {
 	_ = os.Chmod(authPath, 0o600)
 
 	if m.BotGithubPrivateKey != "" {
-		// Only seed id_ed25519 if missing — pre-existing keys on this
-		// host are assumed authoritative (operator already registered
-		// them with github) and overwriting would orphan the github
-		// account from this host.
 		privPath := filepath.Join(sshDir, "id_ed25519")
 		if _, err := os.Stat(privPath); os.IsNotExist(err) {
 			if err := os.WriteFile(privPath, []byte(ensureTrailingNL(m.BotGithubPrivateKey)), 0o600); err != nil {
@@ -292,7 +253,6 @@ func installJoinMaterial(sshUser string, m vmJoinResponse) error {
 		}
 	}
 
-	// known_hosts: trust github.com so the bot can clone immediately.
 	khPath := filepath.Join(sshDir, "known_hosts")
 	if !knownHostHas(khPath, "github.com") {
 		out, _ := exec.Command("ssh-keyscan", "-t", "ed25519,rsa", "github.com").Output()
@@ -305,7 +265,6 @@ func installJoinMaterial(sshUser string, m vmJoinResponse) error {
 		}
 	}
 
-	// chown the whole .ssh tree to the target user so the daemon can read it.
 	_ = exec.Command("chown", "-R", sshUser+":"+sshUser, sshDir).Run()
 	return nil
 }
@@ -425,21 +384,14 @@ func handleVMJoin(w http.ResponseWriter, r *http.Request) error {
 		name = allocVMName(&current, req.Hostname)
 	}
 
-	// Generate the dedicated per-VM access keypair. ssh-keygen is already
-	// a hard prereq (the orch host always has openssh-client) so going
-	// out-of-process keeps us from pulling in golang.org/x/crypto.
 	keyPath, pubBytes, err := generateVMAccessKey(globalConfigPath, name)
 	if err != nil {
 		http.Error(w, "keygen: "+err.Error(), http.StatusInternalServerError)
 		return err
 	}
 
-	// Optional bot github keypair — best effort; an empty result is fine
-	// (the worker prints a warning).
 	botPriv, botPub := readBotGithubKey(current.Orch.BotGithubKey)
 
-	// Patch swarm.hcl in place. Reuses the same patchHCL the dashboard
-	// settings page uses, so comments and unrelated formatting survive.
 	patch := map[string]map[string]any{
 		"vm." + name: {
 			"host":         req.Hostname,
@@ -510,7 +462,6 @@ func allocVMName(cfg *Config, hostname string) string {
 
 func slugifyHostname(h string) string {
 	h = strings.ToLower(h)
-	// Drop port, take first hostname label, sanitize.
 	if i := strings.Index(h, ":"); i >= 0 {
 		h = h[:i]
 	}
@@ -547,7 +498,6 @@ func generateVMAccessKey(configPath, name string) (string, []byte, error) {
 		return "", nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	keyPath := filepath.Join(dir, name)
-	// Overwrite — re-joins should rotate the key.
 	_ = os.Remove(keyPath)
 	_ = os.Remove(keyPath + ".pub")
 	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-q", "-N", "", "-C", "orchid-central→"+name, "-f", keyPath)
@@ -628,7 +578,6 @@ func main() {
 		return
 	}
 	if *describeFlag {
-		// Mirror the runtime publish so describe sees a non-nil snapshot.
 		snap := make(map[int]Job, len(st.Jobs))
 		for n, j := range st.Jobs {
 			snap[n] = *j
@@ -654,12 +603,6 @@ func main() {
 		cfg.GitHub.InboxRepo, strings.Join(tnames, ","), len(cfg.VMs), interval, len(st.Jobs))
 
 	if cfg.Orch.HTTPAddr != "" {
-		// The http_secret gates every dashboard endpoint and is the only
-		// barrier between the public internet (when relay-fronted) and
-		// arbitrary tmux paste / config rewrites. A short, guessable
-		// secret means everyone on the network owns this orchestrator.
-		// install.sh ships 16-byte hex; warn loudly if the operator
-		// reduced it.
 		if s := cfg.Orch.HTTPSecret; s == "" {
 			log.Printf("SECURITY: orchestrator.http_secret is empty — dashboard is OPEN to anyone who can reach %s. Set http_secret to a 32+ char random string (openssl rand -hex 32).", cfg.Orch.HTTPAddr)
 		} else if len(s) < 16 {
@@ -673,11 +616,6 @@ func main() {
 		}()
 	}
 
-	// Background pane-activity sampler. Captures each live session's pane
-	// every second, hashes it, and records a 0/1 tick into the per-session
-	// ring buffer. The dashboard reads this via /api/state for initial
-	// state and gets push notifications via the canvas WS for real-time
-	// updates so the working/idle indicators don't lag a poll cycle behind.
 	go func() {
 		t := time.NewTicker(1 * time.Second)
 		defer t.Stop()
@@ -710,13 +648,6 @@ func main() {
 					})
 					globalCollabHub.broadcast(nil, msg)
 				}
-				// Prompt detection rides the same capture: when claude shows a
-				// permission/decision dialog the footer changes to "Esc to
-				// cancel · …", which tail -8 reliably catches. On transitions
-				// we kick the state broadcast so the next /api/state push (≤
-				// 500ms via the relay throttle) carries the new needs_input
-				// flag — the dashboard re-categorises the card to "Needs you"
-				// without waiting for the slow polling fallback.
 				needs := panePrompted(out, vmAgent(*vm))
 				if paneNeedsInputSet(j.Tmux, needs) {
 					if st.Bcast != nil {
@@ -736,10 +667,6 @@ func main() {
 		if *relayToken == "" {
 			log.Fatalf("-relay requires -relay-token (issued by the relay on signup)")
 		}
-		// snapRead/snapWrite back the events-WS snap channel. Source of
-		// truth is the sqlite store — same rows the /api/snap HTTP
-		// handler reads from, so a browser writing layout via the WS
-		// and another viewing it via the HTTP path see the same data.
 		snapRead := func() []byte {
 			b, err := st.store.GetSnap()
 			if err != nil {
@@ -753,9 +680,6 @@ func main() {
 			}
 			return st.store.PutSnap(body)
 		}
-		// allowedLoginsProvider lets the config-save handler hot-push
-		// allow-list edits without an orch restart. Captures cfg by
-		// pointer so the closure reads the freshest slice each call.
 		allowedLoginsProvider = func() []string { return append([]string(nil), cfg.Orch.AllowedLogins...) }
 		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st), st.Bcast, func() []byte { return buildAPIStateJSON(&cfg, st) }, snapRead, snapWrite, func(s string) *VMBlock { return lookupPaneVM(&cfg, st, s) })
 	}
@@ -768,22 +692,15 @@ func main() {
 		}
 	}
 
-	// Tail each VM's Claude statusline.jsonl in the background. Feeds
-	// the in-memory usage map that /api/state exposes. Self-restarts
-	// on EOF, so a transient ssh blip just means we miss a few ticks.
 	for i := range cfg.VMs {
 		vm := cfg.VMs[i]
 		go tailStatusLine(context.Background(), vm, st.Bcast)
 	}
 
-	// History scanner: walks ~/.claude/projects/**/*.jsonl on every VM
-	// and aggregates per-day tokens + cost into the usage_daily table.
-	// Backfills on startup, then incrementally re-reads tail bytes of
-	// modified files. Drives the Usage tab's charts.
 	for i := range cfg.VMs {
 		vm := cfg.VMs[i]
 		if !isLocal(vm) {
-			continue // remote VMs need ssh-side scanning; defer to a later pass
+			continue
 		}
 		go runUsageScanLoop(context.Background(), projectsRootFor(vm), st.store, 5*time.Minute)
 	}
@@ -791,11 +708,6 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Mention watcher: validate org access at startup so a missing
-	// `read:org` scope or non-member token surfaces immediately, not on
-	// the first tick. This is intentionally a hard fail — silently
-	// downgrading members to "external" would route their requests to
-	// the canned reply.
 	if cfg.Orch.Mentions != nil {
 		if _, err := fetchMaintainers(cfg.Orch.Mentions.Org); err != nil {
 			log.Fatalf("mentions: cannot read org %s members (token needs read:org and to be in the org): %v",
@@ -821,11 +733,6 @@ func main() {
 		log.Printf("mentions: poller started, every %s, org=%s", mentionInterval, cfg.Orch.Mentions.Org)
 	}
 
-	// Assignment watcher runs unconditionally — only requires a
-	// bot_login (every orch has one), no org membership check. Polls
-	// every 60s; assignment is a low-frequency event so we don't pay
-	// much for the cadence and the latency-to-spawn matters when a
-	// human just assigned the issue and expects orchid to pick it up.
 	if len(botLogins(&cfg)) > 0 {
 		go func() {
 			at := time.NewTicker(60 * time.Second)
@@ -857,8 +764,6 @@ func main() {
 		}
 	}()
 
-	// Operator session watcher: keep the operator claude session alive and
-	// unstuck (dismiss the trust dialog if it reappears after a crash).
 	go func() {
 		ot := time.NewTicker(30 * time.Second)
 		defer ot.Stop()

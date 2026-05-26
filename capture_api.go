@@ -1,22 +1,5 @@
 package main
 
-// Orchid Capture intake. Two HTTP endpoints wired into the orch HTTP server
-// when the operator sets the `capture` config block:
-//
-//	POST /api/drafts        — accepts a Draft JSON, files a GitHub issue
-//	GET  /captures/<id>     — serves the binary asset (image/voice) so the
-//	                          GitHub issue body can embed it via a public URL
-//
-// See capture/DRAFT_PAYLOAD.md for the wire format and capture/README.md for
-// the product context. The handler is intentionally narrow:
-//   - one POST → one issue
-//   - assets are written to disk under cfg.Orch.Capture.AssetsDir and served
-//     by orch itself (no S3, no gist fallback) so the whole flow is owned by
-//     one binary you already trust
-//   - failures return HTTP errors and write nothing partial — clients retry
-//     by replaying the same Draft (drafts carry their own id; idempotency at
-//     issue level is the GitHub layer's problem, not ours yet)
-
 import (
 	"crypto/subtle"
 	"encoding/base64"
@@ -31,20 +14,14 @@ import (
 	"time"
 )
 
-// validRepo recognizes a GitHub "owner/repo" name (the only thing we hand
-// to `gh issue create --repo`). Restricting clients to this shape closes
-// a slim argv-injection vector if `gh` ever grew double-dash-parsing for
-// the --repo value, and rejects obvious garbage like "../../../etc" early.
-// Each segment must start with an alphanumeric to keep "-foo/repo" (which
-// looks like a flag) and other dash-led shapes out.
 var validRepo = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
 
 // DraftPayload mirrors capture/DRAFT_PAYLOAD.md.
 type DraftPayload struct {
 	ID        string        `json:"id"`
 	CreatedAt time.Time     `json:"createdAt"`
-	Source    string        `json:"source"` // "macos" | "ios"
-	Kind      string        `json:"kind"`   // "screenshot" | "link" | "text" | "voice"
+	Source    string        `json:"source"`
+	Kind      string        `json:"kind"`
 	Note      string        `json:"note"`
 	Image     *DraftImage   `json:"image,omitempty"`
 	Link      *DraftLink    `json:"link,omitempty"`
@@ -116,20 +93,12 @@ func captureAssetsDir(cfg *Config) (string, error) {
 func registerCaptureRoutes(mux *http.ServeMux, cfg *Config) {
 	cap := cfg.Orch.Capture
 
-	// Capture token is the only auth on this endpoint. Constant-time compare
-	// so an attacker can't probe its value byte-by-byte via response timing.
 	expectToken := []byte(cap.AuthToken)
 	mux.HandleFunc("/api/drafts", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		// CORS removed: the macOS/iOS clients are native and do not need
-		// the preflight allowance, and the previous `Allow-Origin: *`
-		// invited any browser script that obtained the token (e.g. via
-		// an XSS in a third-party app reading the macOS keychain export)
-		// to file issues with it. If a future web composer ever needs
-		// access, set an explicit, restrictive allowlist here.
 		got := r.Header.Get("X-Capture-Token")
 		if len(expectToken) == 0 ||
 			subtle.ConstantTimeCompare([]byte(got), expectToken) != 1 {
@@ -160,8 +129,6 @@ func registerCaptureRoutes(mux *http.ServeMux, cfg *Config) {
 			return
 		}
 
-		// Resolve target BEFORE writing the asset so a bad request doesn't
-		// leave files behind on disk.
 		repo, labels, terr := resolveDraftTarget(cfg, &d)
 		if terr != nil {
 			http.Error(w, terr.Error(), http.StatusForbidden)
@@ -180,9 +147,6 @@ func registerCaptureRoutes(mux *http.ServeMux, cfg *Config) {
 
 		title, issueBody := renderDraftIssue(&d, assetURL, assetPath)
 
-		// `--` after the flag block so a future gh release that adopts a
-		// new option can't be tricked into consuming a label value as a
-		// flag. (Belt + suspenders alongside validRepo.)
 		args := []string{"issue", "create", "--repo", repo, "--title", title, "--body", issueBody}
 		for _, l := range labels {
 			args = append(args, "--label", l)
@@ -204,9 +168,6 @@ func registerCaptureRoutes(mux *http.ServeMux, cfg *Config) {
 		})
 	})
 
-	// /captures/<id>.<ext> — static file server scoped to the assets dir.
-	// Anyone with the URL can read; that's deliberate so GitHub can render
-	// the image inline in the issue body without an authenticated fetch.
 	mux.HandleFunc("/captures/", func(w http.ResponseWriter, r *http.Request) {
 		dir, err := captureAssetsDir(cfg)
 		if err != nil {
@@ -214,9 +175,6 @@ func registerCaptureRoutes(mux *http.ServeMux, cfg *Config) {
 			return
 		}
 		name := strings.TrimPrefix(r.URL.Path, "/captures/")
-		// Defense in depth: reject any path that tries to climb out, points
-		// at a dotfile (.htaccess, .ssh-style hidden state), or carries a
-		// path separator / NUL / control char.
 		if name == "" || strings.HasPrefix(name, ".") ||
 			strings.Contains(name, "..") ||
 			strings.ContainsRune(name, '/') ||
@@ -308,10 +266,6 @@ func safeDraftFilename(id string) string {
 	return b.String()
 }
 
-// renderDraftIssue produces the GitHub issue title and body. Deterministic
-// formatting only — no LLM in the prototype. The first line of the note
-// becomes the title (truncated to 80 chars), or a sensible fallback if the
-// note is empty. The body has the note + a typed block per kind.
 func renderDraftIssue(d *DraftPayload, assetURL, assetPath string) (string, string) {
 	title := firstLine(d.Note)
 	if title == "" {
@@ -387,13 +341,6 @@ func renderDraftIssue(d *DraftPayload, assetURL, assetPath string) (string, stri
 	return title, b.String()
 }
 
-// resolveDraftTarget resolves the (repo, labels) the draft should land on
-// and refuses request-supplied targets that fall outside the configured
-// allow-list. The capture token grants the bearer the use of orch's
-// GH_TOKEN, which is typically broadly scoped — allowing arbitrary repo
-// targets would let a leaked capture token spam any repo the PAT can
-// write to. By default, only `default_repo` (or `inbox_repo`) is allowed;
-// operators opt other repos in via `capture.allowed_repos`.
 func resolveDraftTarget(cfg *Config, d *DraftPayload) (string, []string, error) {
 	defaultRepo := cfg.Orch.Capture.DefaultRepo
 	if defaultRepo == "" {
@@ -403,9 +350,6 @@ func resolveDraftTarget(cfg *Config, d *DraftPayload) (string, []string, error) 
 	repo := ""
 	if d.Target != nil {
 		repo = strings.TrimSpace(d.Target.Repo)
-		// Defensive copy + filter so a client can't smuggle in flag-shaped
-		// labels (e.g. "--repo other/repo"). gh accepts labels via
-		// `--label name`, so a value starting with `-` is never legitimate.
 		for _, l := range d.Target.Labels {
 			l = strings.TrimSpace(l)
 			if l == "" || strings.HasPrefix(l, "-") {

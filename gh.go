@@ -8,11 +8,6 @@ import (
 	"strings"
 )
 
-// Thin wrappers around the `gh` CLI. The CLI itself handles auth + the
-// noise of GitHub's GraphQL/REST split — we just decode the JSON we asked
-// for. Keep this file the only place that shells out to `gh` so the rest
-// of the codebase has one place to look when a query needs adjusting.
-
 // ghIssueList returns open issues in repo. If label is non-empty, restricts
 // to that label; if empty, returns every open issue (used by tick to fetch
 // the full inbox in one call instead of one-call-per-target).
@@ -64,10 +59,6 @@ type PRSummary struct {
 	State  string `json:"state"`
 }
 
-// ghFindPRByBranch looks up an existing PR for (repo, branch). If author is
-// non-empty, the search is restricted to PRs opened by that GitHub user —
-// without this filter, two orch instances sharing a branch_prefix can
-// spuriously match each other's PRs in the same target repo.
 func ghFindPRByBranch(repo, branch, author string) (*PRSummary, error) {
 	args := []string{"pr", "list",
 		"--repo", repo, "--head", branch, "--state", "all",
@@ -111,10 +102,6 @@ func ghBranchAhead(repo, branch string) (bool, error) {
 	return n > 0, nil
 }
 
-// ghAutoCreatePR opens a PR for the worker's branch when commits exist.
-// Used when the worker's environment can't reach the API directly (e.g.
-// clawpatrol's MITM blocks credential injection on api.github.com inside
-// sessions) — central does it on the worker's behalf.
 func ghAutoCreatePR(cfg *Config, n int, j *Job, is Issue) (int, error) {
 	ahead, err := ghBranchAhead(j.TargetRepo, j.Branch)
 	if err != nil {
@@ -147,7 +134,7 @@ type StatusCheck struct {
 	Name        string `json:"name"`
 	Status      string `json:"status"`
 	Conclusion  string `json:"conclusion"`
-	CompletedAt string `json:"completedAt"` // RFC3339; latest run per name wins
+	CompletedAt string `json:"completedAt"`
 }
 
 type PRView struct {
@@ -174,13 +161,7 @@ type PRView struct {
 		Body   string                 `json:"body"`
 	} `json:"comments"`
 	StatusCheckRollup []StatusCheck `json:"statusCheckRollup"`
-	// Mergeable: GitHub returns "MERGEABLE", "CONFLICTING", or "UNKNOWN".
-	// UNKNOWN means GitHub hasn't finished computing the merge — a few
-	// seconds after the PR is viewed it usually settles.
 	Mergeable string `json:"mergeable"`
-	// Commits is the chronological commit list on the PR head branch.
-	// Used to attribute new pushes so bot-authored pushes don't wake up
-	// the session that just made them.
 	Commits []struct {
 		Oid     string `json:"oid"`
 		Authors []struct {

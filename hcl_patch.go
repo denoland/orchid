@@ -9,11 +9,6 @@ import (
 	"github.com/zclconf/go-cty/cty"
 )
 
-// HCL patcher used by the dashboard's settings page + `orch join vm` to
-// edit swarm.hcl in place. Preserves comments + whitespace via hclwrite
-// rather than re-emitting the whole file. Knows about the four block
-// kinds that are safe to touch from outside the operator's editor.
-
 type blockKind int
 
 const (
@@ -28,15 +23,6 @@ var patchableBlocks = map[string]blockKind{
 	"target":       blockKeyed,
 }
 
-// patchHCL applies a patch onto an existing HCL source while preserving
-// comments and whitespace in the rest of the file.
-//
-// Singleton block patches: `{ orchestrator: { http_addr: ":8000" } }`.
-// Keyed block patches: `{ "vm.local": { host: "localhost" } }` — the
-// part before the dot is the block type, after is the label. Setting
-// the entire keyed value to nil deletes that block. Capture lives
-// inside orchestrator and is reached via dot notation:
-// `{ "orchestrator.capture": { auth_token: "…" } }`.
 func patchHCL(src []byte, patch map[string]map[string]any) ([]byte, error) {
 	f, diags := hclwrite.ParseConfig(src, "swarm.hcl", hcl.Pos{Line: 1, Column: 1})
 	if diags.HasErrors() {
@@ -50,7 +36,6 @@ func patchHCL(src []byte, patch map[string]map[string]any) ([]byte, error) {
 			return nil, fmt.Errorf("block %q is not editable via the dashboard", blockName)
 		}
 
-		// "orchestrator.capture" → nested block inside orchestrator.
 		if head == "orchestrator" && len(parts) == 2 && parts[1] == "capture" {
 			var orch *hclwrite.Block
 			for _, b := range f.Body().Blocks() {
@@ -90,8 +75,6 @@ func patchHCL(src []byte, patch map[string]map[string]any) ([]byte, error) {
 					break
 				}
 			}
-			// `{ "vm.foo": null }` (encoded as an empty map with a single
-			// "__delete" sentinel from the dashboard) removes the block.
 			if _, del := fields["__delete"]; del {
 				if existing != nil {
 					f.Body().RemoveBlock(existing)

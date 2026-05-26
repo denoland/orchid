@@ -15,12 +15,6 @@ import (
 	"time"
 )
 
-// modelPricing is per-million-token USD for {input, cacheCreation,
-// cacheRead, output}. Values match Anthropic's published rates at
-// time of writing; subscription users see this only as a relative
-// burn proxy, not an actual invoice. Update when prices move — the
-// numbers feed the dashboard's Usage tab and the future budget
-// controller's weight formula.
 type modelRate struct {
 	Input, CacheCreate, CacheRead, Output float64
 }
@@ -44,13 +38,9 @@ func pricingFor(model string) modelRate {
 			return p.rate
 		}
 	}
-	return modelPricing[1].rate // unknown → sonnet rate (middle)
+	return modelPricing[1].rate
 }
 
-// jsonlMessage is the subset of the transcript line we care about: an
-// assistant message with usage + timestamp. We ignore every other
-// line type (file-history-snapshot, permission-mode, …) so a schema
-// change upstream that adds new line kinds is forward-compatible.
 type jsonlMessage struct {
 	Type      string    `json:"type"`
 	Timestamp time.Time `json:"timestamp"`
@@ -66,13 +56,9 @@ type jsonlMessage struct {
 	} `json:"message"`
 }
 
-// scanProgress tracks how far we've consumed each jsonl file so a
-// re-scan only reads the tail. Persisting this across orch restarts
-// would be nice but isn't critical — re-reading is idempotent and
-// the upsert collapses duplicates.
 type scanProgress struct {
 	mu   sync.Mutex
-	pos  map[string]int64 // file path → bytes consumed
+	pos  map[string]int64
 }
 
 func newScanProgress() *scanProgress { return &scanProgress{pos: map[string]int64{}} }
@@ -87,12 +73,6 @@ func (p *scanProgress) set(path string, n int64) {
 	p.pos[path] = n
 }
 
-// scanUsageHistory walks the claude projects directory and aggregates
-// every assistant turn it finds into per-day buckets, keyed by
-// (date, sessionId, model). On startup this populates the full
-// history from disk; on each tick after that, only files modified
-// since the last scan get re-read. Idempotent — re-scanning the
-// same range produces the same numbers.
 func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, prog *scanProgress) error {
 	type bucketKey struct{ date, session, model string }
 	type bucket struct {
@@ -101,10 +81,6 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 		issue           int
 	}
 	buckets := map[bucketKey]*bucket{}
-	// Parent directory of every jsonl is the cwd-encoded project, like
-	// `-home-orchid-orch-work-issue-230`. Pull the issue number once
-	// per file so we can group by repo on the dashboard side without
-	// re-parsing every transcript line.
 	pathIssueRe := cwdIssueRe
 
 	err := filepath.WalkDir(projectsRoot, func(path string, d fs.DirEntry, err error) error {
@@ -123,7 +99,7 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 		}
 		start := prog.get(path)
 		if start >= fi.Size() {
-			return nil // unchanged since last scan
+			return nil
 		}
 		f, err := os.Open(path)
 		if err != nil {
@@ -135,10 +111,6 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 				return nil
 			}
 		}
-		// Decode the issue number from the parent directory once per
-		// file. claude encodes the cwd as the dir name with slashes
-		// turned into dashes — `/home/orchid/orch-work/issue-N`
-		// becomes `-home-orchid-orch-work-issue-N`.
 		issueNum := 0
 		if m := pathIssueRe.FindStringSubmatch(filepath.Base(filepath.Dir(path))); len(m) > 0 {
 			if n, err := strconv.Atoi(m[1]); err == nil {
@@ -146,11 +118,11 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 			}
 		}
 		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 0, 64*1024), 4<<20) // some lines are large
+		sc.Buffer(make([]byte, 0, 64*1024), 4<<20)
 		var consumed int64 = start
 		for sc.Scan() {
 			line := sc.Bytes()
-			consumed += int64(len(line)) + 1 // +1 for the trailing \n
+			consumed += int64(len(line)) + 1
 			var m jsonlMessage
 			if err := json.Unmarshal(line, &m); err != nil {
 				continue
@@ -189,9 +161,6 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 	if err != nil {
 		return err
 	}
-	// One upsert per bucket. ON CONFLICT REPLACE means we have to merge
-	// with the existing row first — partial-day scans where new turns
-	// landed after a previous bucket would otherwise overwrite.
 	for k, b := range buckets {
 		existing, err := store.LoadUsageHistory(k.date)
 		if err != nil {
@@ -225,16 +194,7 @@ func scanUsageHistory(ctx context.Context, projectsRoot string, store *Store, pr
 	return ctx.Err()
 }
 
-// runUsageScanLoop bootstraps a full scan at startup and then re-runs
-// every interval thereafter so newly-flushed turns flow into the
-// dashboard within a poll window. Errors are logged but don't kill
-// the loop — a partial scan is better than no scan.
 func runUsageScanLoop(ctx context.Context, projectsRoot string, store *Store, interval time.Duration) {
-	// One-shot backfill: walk every project dir, derive session_id
-	// from the jsonl filename, issue from the parent dir, and update
-	// any usage_daily rows that landed before the issue column
-	// existed (or before the cwd-issue regex was added). Cheap — no
-	// content read, just directory listing.
 	if n, err := backfillIssue(projectsRoot, store); err != nil {
 		log.Printf("usage_history: backfill: %v", err)
 	} else {
@@ -272,7 +232,6 @@ func backfillIssue(projectsRoot string, store *Store) (int, error) {
 		if !strings.HasSuffix(path, ".jsonl") {
 			return nil
 		}
-		// session UUID is the basename without extension.
 		base := filepath.Base(path)
 		sid := strings.TrimSuffix(base, ".jsonl")
 		parent := filepath.Base(filepath.Dir(path))
