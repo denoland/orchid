@@ -179,7 +179,46 @@ html.dark .card-status-watching {
 }
 .docs-signin:hover { transform: translateY(-1px); box-shadow: 0 10px 24px -10px rgba(0,0,0,.3); }
 
-.docs-main { flex: 1; max-width: 760px; width: 100%; margin: 0 auto; padding: 40px 28px 80px; }
+.docs-layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+  gap: 48px;
+  padding: 24px 28px 80px;
+}
+.docs-sidebar {
+  position: sticky; top: 88px; align-self: start;
+  display: flex; flex-direction: column; gap: 2px;
+  font-size: 14px;
+  border-right: 1px solid var(--line);
+  padding-right: 24px;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+}
+.docs-side-section {
+  margin-top: 16px; margin-bottom: 4px;
+  font-size: 11px; font-weight: 600;
+  letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted);
+}
+.docs-side-link {
+  display: block;
+  padding: 6px 10px;
+  border-radius: 6px;
+  color: var(--ink); opacity: .75;
+  text-decoration: none;
+  transition: background .15s, opacity .15s, color .15s;
+}
+.docs-side-link:hover { opacity: 1; background: rgba(0, 0, 0, .03); }
+.docs-side-link.is-active {
+  opacity: 1; color: var(--orchid-deep);
+  background: rgba(124, 58, 237, .08);
+  font-weight: 500;
+}
+.docs-main { min-width: 0; padding-top: 16px; }
 
 .docs-hero { text-align: center; padding: 40px 0 48px; }
 .docs-hero-title {
@@ -271,9 +310,22 @@ html.dark .card-status-watching {
 .docs-prose th, .docs-prose td { padding: .55rem .85rem; border-bottom: 1px solid var(--line); text-align: left; }
 .docs-prose th { font-weight: 600; background: #f4f4f5; }
 
-@media (max-width: 640px) {
+@media (max-width: 840px) {
   .docs-nav { padding: 16px 20px; }
   .docs-brand { font-size: 30px; }
-  .docs-main { padding: 24px 20px 48px; }
-  .docs-hero { padding: 24px 0 32px; }
+  .docs-layout {
+    grid-template-columns: 1fr;
+    gap: 24px;
+    padding: 16px 20px 48px;
+  }
+  .docs-sidebar {
+    position: static;
+    flex-direction: row; flex-wrap: wrap;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 0 0 16px;
+    max-height: none;
+  }
+  .docs-side-section { width: 100%; margin-top: 8px; }
+  .docs-main { padding-top: 0; }
 }
