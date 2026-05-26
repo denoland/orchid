@@ -52,6 +52,7 @@ cf/dist/
 # only for the landing page + favicon. Build artefacts:
 cf/public/_a/
 cf/public/index.html
+cf/public/docs/
 
 # macOS capture build artefacts
 capture/macos/.build/

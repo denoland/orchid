@@ -1,5 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { marked } from 'marked'
+import { DIAGRAMS } from './DocsDiagrams'
 
 interface Page { slug: string; title: string; file: string; lede?: string; section: 'start' | 'configure' | 'integrate' | 'deep' }
 const PAGES: Page[] = [
@@ -105,9 +107,31 @@ export function Docs() {
     let cancelled = false
     fetch(`/docs/${page.file}`)
       .then((r) => r.text())
-      .then((md) => { if (!cancelled) setBody(marked.parse(md) as string) })
+      .then((md) => {
+        if (cancelled) return
+        // Replace {{diagram:name}} markers with placeholder divs the
+        // React effect below will mount real ReactFlow components into.
+        const transformed = md.replace(/\{\{diagram:([a-z0-9-]+)\}\}/g,
+          (_, name) => `<div data-diagram="${name}"></div>`)
+        setBody(marked.parse(transformed) as string)
+      })
     return () => { cancelled = true }
   }, [slug])
+
+  // After marked renders, hunt for diagram placeholders and portal the
+  // matching React component into each. New body resets the list.
+  const articleRef = useRef<HTMLElement | null>(null)
+  const [mounts, setMounts] = useState<{ name: string; el: HTMLElement }[]>([])
+  useEffect(() => {
+    if (!body || !articleRef.current) { setMounts([]); return }
+    const els = articleRef.current.querySelectorAll<HTMLElement>('[data-diagram]')
+    const next: { name: string; el: HTMLElement }[] = []
+    els.forEach((el) => {
+      const name = el.dataset.diagram
+      if (name && DIAGRAMS[name]) next.push({ name, el })
+    })
+    setMounts(next)
+  }, [body])
 
   const go = (to: string | null, e: React.MouseEvent) => {
     e.preventDefault()
@@ -180,7 +204,15 @@ export function Docs() {
             </>
           )}
           {slug && !page && <p>Page not found.</p>}
-          {slug && page && <article className="docs-prose" dangerouslySetInnerHTML={{ __html: body }} />}
+          {slug && page && (
+            <>
+              <article ref={articleRef} className="docs-prose" dangerouslySetInnerHTML={{ __html: body }} />
+              {mounts.map(({ name, el }) => {
+                const C = DIAGRAMS[name]
+                return createPortal(<C />, el)
+              })}
+            </>
+          )}
         </main>
       </div>
       <footer className="docs-footer">

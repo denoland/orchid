@@ -4,29 +4,7 @@ A high-level map of what runs where and how the pieces talk.
 
 ## Components
 
-```
-                ┌───────────────────────────┐
-   you  ─────►  │   orchid.littledivy.com   │  Cloudflare Worker
-                │       (relay + UI)        │   - landing
-                └────────────┬──────────────┘   - GitHub OAuth
-                             │                  - hibernated WS DOs
-                             │ wss agent tunnel
-                             ▼
-                ┌───────────────────────────┐
-                │  orch  (single Go binary) │  on your machine
-                │  - polls GitHub           │
-                │  - drives tmux + claude   │
-                │  - serves /api on :8000   │
-                └────────────┬──────────────┘
-                             │ SSH
-                ┌────────────┴──────────────┐
-                ▼            ▼              ▼
-            ┌──────────┐ ┌──────────┐ ┌──────────┐
-            │  vm A    │ │  vm B    │ │ vm local │
-            │ tmux +   │ │ tmux +   │ │ tmux +   │
-            │ claude×N │ │ claude×N │ │ claude×N │
-            └──────────┘ └──────────┘ └──────────┘
-```
+{{diagram:architecture}}
 
 Three processes you actually run:
 
@@ -89,28 +67,4 @@ files in the same dir get auto-imported once and renamed
 
 ## State diagram for one issue
 
-```
-inbox issue opened
-        │
-        ▼
-   labeled                  → no-match → ignored
-   matches target?
-        │ yes
-        ▼
-   free VM slot?            → none → wait next poll
-        │ yes
-        ▼
-   spawn tmux + claude
-        │
-        ▼
-   paste bootstrap prompt
-        │
-        ▼
-   claude opens PR ─────────► relayed reviews / CI flips
-        │                              │
-        ▼                              │
-   PR merges or closes ◄───────────────┘
-        │
-        ▼
-   tear down + close inbox issue
-```
+{{diagram:issue}}
