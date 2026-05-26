@@ -915,7 +915,15 @@ else
 fi
 [ -f ~/.claude.json ] || echo '{}' > ~/.claude.json
 %s
-ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | head -1
+# github auth check: try ssh first (the historic path), fall back to
+# the gh CLI's https auth when ssh is blocked by the VM's network
+# (exe.dev and similar shared hosts intercept outbound port 22 to
+# github). Either is enough to git clone work repos.
+{
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | head -1
+  gh auth status -h github.com 2>&1 | grep -m1 -E 'Logged in to github.com|Active account' || true
+} | tr '\n' ' '
+echo
 `, sccacheSetup)
 
 	var out, errStr string
@@ -976,8 +984,12 @@ fi
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, errStr)
 	}
-	if !strings.Contains(out, "successfully authenticated") {
-		return fmt.Errorf("github ssh auth check unexpected: %q", strings.TrimSpace(out))
+	// Pass on either signal: ssh's "Hi <user>! You've successfully
+	// authenticated" or `gh auth status`'s "Logged in to github.com"
+	// (used on hosts where outbound port 22 is intercepted).
+	if !strings.Contains(out, "successfully authenticated") &&
+		!strings.Contains(out, "Logged in to github.com") {
+		return fmt.Errorf("github auth check failed (no ssh + no gh login): %q", strings.TrimSpace(out))
 	}
 	return nil
 }
@@ -1016,10 +1028,18 @@ BOT_LOGIN=%q
 BOT_EMAIL=%q
 AGENT=%q
 
-# 1) shared clone (once per repo per VM); always fetch fresh refs
+# 1) shared clone (once per repo per VM); always fetch fresh refs.
+# Prefer ssh when the bot has an id_ed25519 wired to github; fall back
+# to https via gh's credential helper when port 22 is blocked
+# (shared-tenant hosts like exe.dev). Either way refs get fetched.
 if [ ! -d "$SHARED/.git" ]; then
   mkdir -p "$(dirname "$SHARED")"
-  git clone "git@github.com:$REPO.git" "$SHARED"
+  if ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | grep -q 'successfully authenticated'; then
+    git clone "git@github.com:$REPO.git" "$SHARED"
+  else
+    gh auth setup-git -h github.com >/dev/null 2>&1 || true
+    git clone "https://github.com/$REPO.git" "$SHARED"
+  fi
 fi
 git -C "$SHARED" fetch origin --prune --quiet
 
