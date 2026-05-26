@@ -1,0 +1,888 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/hashicorp/hcl/v2/hclsimple"
+)
+
+// CLI entry point + `orch join` subcommands + the matching server-side
+// /api/vm/join handler. Kept together because the request shape and the
+// SSH-material install have to stay in lockstep — touching one without
+// the other has burned us before.
+
+func runJoin(args []string) {
+	if len(args) >= 1 {
+		switch args[0] {
+		case "vm":
+			runJoinVM(args[1:])
+			return
+		case "relay":
+			runJoinRelay(args[1:])
+			return
+		}
+	}
+	runJoinRelay(args)
+}
+
+// runJoinRelay writes the relay URL + agent token into the operator's env
+// file and restarts the systemd unit so the daemon picks them up.
+func runJoinRelay(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: orch join [relay] <relay-url> <relay-token>")
+		os.Exit(2)
+	}
+	relayArg, token := args[0], args[1]
+	// Reject anything that could break out of the `KEY=VALUE` line in the
+	// systemd EnvironmentFile or smuggle additional vars. Newlines and NULs
+	// are the obvious attack; control chars are gratuitous and never
+	// legitimate in either a URL or a token.
+	for _, c := range relayArg + token {
+		if c == '\n' || c == '\r' || c == 0 || c < 0x20 || c == 0x7f {
+			fmt.Fprintln(os.Stderr, "orch join: url/token contains control characters")
+			os.Exit(2)
+		}
+	}
+	// Validate URL shape so a typo doesn't quietly point the agent at an
+	// attacker-controlled origin. wss:// in prod, ws:// only for dev.
+	u, perr := url.Parse(relayArg)
+	if perr != nil || (u.Scheme != "wss" && u.Scheme != "ws") || u.Host == "" {
+		fmt.Fprintf(os.Stderr, "orch join: bad relay url (expect wss://host/path): %v\n", perr)
+		os.Exit(2)
+	}
+	envPath := os.Getenv("ORCHID_ENV_FILE")
+	if envPath == "" {
+		envPath = "/root/orch/env"
+	}
+	// Read existing env, drop any old RELAY_* lines, append new ones.
+	var keep []string
+	if b, err := os.ReadFile(envPath); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(line, "RELAY_URL=") || strings.HasPrefix(line, "RELAY_TOKEN=") {
+				continue
+			}
+			if line != "" {
+				keep = append(keep, line)
+			}
+		}
+	}
+	keep = append(keep, "RELAY_URL="+relayArg, "RELAY_TOKEN="+token)
+	if err := os.WriteFile(envPath, []byte(strings.Join(keep, "\n")+"\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "write %s: %v\n", envPath, err)
+		os.Exit(1)
+	}
+	// Systemd will expand the new RELAY_URL/RELAY_TOKEN values on the
+	// next restart. The ExecStart line installed by install.sh already
+	// uses -relay=${RELAY_URL} -relay-token=${RELAY_TOKEN}, so no unit
+	// rewrite is needed — daemon-reload + restart is enough.
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+	if err := exec.Command("systemctl", "restart", "orchid").Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "systemctl restart: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("orch: joined " + relayArg)
+}
+
+// vmJoinRequest is the payload `orch join vm` POSTs to /api/vm/join.
+type vmJoinRequest struct {
+	Name     string `json:"name,omitempty"`     // optional preferred VM name; central allocates if empty
+	Hostname string `json:"hostname"`           // public hostname/IP central will SSH to
+	SSHUser  string `json:"ssh_user"`           // user on this VM that central connects as (e.g. "orchid")
+	HostKey  string `json:"host_key,omitempty"` // optional: the worker's ssh-keyscan'd host key, helps central populate known_hosts
+}
+
+// vmJoinResponse is central's reply with the SSH material the worker
+// installs into the orchid user's ~/.ssh.
+type vmJoinResponse struct {
+	Name string `json:"name"`
+	// AccessPublicKey is the OpenSSH public key central uses for
+	// central→worker SSH. Worker appends it to
+	// ~<ssh_user>/.ssh/authorized_keys.
+	AccessPublicKey string `json:"access_public_key"`
+	// BotGithubPrivateKey / BotGithubPublicKey are the bot account's
+	// GitHub SSH keypair (when orchestrator.bot_github_key is configured
+	// or the default ~/.ssh/id_ed25519 exists). Worker writes them into
+	// ~<ssh_user>/.ssh/id_ed25519{,.pub} so claude can `git clone
+	// git@github.com:…` as the bot. Empty when the operator hasn't
+	// configured one.
+	BotGithubPrivateKey string `json:"bot_github_private_key,omitempty"`
+	BotGithubPublicKey  string `json:"bot_github_public_key,omitempty"`
+}
+
+// runJoinVM is invoked on a fresh worker host. It POSTs this VM's
+// network identity to central, then installs the SSH material central
+// returns so central can SSH in and so the bot can `git clone` as
+// itself.
+func runJoinVM(args []string) {
+	fs := flag.NewFlagSet("orch join vm", flag.ExitOnError)
+	hostname := fs.String("hostname", "", "public hostname/IP central will SSH to (default: first non-loopback address)")
+	sshUser := fs.String("user", "orchid", "SSH user on this VM central connects as (must already exist)")
+	name := fs.String("name", "", "VM name central should record (default: central allocates)")
+	insecure := fs.Bool("insecure-http", false, "allow plain-http central-url (required to send bot github keys over the wire)")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	pos := fs.Args()
+	if len(pos) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: orch join vm [--hostname=H] [--user=U] [--name=N] <central-url> <invite-token>")
+		os.Exit(2)
+	}
+	centralURL, token := strings.TrimRight(pos[0], "/"), pos[1]
+	parsed, err := url.Parse(centralURL)
+	if err != nil || parsed.Host == "" {
+		fmt.Fprintf(os.Stderr, "bad central url %q: %v\n", centralURL, err)
+		os.Exit(2)
+	}
+	if parsed.Scheme != "https" && !*insecure {
+		fmt.Fprintf(os.Stderr, "refusing to send join request over %q — pass --insecure-http if you trust this network\n", parsed.Scheme)
+		os.Exit(2)
+	}
+
+	if _, err := exec.Command("id", "-u", *sshUser).Output(); err != nil {
+		fmt.Fprintf(os.Stderr, "ssh user %q does not exist on this host (create it first, e.g. `useradd -m %s`)\n", *sshUser, *sshUser)
+		os.Exit(1)
+	}
+	host := *hostname
+	if host == "" {
+		host = detectPublicAddr()
+	}
+	if host == "" {
+		fmt.Fprintln(os.Stderr, "could not auto-detect a public hostname/IP — pass --hostname=<addr>")
+		os.Exit(1)
+	}
+	hostKey, _ := readLocalHostKey()
+
+	body, _ := json.Marshal(vmJoinRequest{
+		Name: *name, Hostname: host, SSHUser: *sshUser, HostKey: hostKey,
+	})
+	req, _ := http.NewRequest(http.MethodPost, centralURL+"/api/vm/join", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "central: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		fmt.Fprintf(os.Stderr, "central returned %d: %s\n", resp.StatusCode, strings.TrimSpace(string(msg)))
+		os.Exit(1)
+	}
+	var got vmJoinResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		fmt.Fprintf(os.Stderr, "decode response: %v\n", err)
+		os.Exit(1)
+	}
+	if got.AccessPublicKey == "" {
+		fmt.Fprintln(os.Stderr, "central returned no access_public_key")
+		os.Exit(1)
+	}
+	if err := installJoinMaterial(*sshUser, got); err != nil {
+		fmt.Fprintf(os.Stderr, "install ssh material: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("orch: joined as VM %q. Central can now SSH in as %s@%s.\n", got.Name, *sshUser, host)
+	if got.BotGithubPrivateKey == "" {
+		fmt.Println("warning: central did not push a bot github key — make sure this host has its own SSH access to github (e.g. `gh auth login` + ssh-keygen + add to github bot account) or claude sessions won't be able to `git clone` here.")
+	}
+}
+
+// detectPublicAddr returns the first IPv4/IPv6 address bound to a
+// non-loopback, non-private interface, or empty when nothing fits. We
+// intentionally avoid hitting an external `curl ifconfig.me` service —
+// orch installs run on locked-down corporate boxes where outbound to
+// random services is blocked. Operators with NAT/no global IP pass
+// --hostname explicitly.
+func detectPublicAddr() string {
+	ifaces, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	var privateFallback string
+	for _, a := range ifaces {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP.IsLoopback() || ipnet.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		ip := ipnet.IP
+		if ip.To4() == nil && ip.To16() != nil {
+			// Skip IPv6 unless we have nothing else; v4 first.
+			if privateFallback == "" {
+				privateFallback = ip.String()
+			}
+			continue
+		}
+		if ip.IsPrivate() {
+			if privateFallback == "" {
+				privateFallback = ip.String()
+			}
+			continue
+		}
+		return ip.String()
+	}
+	return privateFallback
+}
+
+// readLocalHostKey grabs the ed25519 host key sshd already published so
+// the join response can carry it back to central for known_hosts. Best
+// effort — empty result is fine.
+func readLocalHostKey() (string, error) {
+	for _, p := range []string{"/etc/ssh/ssh_host_ed25519_key.pub", "/etc/ssh/ssh_host_rsa_key.pub"} {
+		b, err := os.ReadFile(p)
+		if err == nil {
+			return strings.TrimSpace(string(b)), nil
+		}
+	}
+	return "", fmt.Errorf("no host key found")
+}
+
+// installJoinMaterial places central's access pubkey into the ssh user's
+// authorized_keys and (when provided) drops the bot's github keypair so
+// the worker can clone/push as the bot.
+func installJoinMaterial(sshUser string, m vmJoinResponse) error {
+	home, err := lookupHome(sshUser)
+	if err != nil {
+		return err
+	}
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", sshDir, err)
+	}
+
+	authPath := filepath.Join(sshDir, "authorized_keys")
+	marker := "# orchid-central:" + m.Name
+	if err := appendAuthorizedKey(authPath, marker, m.AccessPublicKey); err != nil {
+		return fmt.Errorf("authorized_keys: %w", err)
+	}
+	_ = os.Chmod(authPath, 0o600)
+
+	if m.BotGithubPrivateKey != "" {
+		// Only seed id_ed25519 if missing — pre-existing keys on this
+		// host are assumed authoritative (operator already registered
+		// them with github) and overwriting would orphan the github
+		// account from this host.
+		privPath := filepath.Join(sshDir, "id_ed25519")
+		if _, err := os.Stat(privPath); os.IsNotExist(err) {
+			if err := os.WriteFile(privPath, []byte(ensureTrailingNL(m.BotGithubPrivateKey)), 0o600); err != nil {
+				return fmt.Errorf("write %s: %w", privPath, err)
+			}
+			if m.BotGithubPublicKey != "" {
+				_ = os.WriteFile(privPath+".pub", []byte(ensureTrailingNL(m.BotGithubPublicKey)), 0o644)
+			}
+		}
+	}
+
+	// known_hosts: trust github.com so the bot can clone immediately.
+	khPath := filepath.Join(sshDir, "known_hosts")
+	if !knownHostHas(khPath, "github.com") {
+		out, _ := exec.Command("ssh-keyscan", "-t", "ed25519,rsa", "github.com").Output()
+		if len(out) > 0 {
+			f, err := os.OpenFile(khPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+			if err == nil {
+				_, _ = f.Write(out)
+				_ = f.Close()
+			}
+		}
+	}
+
+	// chown the whole .ssh tree to the target user so the daemon can read it.
+	_ = exec.Command("chown", "-R", sshUser+":"+sshUser, sshDir).Run()
+	return nil
+}
+
+func ensureTrailingNL(s string) string {
+	if strings.HasSuffix(s, "\n") {
+		return s
+	}
+	return s + "\n"
+}
+
+// appendAuthorizedKey writes (key) into (path) under a one-line marker
+// comment so re-running `orch join vm` for the same name rotates the
+// key in place rather than appending duplicates.
+func appendAuthorizedKey(path, marker, key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("empty key")
+	}
+	var existing []byte
+	if b, err := os.ReadFile(path); err == nil {
+		existing = b
+	}
+	out := stripMarkerBlock(existing, marker)
+	if len(out) > 0 && !bytes.HasSuffix(out, []byte{'\n'}) {
+		out = append(out, '\n')
+	}
+	out = append(out, []byte(marker+"\n"+key+"\n")...)
+	return os.WriteFile(path, out, 0o600)
+}
+
+// stripMarkerBlock returns src with any "# marker" line and the single
+// line that follows removed. Used to make authorized_keys updates
+// idempotent when central reissues an access key.
+func stripMarkerBlock(src []byte, marker string) []byte {
+	if len(src) == 0 {
+		return src
+	}
+	lines := strings.Split(string(src), "\n")
+	out := make([]string, 0, len(lines))
+	skipNext := false
+	for _, line := range lines {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if strings.TrimSpace(line) == marker {
+			skipNext = true
+			continue
+		}
+		out = append(out, line)
+	}
+	return []byte(strings.Join(out, "\n"))
+}
+
+func knownHostHas(path, host string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, host+" ") || strings.HasPrefix(line, host+",") {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupHome returns the home directory for a system user.
+func lookupHome(user string) (string, error) {
+	out, err := exec.Command("getent", "passwd", user).Output()
+	if err != nil {
+		return "", fmt.Errorf("getent passwd %s: %w", user, err)
+	}
+	parts := strings.Split(strings.TrimSpace(string(out)), ":")
+	if len(parts) < 6 {
+		return "", fmt.Errorf("malformed passwd entry for %s", user)
+	}
+	return parts[5], nil
+}
+
+// handleVMJoin is the server-side counterpart to runJoinVM. Auth is
+// handled by the wrapping `auth()` (Bearer == http_secret).
+func handleVMJoin(w http.ResponseWriter, r *http.Request) error {
+	defer r.Body.Close()
+	var req vmJoinRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return err
+	}
+	if strings.TrimSpace(req.Hostname) == "" || strings.TrimSpace(req.SSHUser) == "" {
+		http.Error(w, "hostname and ssh_user required", http.StatusBadRequest)
+		return fmt.Errorf("missing hostname/ssh_user")
+	}
+	if !validVMName(req.Name) && req.Name != "" {
+		http.Error(w, "invalid name (alnum + dash/underscore only)", http.StatusBadRequest)
+		return fmt.Errorf("invalid name %q", req.Name)
+	}
+
+	if globalConfigPath == "" {
+		http.Error(w, "config path unknown", http.StatusInternalServerError)
+		return fmt.Errorf("globalConfigPath unset")
+	}
+	src, err := os.ReadFile(globalConfigPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return err
+	}
+	var current Config
+	if err := hclsimple.Decode(filepath.Base(globalConfigPath), src, nil, &current); err != nil {
+		http.Error(w, "parse swarm.hcl: "+err.Error(), http.StatusInternalServerError)
+		return err
+	}
+
+	name := req.Name
+	if name == "" {
+		name = allocVMName(&current, req.Hostname)
+	}
+
+	// Generate the dedicated per-VM access keypair. ssh-keygen is already
+	// a hard prereq (the orch host always has openssh-client) so going
+	// out-of-process keeps us from pulling in golang.org/x/crypto.
+	keyPath, pubBytes, err := generateVMAccessKey(globalConfigPath, name)
+	if err != nil {
+		http.Error(w, "keygen: "+err.Error(), http.StatusInternalServerError)
+		return err
+	}
+
+	// Optional bot github keypair — best effort; an empty result is fine
+	// (the worker prints a warning).
+	botPriv, botPub := readBotGithubKey(current.Orch.BotGithubKey)
+
+	// Patch swarm.hcl in place. Reuses the same patchHCL the dashboard
+	// settings page uses, so comments and unrelated formatting survive.
+	patch := map[string]map[string]any{
+		"vm." + name: {
+			"host":         req.Hostname,
+			"user":         req.SSHUser,
+			"key":          keyPath,
+			"capacity":     float64(4),
+			"join_managed": true,
+		},
+	}
+	out, err := patchHCL(src, patch)
+	if err != nil {
+		http.Error(w, "patch: "+err.Error(), http.StatusInternalServerError)
+		return err
+	}
+	// Validate before touching disk — hclsimple.DecodeFile picks its
+	// parser by extension, and `.tmp` blows it up. Decode in-memory
+	// so the trial parse uses the real filename's parser.
+	var trial Config
+	if err := hclsimple.Decode(filepath.Base(globalConfigPath), out, nil, &trial); err != nil {
+		http.Error(w, "swarm.hcl invalid after patch: "+err.Error(), http.StatusInternalServerError)
+		return err
+	}
+	tmp := globalConfigPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return err
+	}
+	if err := os.Rename(tmp, globalConfigPath); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return err
+	}
+
+	resp := vmJoinResponse{
+		Name:                name,
+		AccessPublicKey:     strings.TrimSpace(string(pubBytes)),
+		BotGithubPrivateKey: botPriv,
+		BotGithubPublicKey:  botPub,
+	}
+	log.Printf("vm join: registered %q at %s@%s (key=%s, github_key=%v)",
+		name, req.SSHUser, req.Hostname, keyPath, botPriv != "")
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(resp)
+}
+
+// validVMName mirrors what HCL accepts as a block label and what
+// filenames under vm-keys/ tolerate without quoting headaches.
+var vmNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`)
+
+func validVMName(name string) bool { return vmNamePattern.MatchString(name) }
+
+// allocVMName picks the next free vm name. Prefers a hostname-derived
+// slug ("vm-<sanitized-host>") then falls back to vm-N.
+func allocVMName(cfg *Config, hostname string) string {
+	used := map[string]bool{}
+	for _, v := range cfg.VMs {
+		used[v.Name] = true
+	}
+	if slug := slugifyHostname(hostname); slug != "" && !used[slug] {
+		return slug
+	}
+	for i := 1; ; i++ {
+		n := fmt.Sprintf("vm-%d", i)
+		if !used[n] {
+			return n
+		}
+	}
+}
+
+func slugifyHostname(h string) string {
+	h = strings.ToLower(h)
+	// Drop port, take first hostname label, sanitize.
+	if i := strings.Index(h, ":"); i >= 0 {
+		h = h[:i]
+	}
+	if i := strings.Index(h, "."); i >= 0 {
+		h = h[:i]
+	}
+	var b strings.Builder
+	for _, r := range h {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else if r == '-' || r == '_' {
+			b.WriteRune('-')
+		}
+	}
+	s := b.String()
+	if s == "" {
+		return ""
+	}
+	if s[0] >= '0' && s[0] <= '9' {
+		s = "vm-" + s
+	}
+	if !validVMName(s) {
+		return ""
+	}
+	return s
+}
+
+// generateVMAccessKey writes a fresh ed25519 keypair under
+// <install_dir>/vm-keys/<name>. install_dir is derived from
+// configPath's directory so the layout matches install.sh.
+func generateVMAccessKey(configPath, name string) (string, []byte, error) {
+	dir := filepath.Join(filepath.Dir(configPath), "vm-keys")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", nil, fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	keyPath := filepath.Join(dir, name)
+	// Overwrite — re-joins should rotate the key.
+	_ = os.Remove(keyPath)
+	_ = os.Remove(keyPath + ".pub")
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-q", "-N", "", "-C", "orchid-central→"+name, "-f", keyPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", nil, fmt.Errorf("ssh-keygen: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	pub, err := os.ReadFile(keyPath + ".pub")
+	if err != nil {
+		return "", nil, fmt.Errorf("read pub: %w", err)
+	}
+	return keyPath, pub, nil
+}
+
+// readBotGithubKey returns the (private, public) bytes of the bot's
+// github ssh key when discoverable. Empty strings on miss; the worker
+// prints a warning but the join still succeeds.
+func readBotGithubKey(configured string) (priv, pub string) {
+	path := configured
+	if path == "" {
+		home, _ := os.UserHomeDir()
+		if home == "" {
+			return "", ""
+		}
+		path = filepath.Join(home, ".ssh", "id_ed25519")
+	} else {
+		path = expand(path)
+	}
+	pb, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+	pubB, _ := os.ReadFile(path + ".pub")
+	return string(pb), string(pubB)
+}
+
+// subcommands maps the first argv element to a handler that takes the
+// remaining args. Centralised so adding a new top-level command means
+// adding one entry here — no chained `if os.Args[1] == ...` ladders.
+var subcommands = map[string]func([]string){
+	"join": runJoin,
+}
+
+func main() {
+	if len(os.Args) >= 2 {
+		if h, ok := subcommands[os.Args[1]]; ok {
+			h(os.Args[2:])
+			return
+		}
+	}
+	cfgPath := flag.String("config", "swarm.hcl", "path to HCL config")
+	describeFlag := flag.Bool("describe", false, "print a CLAUDE.md-shaped description of this instance and exit")
+	captureOnly := flag.Bool("capture-only", false, "run only the /api/drafts capture HTTP server (no swarm polling, no VM bootstrap); requires a capture block in the config")
+	relayURL := flag.String("relay", "", "outbound relay URL (e.g. wss://orchid.com/agent) — dashboard is reachable at <sub>.orchid.com without exposing this port")
+	relayToken := flag.String("relay-token", "", "agent token issued by the relay on signup")
+	flag.Parse()
+	globalConfigPath = *cfgPath
+
+	var cfg Config
+	if err := hclsimple.DecodeFile(*cfgPath, nil, &cfg); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	st, err := loadState(cfg.Orch.StateDB)
+	if err != nil {
+		log.Fatalf("state: %v", err)
+	}
+	if *captureOnly {
+		if cfg.Orch.Capture == nil {
+			log.Fatalf("-capture-only requires a `capture { ... }` block in the config")
+		}
+		if cfg.Orch.HTTPAddr == "" {
+			log.Fatalf("-capture-only requires orchestrator.http_addr to be set")
+		}
+		log.Printf("orchid capture: listening on http://%s/, assets under %s",
+			cfg.Orch.HTTPAddr, captureAssetsDirOrPlaceholder(&cfg))
+		if err := http.ListenAndServe(cfg.Orch.HTTPAddr, httpHandler(&cfg, st)); err != nil {
+			log.Fatalf("http: %v", err)
+		}
+		return
+	}
+	if *describeFlag {
+		// Mirror the runtime publish so describe sees a non-nil snapshot.
+		snap := make(map[int]Job, len(st.Jobs))
+		for n, j := range st.Jobs {
+			snap[n] = *j
+		}
+		st.httpSnap.Store(snap)
+		fmt.Print(describe(&cfg, st, ""))
+		return
+	}
+	interval, err := time.ParseDuration(cfg.Orch.PollInterval)
+	if err != nil {
+		log.Fatalf("poll_interval: %v", err)
+	}
+	for _, vm := range cfg.VMs {
+		if login, _ := vmBotIdentity(cfg.Orch, vm); login == "" {
+			log.Fatalf("vm %q: bot_login not set; configure orchestrator.bot_login or vm.%s.bot_login", vm.Name, vm.Name)
+		}
+	}
+	tnames := make([]string, 0, len(cfg.Targets))
+	for _, t := range cfg.Targets {
+		tnames = append(tnames, fmt.Sprintf("%s(%s→%s)", t.Name, t.Label, t.Repo))
+	}
+	log.Printf("orch up: inbox=%s targets=[%s] vms=%d interval=%s tracked=%d",
+		cfg.GitHub.InboxRepo, strings.Join(tnames, ","), len(cfg.VMs), interval, len(st.Jobs))
+
+	if cfg.Orch.HTTPAddr != "" {
+		// The http_secret gates every dashboard endpoint and is the only
+		// barrier between the public internet (when relay-fronted) and
+		// arbitrary tmux paste / config rewrites. A short, guessable
+		// secret means everyone on the network owns this orchestrator.
+		// install.sh ships 16-byte hex; warn loudly if the operator
+		// reduced it.
+		if s := cfg.Orch.HTTPSecret; s == "" {
+			log.Printf("SECURITY: orchestrator.http_secret is empty — dashboard is OPEN to anyone who can reach %s. Set http_secret to a 32+ char random string (openssl rand -hex 32).", cfg.Orch.HTTPAddr)
+		} else if len(s) < 16 {
+			log.Printf("SECURITY: orchestrator.http_secret is only %d chars — trivially brute-forceable. Replace with at least 32 hex chars (openssl rand -hex 32).", len(s))
+		}
+		go func() {
+			log.Printf("http ui on http://%s/", cfg.Orch.HTTPAddr)
+			if err := http.ListenAndServe(cfg.Orch.HTTPAddr, httpHandler(&cfg, st)); err != nil {
+				log.Printf("http server: %v", err)
+			}
+		}()
+	}
+
+	// Background pane-activity sampler. Captures each live session's pane
+	// every second, hashes it, and records a 0/1 tick into the per-session
+	// ring buffer. The dashboard reads this via /api/state for initial
+	// state and gets push notifications via the canvas WS for real-time
+	// updates so the working/idle indicators don't lag a poll cycle behind.
+	go func() {
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			var snap map[int]Job
+			if v := st.httpSnap.Load(); v != nil {
+				snap = v.(map[int]Job)
+			}
+			live := map[string]bool{}
+			for _, j := range snap {
+				if j.Tmux == "" {
+					continue
+				}
+				live[j.Tmux] = true
+				vm := vmByName(&cfg, j.VM)
+				if vm == nil {
+					continue
+				}
+				out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s 2>/dev/null | tail -8", j.Tmux))
+				if err != nil {
+					continue
+				}
+				h := fnv64(out)
+				changed := paneActivityRecordTick(j.Tmux, h)
+				if changed {
+					msg, _ := json.Marshal(map[string]any{
+						"type": "activity",
+						"tmux": j.Tmux,
+						"ts":   time.Now().UnixMilli(),
+					})
+					globalCollabHub.broadcast(nil, msg)
+				}
+				// Prompt detection rides the same capture: when claude shows a
+				// permission/decision dialog the footer changes to "Esc to
+				// cancel · …", which tail -8 reliably catches. On transitions
+				// we kick the state broadcast so the next /api/state push (≤
+				// 500ms via the relay throttle) carries the new needs_input
+				// flag — the dashboard re-categorises the card to "Needs you"
+				// without waiting for the slow polling fallback.
+				needs := panePrompted(out, vmAgent(*vm))
+				if paneNeedsInputSet(j.Tmux, needs) {
+					if st.Bcast != nil {
+						select {
+						case st.Bcast <- struct{}{}:
+						default:
+						}
+					}
+				}
+			}
+			paneActivityPrune(live)
+			paneNeedsInputPrune(live)
+		}
+	}()
+
+	if *relayURL != "" {
+		if *relayToken == "" {
+			log.Fatalf("-relay requires -relay-token (issued by the relay on signup)")
+		}
+		// snapRead/snapWrite back the events-WS snap channel. Source of
+		// truth is the sqlite store — same rows the /api/snap HTTP
+		// handler reads from, so a browser writing layout via the WS
+		// and another viewing it via the HTTP path see the same data.
+		snapRead := func() []byte {
+			b, err := st.store.GetSnap()
+			if err != nil {
+				return nil
+			}
+			return b
+		}
+		snapWrite := func(body []byte) error {
+			if !json.Valid(body) {
+				return fmt.Errorf("invalid json")
+			}
+			return st.store.PutSnap(body)
+		}
+		// allowedLoginsProvider lets the config-save handler hot-push
+		// allow-list edits without an orch restart. Captures cfg by
+		// pointer so the closure reads the freshest slice each call.
+		allowedLoginsProvider = func() []string { return append([]string(nil), cfg.Orch.AllowedLogins...) }
+		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st), st.Bcast, func() []byte { return buildAPIStateJSON(&cfg, st) }, snapRead, snapWrite, func(s string) *VMBlock { return lookupPaneVM(&cfg, st, s) })
+	}
+
+	for i := range cfg.VMs {
+		if err := bootstrapVM(cfg.VMs[i]); err != nil {
+			log.Printf("vm %s: bootstrap FAILED: %v", cfg.VMs[i].Name, err)
+		} else {
+			log.Printf("vm %s: bootstrapped (github ssh ok)", cfg.VMs[i].Name)
+		}
+	}
+
+	// Tail each VM's Claude statusline.jsonl in the background. Feeds
+	// the in-memory usage map that /api/state exposes. Self-restarts
+	// on EOF, so a transient ssh blip just means we miss a few ticks.
+	for i := range cfg.VMs {
+		vm := cfg.VMs[i]
+		go tailStatusLine(context.Background(), vm, st.Bcast)
+	}
+
+	// History scanner: walks ~/.claude/projects/**/*.jsonl on every VM
+	// and aggregates per-day tokens + cost into the usage_daily table.
+	// Backfills on startup, then incrementally re-reads tail bytes of
+	// modified files. Drives the Usage tab's charts.
+	for i := range cfg.VMs {
+		vm := cfg.VMs[i]
+		if !isLocal(vm) {
+			continue // remote VMs need ssh-side scanning; defer to a later pass
+		}
+		go runUsageScanLoop(context.Background(), projectsRootFor(vm), st.store, 5*time.Minute)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Mention watcher: validate org access at startup so a missing
+	// `read:org` scope or non-member token surfaces immediately, not on
+	// the first tick. This is intentionally a hard fail — silently
+	// downgrading members to "external" would route their requests to
+	// the canned reply.
+	if cfg.Orch.Mentions != nil {
+		if _, err := fetchMaintainers(cfg.Orch.Mentions.Org); err != nil {
+			log.Fatalf("mentions: cannot read org %s members (token needs read:org and to be in the org): %v",
+				cfg.Orch.Mentions.Org, err)
+		}
+		mentionInterval, err := time.ParseDuration(cfg.Orch.Mentions.PollInterval)
+		if err != nil || mentionInterval == 0 {
+			mentionInterval = 5 * time.Minute
+		}
+		go func() {
+			mt := time.NewTicker(mentionInterval)
+			defer mt.Stop()
+			mentionTick(&cfg, st)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-mt.C:
+					mentionTick(&cfg, st)
+				}
+			}
+		}()
+		log.Printf("mentions: poller started, every %s, org=%s", mentionInterval, cfg.Orch.Mentions.Org)
+	}
+
+	// Assignment watcher runs unconditionally — only requires a
+	// bot_login (every orch has one), no org membership check. Polls
+	// every 60s; assignment is a low-frequency event so we don't pay
+	// much for the cadence and the latency-to-spawn matters when a
+	// human just assigned the issue and expects orchid to pick it up.
+	if len(botLogins(&cfg)) > 0 {
+		go func() {
+			at := time.NewTicker(60 * time.Second)
+			defer at.Stop()
+			assignmentTick(&cfg, st)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-at.C:
+					assignmentTick(&cfg, st)
+				}
+			}
+		}()
+		log.Printf("assignments: poller started, every 60s, bots=%v", botLogins(&cfg))
+	}
+
+	go func() {
+		pt := time.NewTicker(time.Hour)
+		defer pt.Stop()
+		pruneOrphanWorkdirs(&cfg, st)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pt.C:
+				pruneOrphanWorkdirs(&cfg, st)
+			}
+		}
+	}()
+
+	// Operator session watcher: keep the operator claude session alive and
+	// unstuck (dismiss the trust dialog if it reappears after a crash).
+	go func() {
+		ot := time.NewTicker(30 * time.Second)
+		defer ot.Stop()
+		ensureOperator(&cfg)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ot.C:
+				ensureOperator(&cfg)
+			}
+		}
+	}()
+
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	tick(&cfg, st)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("shutdown")
+			return
+		case <-t.C:
+			tick(&cfg, st)
+		}
+	}
+}
