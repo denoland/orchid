@@ -1,6 +1,4 @@
-# Architecture
-
-{{illust:branch-tree}}
+# {{illust:branch-tree}} Architecture
 
 A high-level map of what runs where and how the pieces talk.
 

@@ -1,6 +1,4 @@
-# VMs
-
-{{illust:vm-cluster}}
+# {{illust:vm-cluster}} VMs
 
 A **VM** in orchid is anything that runs `tmux` + `claude` sessions
 on orch's behalf. The central host counts as one (its localhost

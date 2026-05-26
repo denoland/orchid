@@ -154,9 +154,9 @@ html.dark .card-status-watching {
   position: sticky; top: 0; z-index: 10;
   display: flex; align-items: baseline; gap: 16px;
   padding: 24px 32px;
-  background: rgba(250, 250, 249, .85);
-  backdrop-filter: blur(8px);
+  background: transparent;
 }
+.docs-nav .docs-signin { margin-left: auto; }
 .docs-brand {
   font-family: 'Cormorant Garamond', serif;
   font-style: italic; font-weight: 500;

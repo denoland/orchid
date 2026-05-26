@@ -1,6 +1,4 @@
-# Chat with your orchid
-
-{{illust:chat-vine}}
+# {{illust:chat-vine}} Chat with your orchid
 
 {{mockup:telegram}}
 

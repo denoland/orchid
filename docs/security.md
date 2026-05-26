@@ -1,6 +1,4 @@
-# Security
-
-{{illust:lock-vine}}
+# {{illust:lock-vine}} Security
 
 Orchid runs `claude --dangerously-skip-permissions` inside tmux. The
 flag exists for a reason: by default Claude prompts before every

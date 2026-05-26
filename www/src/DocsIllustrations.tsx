@@ -1,17 +1,17 @@
 // Tiny line-art icons drawn with explicit symmetric geometry. Used as
 // page-identity badges — small, consistent stroke width, no wobble.
 
-function frame(children: React.ReactNode, size = 96) {
+function frame(children: React.ReactNode, size = 40) {
   return (
-    <div className="docs-illust" style={{ display: 'flex', justifyContent: 'flex-start', margin: '8px 0 16px' }}>
-      <svg
-        viewBox="-50 -50 100 100" width={size} height={size}
-        fill="none" stroke="#7c3aed" strokeWidth="1.6"
-        strokeLinecap="round" strokeLinejoin="round"
-      >
-        {children}
-      </svg>
-    </div>
+    <svg
+      className="docs-illust-svg"
+      viewBox="-50 -50 100 100" width={size} height={size}
+      fill="none" stroke="#7c3aed" strokeWidth="2.2"
+      strokeLinecap="round" strokeLinejoin="round"
+      style={{ verticalAlign: 'middle', display: 'inline-block', marginRight: 4 }}
+    >
+      {children}
+    </svg>
   )
 }
 
@@ -26,15 +26,11 @@ export function Bud() {
   </>)
 }
 
-// Three buds — small bouquet for the dashboard page.
+// Two overlapping cards — dashboard.
 export function Spray() {
   return frame(<>
-    <line x1="0" y1="40" x2="0" y2="-12" />
-    <path d="M 0 40 Q -16 24 -24 0" />
-    <path d="M 0 40 Q  16 24  24 0" />
-    <ellipse cx="-24" cy="-6" rx="5" ry="7" />
-    <ellipse cx=" 24" cy="-6" rx="5" ry="7" />
-    <ellipse cx="0"  cy="-22" rx="6" ry="9" />
+    <rect x="-30" y="-20" width="36" height="28" rx="3" />
+    <rect x="-6"  y=" -4" width="36" height="28" rx="3" fill="#fafaf9" />
   </>)
 }
 
@@ -69,17 +65,18 @@ export function VineMesh() {
   </>)
 }
 
-// Branch — center trunk with two clean forks. Architecture.
+// Isometric cube — architecture.
 export function BranchTree() {
   return frame(<>
-    <line x1="0" y1="40" x2="0" y2="0" />
-    <line x1="0" y1="0" x2="-26" y2="-20" />
-    <line x1="0" y1="0" x2=" 26" y2="-20" />
-    <circle cx="0"  cy="0"    r="2.5" fill="#7c3aed" stroke="none" />
-    <circle cx="-26" cy="-20" r="3.5" />
-    <circle cx=" 26" cy="-20" r="3.5" />
-    <line x1="0" y1="16" x2="-14" y2="6" />
-    <line x1="0" y1="16" x2=" 14" y2="6" />
+    {/* top diamond */}
+    <polygon points="0,-30 30,-12 0,6 -30,-12" />
+    {/* left + right verticals */}
+    <line x1="-30" y1="-12" x2="-30" y2="20" />
+    <line x1=" 30" y1="-12" x2=" 30" y2="20" />
+    <line x1="0"   y1="  6" x2="0"   y2="38" />
+    {/* bottom outline */}
+    <line x1="-30" y1="20" x2="0"  y2="38" />
+    <line x1=" 30" y1="20" x2="0"  y2="38" />
   </>)
 }
 
@@ -93,12 +90,13 @@ export function ChatVine() {
   </>)
 }
 
-// Pen nib — capture.
+// Microphone — capture.
 export function HandBud() {
   return frame(<>
-    <path d="M -20 30 L 20 -30 L 28 -22 L -12 38 Z" />
-    <line x1="-20" y1="30" x2="-8" y2="34" />
-    <circle cx="-22" cy="40" r="2" fill="#7c3aed" stroke="none" />
+    <rect x="-10" y="-32" width="20" height="36" rx="10" />
+    <path d="M -22 -2 V 6 Q -22 22 0 22 Q 22 22 22 6 V -2" />
+    <line x1="0" y1="22" x2="0" y2="36" />
+    <line x1="-10" y1="36" x2="10" y2="36" />
   </>)
 }
 

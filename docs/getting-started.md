@@ -1,7 +1,5 @@
 # Getting started
 
-{{illust:bud}}
-
 Orchid is a swarm of coding agents that ship pull requests. You file
 issues; orchid spawns a `claude` (or codex) session for each one,
 relays reviews and CI, and tears down once the PR merges. This guide
