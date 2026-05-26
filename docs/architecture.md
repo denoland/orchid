@@ -6,8 +6,6 @@ A high-level map of what runs where and how the pieces talk.
 
 ## Components
 
-{{diagram:architecture}}
-
 Three processes you actually run:
 
 1. **The Cloudflare Worker** (`cf/`) — hosts the landing page, GitHub
@@ -67,6 +65,3 @@ files in the same dir get auto-imported once and renamed
 - **Agent ↔ relay** — one-time agent token issued at signup; can be
   rotated via Settings → Revoke.
 
-## State diagram for one issue
-
-{{diagram:issue}}

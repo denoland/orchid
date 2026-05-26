@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { marked } from 'marked'
-import { DIAGRAMS } from './DocsDiagrams'
 import { ILLUSTRATIONS } from './DocsIllustrations'
 import { MOCKUPS } from './DocsMockups'
 
@@ -111,12 +110,11 @@ export function Docs() {
       .then((r) => r.text())
       .then((md) => {
         if (cancelled) return
-        // Replace {{diagram:name}} / {{illust:name}} / {{mockup:name}}
-        // markers with placeholder divs the React effect mounts into.
+        // Replace {{illust:name}} / {{mockup:name}} markers with
+        // placeholder divs the React effect mounts components into.
         const transformed = md
-          .replace(/\{\{diagram:([a-z0-9-]+)\}\}/g, (_, n) => `<div data-diagram="${n}"></div>`)
-          .replace(/\{\{illust:([a-z0-9-]+)\}\}/g,  (_, n) => `<div data-illust="${n}"></div>`)
-          .replace(/\{\{mockup:([a-z0-9-]+)\}\}/g,  (_, n) => `<div data-mockup="${n}"></div>`)
+          .replace(/\{\{illust:([a-z0-9-]+)\}\}/g, (_, n) => `<div data-illust="${n}"></div>`)
+          .replace(/\{\{mockup:([a-z0-9-]+)\}\}/g, (_, n) => `<div data-mockup="${n}"></div>`)
         setBody(marked.parse(transformed) as string)
       })
     return () => { cancelled = true }
@@ -124,7 +122,7 @@ export function Docs() {
 
   // After marked renders, hunt for diagram placeholders and portal the
   // matching React component into each. New body resets the list.
-  type MountKind = 'd' | 'i' | 'm'
+  type MountKind = 'i' | 'm'
   const articleRef = useRef<HTMLElement | null>(null)
   const [mounts, setMounts] = useState<{ kind: MountKind; name: string; el: HTMLElement }[]>([])
   useEffect(() => {
@@ -136,9 +134,8 @@ export function Docs() {
         if (name && dict[name]) next.push({ kind, name, el })
       })
     }
-    collect('[data-diagram]', 'd', DIAGRAMS,      'diagram')
-    collect('[data-illust]',  'i', ILLUSTRATIONS, 'illust')
-    collect('[data-mockup]',  'm', MOCKUPS,       'mockup')
+    collect('[data-illust]', 'i', ILLUSTRATIONS, 'illust')
+    collect('[data-mockup]', 'm', MOCKUPS,       'mockup')
     setMounts(next)
   }, [body])
 
@@ -217,10 +214,7 @@ export function Docs() {
             <>
               <article ref={articleRef} className="docs-prose" dangerouslySetInnerHTML={{ __html: body }} />
               {mounts.map(({ kind, name, el }, i) => {
-                const C =
-                  kind === 'd' ? DIAGRAMS[name] :
-                  kind === 'i' ? ILLUSTRATIONS[name] :
-                                 MOCKUPS[name]
+                const C = kind === 'i' ? ILLUSTRATIONS[name] : MOCKUPS[name]
                 return createPortal(<C />, el, `${kind}-${name}-${i}`)
               })}
             </>

@@ -24,8 +24,6 @@ WebSocket per tab.
 
 ## Card states
 
-{{diagram:card-states}}
-
 | State | Meaning |
 |-------|---------|
 | **Spawning** | tmux session starting, claude booting. |

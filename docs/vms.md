@@ -8,8 +8,6 @@ block), and you can add as many remote VMs as you have capacity for.
 Orch drives all of them over plain SSH — no agent, no daemon, no
 inbound ports on the worker.
 
-{{diagram:vm-join}}
-
 ## When to add VMs
 
 - **Capacity.** One VM holds ~30 concurrent Claude sessions at the
