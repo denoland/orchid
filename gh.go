@@ -8,29 +8,34 @@ import (
 	"strings"
 )
 
-// ghIssueList returns open issues in repo. If label is non-empty, restricts
-// to that label; if empty, returns every open issue (used by tick to fetch
-// the full inbox in one call instead of one-call-per-target).
+func ghJSON[T any](args ...string) (T, error) {
+	var zero T
+	out, errStr, err := run("gh", args...)
+	if err != nil {
+		return zero, fmt.Errorf("gh %s: %v: %s", strings.Join(args[:2], " "), err, strings.TrimSpace(errStr))
+	}
+	var v T
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		return zero, err
+	}
+	return v, nil
+}
+
 func ghIssueList(repo, label string) ([]Issue, error) {
 	args := []string{"issue", "list", "--repo", repo, "--state", "open",
 		"--limit", "200", "--json", "number,title,body,state,labels"}
 	if label != "" {
 		args = append(args, "--label", label)
 	}
-	out, errStr, err := run("gh", args...)
-	if err != nil {
-		return nil, fmt.Errorf("gh issue list: %v: %s", err, errStr)
-	}
-	var raw []struct {
+	type rawIssue struct {
 		Number int    `json:"number"`
 		Title  string `json:"title"`
 		Body   string `json:"body"`
 		State  string `json:"state"`
-		Labels []struct {
-			Name string `json:"name"`
-		} `json:"labels"`
+		Labels []struct{ Name string } `json:"labels"`
 	}
-	if err := json.Unmarshal([]byte(out), &raw); err != nil {
+	raw, err := ghJSON[[]rawIssue](args...)
+	if err != nil {
 		return nil, err
 	}
 	issues := make([]Issue, 0, len(raw))
@@ -44,7 +49,6 @@ func ghIssueList(repo, label string) ([]Issue, error) {
 	return issues, nil
 }
 
-// hasLabel reports whether the issue carries `name` in its labels list.
 func (is Issue) hasLabel(name string) bool {
 	for _, l := range is.Labels {
 		if l == name {
@@ -60,18 +64,13 @@ type PRSummary struct {
 }
 
 func ghFindPRByBranch(repo, branch, author string) (*PRSummary, error) {
-	args := []string{"pr", "list",
-		"--repo", repo, "--head", branch, "--state", "all",
+	args := []string{"pr", "list", "--repo", repo, "--head", branch, "--state", "all",
 		"--limit", "5", "--json", "number,state"}
 	if author != "" {
 		args = append(args, "--author", author)
 	}
-	out, errStr, err := run("gh", args...)
+	prs, err := ghJSON[[]PRSummary](args...)
 	if err != nil {
-		return nil, fmt.Errorf("gh pr list: %v: %s", err, errStr)
-	}
-	var prs []PRSummary
-	if err := json.Unmarshal([]byte(out), &prs); err != nil {
 		return nil, err
 	}
 	if len(prs) == 0 {
@@ -85,9 +84,6 @@ func ghFindPRByBranch(repo, branch, author string) (*PRSummary, error) {
 	return &prs[0], nil
 }
 
-// ghBranchAhead returns true if branch exists on remote and has at least one
-// commit ahead of the base branch (main). Returns false (not error) if the
-// branch doesn't exist yet.
 func ghBranchAhead(repo, branch string) (bool, error) {
 	out, errStr, err := run("gh", "api",
 		fmt.Sprintf("repos/%s/compare/main...%s", repo, branch),
@@ -104,19 +100,13 @@ func ghBranchAhead(repo, branch string) (bool, error) {
 
 func ghAutoCreatePR(cfg *Config, n int, j *Job, is Issue) (int, error) {
 	ahead, err := ghBranchAhead(j.TargetRepo, j.Branch)
-	if err != nil {
+	if err != nil || !ahead {
 		return 0, err
-	}
-	if !ahead {
-		return 0, nil
 	}
 	body := fmt.Sprintf("Closes %s#%d", cfg.GitHub.InboxRepo, n)
 	out, errStr, err := run("gh", "pr", "create",
-		"--repo", j.TargetRepo,
-		"--head", j.Branch,
-		"--base", "main",
-		"--title", is.Title,
-		"--body", body)
+		"--repo", j.TargetRepo, "--head", j.Branch, "--base", "main",
+		"--title", is.Title, "--body", body)
 	if err != nil {
 		return 0, fmt.Errorf("gh pr create: %v: %s", err, errStr)
 	}
@@ -161,8 +151,8 @@ type PRView struct {
 		Body   string                 `json:"body"`
 	} `json:"comments"`
 	StatusCheckRollup []StatusCheck `json:"statusCheckRollup"`
-	Mergeable string `json:"mergeable"`
-	Commits []struct {
+	Mergeable         string        `json:"mergeable"`
+	Commits           []struct {
 		Oid     string `json:"oid"`
 		Authors []struct {
 			Login string `json:"login"`
@@ -171,14 +161,9 @@ type PRView struct {
 }
 
 func ghPRView(repo string, n int) (*PRView, error) {
-	out, errStr, err := run("gh", "pr", "view", fmt.Sprint(n),
-		"--repo", repo,
+	v, err := ghJSON[PRView]("pr", "view", fmt.Sprint(n), "--repo", repo,
 		"--json", "state,headRefOid,reviews,comments,statusCheckRollup,mergeable,commits")
 	if err != nil {
-		return nil, fmt.Errorf("gh pr view: %v: %s", err, errStr)
-	}
-	var v PRView
-	if err := json.Unmarshal([]byte(out), &v); err != nil {
 		return nil, err
 	}
 	return &v, nil
