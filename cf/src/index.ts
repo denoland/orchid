@@ -278,6 +278,20 @@ app.get('/logout', (c) => {
 
 app.get('/healthz', (c) => c.text('ok'))
 
+// /docs[/<slug>] on the apex serves the SPA shell so the React Docs
+// route can mount and render bundled markdown. Raw .md files under
+// /docs/*.md still hit ASSETS directly via the catch-all below.
+app.get('/docs', (c) => {
+  const u = new URL(c.req.url); u.pathname = '/index.html'
+  return c.env.ASSETS.fetch(new Request(u, c.req.raw))
+})
+app.get('/docs/:slug', async (c) => {
+  const u = new URL(c.req.url)
+  if (u.pathname.endsWith('.md')) return c.env.ASSETS.fetch(c.req.raw)
+  u.pathname = '/index.html'
+  return c.env.ASSETS.fetch(new Request(u, c.req.raw))
+})
+
 app.all('*', (c) => c.env.ASSETS.fetch(c.req.raw))
 
 export default app
