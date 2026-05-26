@@ -2,8 +2,6 @@
 
 {{illust:lock-vine}}
 
-{{diagram:security}}
-
 Orchid runs `claude --dangerously-skip-permissions` inside tmux. The
 flag exists for a reason: by default Claude prompts before every
 shell command, file edit, network call. Disabling the prompt is what
