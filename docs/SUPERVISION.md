@@ -2,7 +2,7 @@
 
 Orchid does not ship a built-in supervisor. Instead, run a general-purpose
 self-hosted agent (OpenClaw or Hermes) alongside it. The agent gets
-`CLAUDE.md` as its skill file and talks to GitHub + the orchid host on your
+`SKILL.md` as its skill file and talks to GitHub + the orchid host on your
 behalf. You chat with the agent over Telegram, Slack, Discord, etc., and it
 tells you what the swarm is doing — or kicks it back to life when needed.
 
@@ -15,7 +15,7 @@ can run shell commands can manage orchid.
 
 Give it:
 
-1. **The skill file.** `CLAUDE.md` at the repo root is the operator
+1. **The skill file.** `SKILL.md` at the repo root is the operator
    handbook. It lists the VM address, binary paths, log location, dashboard
    URL, restart command, and how to file issues.
 2. **SSH access to the orch host.** A non-root account with `tmux` and
@@ -39,7 +39,7 @@ npm install -g @openclaw/cli   # or use the curl|sh from openclaw.ai
 
 # 2. drop the orchid skill into the workspace
 mkdir -p ~/.openclaw/workspace/skills/orchid
-cp /path/to/orchid/CLAUDE.md ~/.openclaw/workspace/skills/orchid/SKILL.md
+cp /path/to/orchid/SKILL.md ~/.openclaw/workspace/skills/orchid/SKILL.md
 
 # 3. configure messaging adapter (Telegram shown here)
 openclaw gateway setup
@@ -77,7 +77,7 @@ pipx install hermes-agent
 
 # 2. skill file
 mkdir -p ~/.hermes/skills/orchid
-cp /path/to/orchid/CLAUDE.md ~/.hermes/skills/orchid/SKILL.md
+cp /path/to/orchid/SKILL.md ~/.hermes/skills/orchid/SKILL.md
 
 # 3. env vars (~/.hermes/.env)
 cat > ~/.hermes/.env <<'EOF'
