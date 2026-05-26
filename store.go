@@ -12,29 +12,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Store is the sqlite-backed persistence layer for every piece of orchid
-// state that survives across process restarts:
-//
-//   - Job records (per inbox issue): the only piece of state that lives
-//     entirely on disk between ticks.
-//   - mention_cursor / maintainers: cached state used by the mention
-//     watcher so we don't rescan from epoch on every boot.
-//   - dashboard snap blob (the opaque "card layout" the canvas posts
-//     to /api/snap) plus the previous good copy as snap.bak.
-//
-// One DB file replaces the old state.json + snap.json + snap.json.bak
-// fan-out. WAL + busy_timeout keeps reads non-blocking while a writer
-// holds the write lock; the orchestrator only ever has one writer goroutine
-// at a time (callers must hold State.mu before calling Save), so the
-// store's own mutex is just belt-and-suspenders against direct misuse.
 type Store struct {
 	mu sync.Mutex
 	db *sql.DB
 }
 
 func openStore(path string) (*Store, error) {
-	// Open with WAL for non-blocking reads and a generous busy timeout
-	// so the SPA polling the dashboard never races a tick-time Save.
 	dsn := fmt.Sprintf(
 		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)",
 		path,
@@ -47,9 +30,6 @@ func openStore(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	// The schema is two tables: one row per tracked job, and a small
-	// key/value table for everything else (mention cursor, maintainer
-	// cache, dashboard snap blob + its backup).
 	if _, err := db.Exec(`
 CREATE TABLE IF NOT EXISTS jobs (
   issue INTEGER PRIMARY KEY,
@@ -75,9 +55,6 @@ CREATE INDEX IF NOT EXISTS usage_daily_date ON usage_daily(date);`); err != nil 
 			_ = db.Close()
 			return nil, err
 		}
-		// Best-effort migration for installs created before the issue
-		// column existed. ALTER TABLE ADD COLUMN is idempotent in the
-		// "already exists" sense — we swallow the error.
 		_, _ = db.Exec(`ALTER TABLE usage_daily ADD COLUMN issue INTEGER NOT NULL DEFAULT 0`)
 		return &Store{db: db}, nil
 	}
@@ -89,10 +66,6 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// LoadState reads every persisted job + mention cursor + maintainer cache
-// in a single read transaction so a partially-applied Save can't show
-// torn state. Returns a zero-valued result (empty Jobs map, nil cursor,
-// nil maintainers) for a fresh DB.
 func (s *Store) LoadState() (jobs map[int]*Job, cursor *time.Time, maint *MaintainerCache, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -154,12 +127,6 @@ func (s *Store) getKV(key string) ([]byte, bool, error) {
 	return v, true, nil
 }
 
-// SaveState replaces the persisted job set + cursor + maintainer cache
-// atomically. The old json file just wrote the entire state on every
-// modification; the sqlite port preserves that simple semantics because
-// the persisted set is always tiny (~30 jobs cap).
-//
-// Caller must hold State.mu.
 func (s *Store) SaveState(jobs map[int]*Job, cursor *time.Time, maint *MaintainerCache) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -222,13 +189,6 @@ func upsertKVTx(tx *sql.Tx, key string, value []byte) error {
 	return err
 }
 
-// GetSnap returns the opaque dashboard layout blob (whatever the canvas
-// last PUT to /api/snap), or nil if no snap has been saved yet.
-// BackfillUsageIssue maps every existing usage_daily row whose issue
-// column is still 0 (rows scanned before the column existed, or
-// scanned from a path that didn't carry an issue number) to whatever
-// (session_id → issue) pairs the caller hands us. Idempotent — only
-// touches rows that don't already have a non-zero issue.
 func (s *Store) BackfillUsageIssue(sessionToIssue map[string]int) (int, error) {
 	if len(sessionToIssue) == 0 {
 		return 0, nil
@@ -261,11 +221,6 @@ func (s *Store) BackfillUsageIssue(sessionToIssue map[string]int) (int, error) {
 	return updated, nil
 }
 
-// GetKV reads an arbitrary kv row. Returns (nil, nil) when the key is
-// absent — callers that need to distinguish should check len(value).
-// Public counterpart to getKV for use by other watchers (assignment
-// poller, future mention extensions, …) that want a free-form
-// per-orch persistence slot without inventing a new table.
 func (s *Store) GetKV(key string) ([]byte, error) {
 	b, _, err := s.getKV(key)
 	return b, err
@@ -288,10 +243,6 @@ func (s *Store) PutKV(key string, value []byte) error {
 	return tx.Commit()
 }
 
-// UpsertUsageDaily writes one row per (date, session_id, model). The
-// scanner replays jsonl files idempotently — same input always yields
-// the same total — so ON CONFLICT REPLACE is safe and lets us re-scan
-// without dedupe bookkeeping.
 func (s *Store) UpsertUsageDaily(date, sessionID, model string, issue int, inputT, cacheCreate, cacheRead, outputT int64, costUSD float64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -321,10 +272,6 @@ type UsageDailyRow struct {
 	CostUSD       float64 `json:"cost_usd"`
 }
 
-// LoadUsageHistory returns all rows on or after `sinceDate` (YYYY-MM-DD
-// UTC). Caller aggregates client-side; rows stay normalised so the
-// dashboard can render per-day totals, per-model splits, and
-// per-session drill-ins from the same payload.
 func (s *Store) LoadUsageHistory(sinceDate string) ([]UsageDailyRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -355,10 +302,6 @@ func (s *Store) GetSnap() ([]byte, error) {
 	return v, nil
 }
 
-// PutSnap replaces the dashboard layout blob and rotates the previous
-// value into snap.bak so a buggy client clobbering positions doesn't
-// destroy the last known-good layout. Mirrors the on-disk snap.json /
-// snap.json.bak pattern the old code used.
 func (s *Store) PutSnap(body []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -382,18 +325,10 @@ func (s *Store) PutSnap(body []byte) error {
 	return tx.Commit()
 }
 
-// migrateLegacyJSON imports the pre-sqlite state.json file (and any
-// snap.json / snap.json.bak siblings) into this store if its rows are
-// empty and the legacy files exist. The legacy files are renamed with
-// a .migrated suffix so we never re-import them on subsequent boots.
-//
-// Skips silently when there's nothing to do — a fresh deploy without
-// any prior state is the common case.
 func (s *Store) migrateLegacyJSON(statePath, snapPath string) error {
 	if !s.isEmpty() {
 		return nil
 	}
-	// state.json — top-level shape was the old State struct's json form.
 	if b, err := os.ReadFile(statePath); err == nil {
 		var legacy struct {
 			Jobs          map[int]*Job     `json:"jobs"`
@@ -413,7 +348,6 @@ func (s *Store) migrateLegacyJSON(statePath, snapPath string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	// snap.json — opaque blob; pass through verbatim.
 	if b, err := os.ReadFile(snapPath); err == nil {
 		s.mu.Lock()
 		_, _ = s.db.Exec("INSERT INTO kv(key,value) VALUES('snap',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", b)

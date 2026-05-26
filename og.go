@@ -11,12 +11,6 @@ import (
 	"time"
 )
 
-// SSRF guard + OpenGraph metadata parser for the /api/og endpoint.
-// Two layers of defence:
-//   1. isPrivateHost rejects obviously-internal destinations at URL-parse time.
-//   2. safeSSRFTransport re-resolves at dial time and refuses any private IP
-//      that came back, closing the DNS-rebinding TOCTOU window.
-
 // isPrivateIP reports whether ip is one we never want to dial out to. Covers
 // loopback, RFC1918, link-local, multicast, unspecified, IPv4-broadcast, plus
 // 100.64/10 (carrier-grade NAT) and the 169.254 metadata range.
@@ -66,10 +60,6 @@ func isPrivateHost(host string) bool {
 
 var errBlockedDestination = errors.New("destination blocked: private/loopback IP")
 
-// safeSSRFTransport returns an http.Transport whose dial resolves the host
-// itself and rejects private IPs at connect time, closing the lookup-then-dial
-// TOCTOU that isPrivateHost can't (DNS rebinding). Re-enters on every redirect
-// so the guard is enforced across the whole chain.
 func safeSSRFTransport() *http.Transport {
 	d := &net.Dialer{Timeout: 5 * time.Second}
 	return &http.Transport{

@@ -11,49 +11,20 @@ import (
 	"time"
 )
 
-// Mention + assignment watchers. Polls every configured target repo for
-// @-mentions of any configured bot login and for issues newly assigned
-// to one. Dispatches:
-//   - mention on a tracked PR: poke that worker session
-//   - mention by an org member: open an inbox issue (with an LLM-summarised
-//     action title) and 👀-react on the source
-//   - mention by an external user: canned reply on the source comment
-//   - assignment to one of our bots: open an inbox issue routed to the
-//     matching target label
-//
-// Both pollers run from the same outer ticker in main; mentions need an
-// explicit `mentions {}` config block, assignments only need a bot_login.
-
 type Mention struct {
-	Repo       string    // owner/repo where the mention lives
-	IsPR       bool      // true if the host is a PR, false for an issue
-	Number     int       // issue or PR number on Repo
-	HostURL    string    // canonical URL of the host issue/PR
-	HostAuthor string    // login that opened the host issue/PR (used to detect bot-self mentions)
-	CommentID  string    // unique GitHub node id of the comment carrying the mention
-	CommentURL string    // direct link to that specific comment
-	Author     string    // login that wrote the comment
-	Body       string    // raw comment body
-	CreatedAt  time.Time // comment creation time (used to advance the cursor)
-	Bot        string    // which configured bot was mentioned
+	Repo       string
+	IsPR       bool
+	Number     int
+	HostURL    string
+	HostAuthor string
+	CommentID  string
+	CommentURL string
+	Author     string
+	Body       string
+	CreatedAt  time.Time
+	Bot        string
 }
 
-// isBotLogin returns true if the given GitHub login looks like a bot.
-// Heuristic order:
-//
-//  1. Any login configured as one of orchid's own bots (orch + per-VM
-//     bot_login fields) is always a bot.
-//  2. mentions.human_overrides force-classify a login as human even if
-//     the heuristic below would mark it otherwise.
-//  3. Otherwise, treat as bot if the login contains "bot"
-//     (case-insensitive). Catches `crowlbot`, `denobot`, `nathanwhitbot`,
-//     `avocet-bot`, etc. — including org-member bots that
-//     `orgs/<org>/members` returns alongside humans.
-//
-// Caller is responsible for the consequences: dispatch skips both
-// comment authors and host (issue/PR) authors classified as bots, so a
-// false-positive here means a real human's mention gets ignored. Use
-// human_overrides for any human whose login happens to contain "bot".
 func isBotLogin(cfg *Config, login string) bool {
 	for _, b := range botLogins(cfg) {
 		if login == b {
@@ -90,10 +61,6 @@ func botLogins(cfg *Config) []string {
 	return out
 }
 
-// fetchMaintainers pulls the full membership list of the configured org.
-// Hard-fails (returns error) if the orch token lacks read:org or isn't in
-// the org — there's no quiet fallback because misclassifying members as
-// external would silently downgrade their requests to canned replies.
 func fetchMaintainers(org string) ([]string, error) {
 	out, errStr, err := run("gh", "api", "--paginate",
 		fmt.Sprintf("orgs/%s/members", org),
@@ -110,12 +77,6 @@ func fetchMaintainers(org string) ([]string, error) {
 	return members, nil
 }
 
-// refreshMaintainers replaces the cache if it's missing or older than ttl.
-// The fetched member list is filtered through isBotLogin — bots that
-// happen to be org members would otherwise be classified as
-// "maintainers" and route their automated mentions to inbox-issue
-// creation, causing bot-on-bot dispatch loops.
-// Caller must hold st.mu.
 func refreshMaintainers(cfg *Config, st *State, ttl time.Duration) error {
 	if st.Maintainers != nil && time.Since(st.Maintainers.FetchedAt) < ttl {
 		return nil
@@ -137,10 +98,6 @@ func refreshMaintainers(cfg *Config, st *State, ttl time.Duration) error {
 	return nil
 }
 
-// searchMentions returns mentions of `bot` in `repo` (issues + PRs) where
-// the comment was created strictly after `since`. Two-stage: search the
-// issue/PR set first, then fetch comments per item to find the specific
-// commenting events.
 func searchMentions(repo, bot string, since time.Time) ([]Mention, error) {
 	type item struct {
 		Number int                    `json:"number"`
@@ -221,23 +178,7 @@ func searchMentions(repo, bot string, since time.Time) ([]Mention, error) {
 	return mentions, nil
 }
 
-// inferMentionAction asks an LLM (run on the orch host) to either (a)
-// summarize what action the comment is requesting, in ≤15 words, or
-// (b) return the literal "NOOP" if the comment is purely informational
-// (status update, FYI, automated bot chatter, etc.). Defaults to
-// `claude -p`; configurable via mentions.llm_command (e.g. ["codex","exec"]
-// to keep claude budget for workers).
-//
-// Returns the summary if the comment is actionable, or "" if NOOP /
-// the model call failed. Caller treats "" as "skip dispatch" — better
-// to silently ignore an ambiguous mention than to spam the inbox with
-// no-op tracking issues.
 func inferMentionAction(cfg *Config, m Mention) string {
-	// Cheap pre-filter for obviously-NOOP comments: short acks like "thanks",
-	// "lgtm", emoji-only, +1, etc. Skips the ~5s LLM call entirely for the
-	// common-case noise. We only match SHORT bodies so a long "thanks for
-	// fixing X, the symptom was Y" still falls through to the LLM which can
-	// pick out an embedded request.
 	if isShortNoop(m.Body) {
 		return ""
 	}
@@ -300,15 +241,9 @@ func targetLabelFor(cfg *Config, repo string) string {
 // dispatchMention is the policy split: classify the mention into one of
 // three buckets and act on it. Caller must hold st.mu.
 func dispatchMention(cfg *Config, st *State, m Mention) {
-	// Bot filters first — drop anything bot-authored.
 	if isBotLogin(cfg, m.Author) {
 		return
 	}
-	// Host-author bot filter: skip if the issue/PR was opened by a
-	// THIRD-PARTY bot (e.g. dependabot, crowlbot). PRs opened by OUR
-	// own bots are exempt — a human pinging us on one of our own PRs
-	// is exactly the case we want to handle (tracked-PR poke, or
-	// maintainer-routed inbox issue if the PR is no longer tracked).
 	if isBotLogin(cfg, m.HostAuthor) {
 		ourBot := false
 		for _, b := range botLogins(cfg) {
@@ -322,9 +257,6 @@ func dispatchMention(cfg *Config, st *State, m Mention) {
 		}
 	}
 
-	// Mention on a PR orch already tracks → poke that worker session.
-	// Skip the LLM gate here; the worker decides whether the comment is
-	// actionable as part of its existing review-handling.
 	if m.IsPR {
 		for n, j := range st.Jobs {
 			if j.PR != m.Number || j.TargetRepo != m.Repo {
@@ -344,16 +276,12 @@ func dispatchMention(cfg *Config, st *State, m Mention) {
 		}
 	}
 
-	// LLM gate: only continue if the comment is actually requesting work.
-	// Returns "" for NOOP (informational, status, FYI) — silently skip.
 	summary := inferMentionAction(cfg, m)
 	if summary == "" {
 		log.Printf("mentions: skipping non-actionable mention from @%s in %s#%d", m.Author, m.Repo, m.Number)
 		return
 	}
 
-	// Maintainer (org-member, post-bot-filter) → open inbox issue with the
-	// LLM-summarized action as the title.
 	if st.Maintainers.has(m.Author) {
 		label := targetLabelFor(cfg, m.Repo)
 		if label == "" {
@@ -376,11 +304,6 @@ func dispatchMention(cfg *Config, st *State, m Mention) {
 			newNum, _ := strconv.Atoi(parts[len(parts)-1])
 			log.Printf("mentions: opened inbox issue #%d for maintainer @%s mention in %s#%d",
 				newNum, m.Author, m.Repo, m.Number)
-			// Append explicit close instructions now that we know the new
-			// issue number. Mention-routed inbox issues are review/response
-			// tasks — there is no PR to ship, so nothing closes the inbox
-			// issue automatically and the worker session would otherwise
-			// linger forever waiting for follow-up that never comes.
 			closeInstr := fmt.Sprintf(
 				"\n\n---\n\n## When done\n\nThis is a review/response task — there is no PR to ship from this issue. After you've posted your response on the source comment/PR, close this inbox issue and exit:\n\n```sh\ngh issue close --repo %s %d --comment \"done\"\n```\n",
 				cfg.GitHub.InboxRepo, newNum)
@@ -390,11 +313,6 @@ func dispatchMention(cfg *Config, st *State, m Mention) {
 				log.Printf("mentions: append close instructions to inbox #%d failed: %v: %s", newNum, err, strings.TrimSpace(errStr))
 			}
 			if cfg.Orch.Mentions.Acknowledge {
-				// React to the mentioning comment with 👀 instead of posting
-				// a "Tracking in inbox#N" reply — GitHub already auto-creates
-				// a "mentioned in" backlink on the source comment when we
-				// reference its URL in the new inbox issue body, so the
-				// comment is needless noise. The reaction is a quieter ack.
 				_, _, err := run("gh", "api", "graphql", "-f",
 					fmt.Sprintf("query=mutation { addReaction(input: {subjectId: %q, content: EYES}) { reaction { content } } }", m.CommentID))
 				if err != nil {
@@ -405,7 +323,6 @@ func dispatchMention(cfg *Config, st *State, m Mention) {
 		}
 	}
 
-	// External user → canned reply on source.
 	reply := fmt.Sprintf("Hi @%s — I'm an automated bot. @bartlomieju has been notified and will follow up.", m.Author)
 	kind := "issue"
 	if m.IsPR {
@@ -432,10 +349,6 @@ type assignedIssue struct {
 	UpdatedAt time.Time
 }
 
-// searchAssignments returns open issues in `repo` currently assigned to
-// `bot`. Same gh search surface mentions uses, just filtered on
-// `assignee:` instead of comment-mention. Caller dedupes via node id
-// so a re-poll never re-creates the inbox issue.
 func searchAssignments(repo, bot string) ([]assignedIssue, error) {
 	out, errStr, err := run("gh", "api",
 		"-H", "Accept: application/vnd.github+json",
@@ -475,18 +388,10 @@ func searchAssignments(repo, bot string) ([]assignedIssue, error) {
 	return res, nil
 }
 
-// assignmentTick scans every target repo for issues newly assigned to
-// one of orchid's bots and opens a corresponding inbox issue so the
-// swarm picks them up. Dedupes against a seen-node-id set stored in
-// the kv table — a re-poll, a restart, or an unassign+reassign never
-// double-files. Same cadence as the mention poller; both run from the
-// same outer loop in main.
 func assignmentTick(cfg *Config, st *State) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	// Load the persisted seen-set. Cap to ~5000 entries so a long-lived
-	// orch doesn't bloat the kv row indefinitely.
 	seen := map[string]bool{}
 	if b, err := st.store.GetKV("assignments_seen"); err == nil && len(b) > 0 {
 		var ids []string
@@ -545,9 +450,6 @@ func assignmentTick(cfg *Config, st *State) {
 		for id := range seen {
 			ids = append(ids, id)
 		}
-		// Trim oldest if we ever grow beyond the cap — simple slice cut,
-		// no need for an ordered structure for what's effectively a
-		// bloom filter at this scale.
 		if len(ids) > 5000 {
 			ids = ids[len(ids)-5000:]
 		}
@@ -572,11 +474,6 @@ func mentionTick(cfg *Config, st *State) {
 		return
 	}
 
-	// Cursor: floor at orch boot time. On a fresh process (cursor nil)
-	// we start at boot time; on a restart with a cursor that predates
-	// boot (long downtime, stale state) we still floor at boot. This
-	// is the deliberate trade: missing pre-boot mentions is acceptable
-	// — silently re-dispatching them on every restart is not.
 	since := orchBootTime
 	if st.MentionCursor != nil && st.MentionCursor.After(orchBootTime) {
 		since = *st.MentionCursor
@@ -586,9 +483,6 @@ func mentionTick(cfg *Config, st *State) {
 	seen := map[string]bool{}
 	maxSeen := since
 	for _, t := range cfg.Targets {
-		// Skip the inbox repo itself — mentions there are noise
-		// (operator chatter on tracking issues we ourselves created),
-		// and the search counts against the same rate limit.
 		if t.Repo == cfg.GitHub.InboxRepo {
 			continue
 		}
@@ -600,7 +494,7 @@ func mentionTick(cfg *Config, st *State) {
 			}
 			for _, m := range ms {
 				if seen[m.CommentID] {
-					continue // same comment found via multiple bot searches
+					continue
 				}
 				seen[m.CommentID] = true
 				dispatchMention(cfg, st, m)
