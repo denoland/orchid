@@ -1,6 +1,4 @@
-# Dashboard
-
-{{illust:spray}}
+# {{illust:spray}} Dashboard
 
 {{mockup:dashboard}}
 

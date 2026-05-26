@@ -1,6 +1,4 @@
-# Configuration
-
-{{illust:config-knot}}
+# {{illust:config-knot}} Configuration
 
 {{mockup:config}}
 

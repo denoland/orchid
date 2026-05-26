@@ -1,6 +1,4 @@
-# Capture
-
-{{illust:hand-bud}}
+# {{illust:hand-bud}} Capture
 
 {{mockup:capture}}
 

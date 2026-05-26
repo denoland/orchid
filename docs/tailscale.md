@@ -1,6 +1,4 @@
-# Tailscale
-
-{{illust:vine-mesh}}
+# {{illust:vine-mesh}} Tailscale
 
 The relay (`orchid.littledivy.com`) is one way to reach your
 dashboard without a public IP. **Tailscale** is the other: spin up

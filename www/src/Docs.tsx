@@ -113,7 +113,7 @@ export function Docs() {
         // Replace {{illust:name}} / {{mockup:name}} markers with
         // placeholder divs the React effect mounts components into.
         const transformed = md
-          .replace(/\{\{illust:([a-z0-9-]+)\}\}/g, (_, n) => `<div data-illust="${n}"></div>`)
+          .replace(/\{\{illust:([a-z0-9-]+)\}\}/g, (_, n) => `<span data-illust="${n}"></span>`)
           .replace(/\{\{mockup:([a-z0-9-]+)\}\}/g, (_, n) => `<div data-mockup="${n}"></div>`)
         setBody(marked.parse(transformed) as string)
       })

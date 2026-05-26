@@ -1176,9 +1176,7 @@ function Header({
           )}
           <div className="flex-1" />
           <HeaderBtnBar>
-            <CaptureButton onClick={onOpenCapture} />
             <ViewToggle view={view} setView={setView} />
-            <DocsButton />
             <SettingsButton onClick={onOpenSettings} />
             <ThemeToggle />
             <LogoutButton />

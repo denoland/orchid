@@ -1,6 +1,4 @@
-# Targets
-
-{{illust:fork-blooms}}
+# {{illust:fork-blooms}} Targets
 
 {{mockup:targets}}
 

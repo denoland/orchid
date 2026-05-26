@@ -4,6 +4,7 @@
 // data fetched, just an honest still-life of the dashboard region.
 
 import './DocsMockups.css'
+import { LockIcon, ClaudeMark, IssueOpenIcon } from './DocsIcons'
 
 function Frame({ url, children }: { url: string; children: React.ReactNode }) {
   return (
@@ -13,7 +14,7 @@ function Frame({ url, children }: { url: string; children: React.ReactNode }) {
         <span className="docs-dot a" />
         <span className="docs-dot g" />
         <span className="docs-addr">
-          <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a3 3 0 0 0-3 3v3H4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-5a2 2 0 0 0-2-2h-1V4a3 3 0 0 0-3-3zm2 6V4a2 2 0 1 0-4 0v3z"/></svg>
+          <LockIcon />
           {url}
         </span>
       </div>
@@ -22,8 +23,17 @@ function Frame({ url, children }: { url: string; children: React.ReactNode }) {
   )
 }
 
-// ─── dashboard list view ────────────────────────────────────────────
+// ─── dashboard: list view (back) + canvas with cards+notes (front) ─
 export function DashboardMockup() {
+  return (
+    <div className="dm-twin">
+      <DashboardListFrame />
+      <DashboardCanvasFrame />
+    </div>
+  )
+}
+
+function DashboardListFrame() {
   return (
     <Frame url="divy.orchid.littledivy.com">
       <div className="dm-head">
@@ -67,6 +77,45 @@ export function DashboardMockup() {
         <div>
           <div className="dm-title">Wire end-to-end capture pipeline</div>
           <div className="dm-meta">clawpatrol · #178 · PR #178</div>
+        </div>
+      </div>
+    </Frame>
+  )
+}
+
+function DashboardCanvasFrame() {
+  return (
+    <Frame url="divy.orchid.littledivy.com">
+      <div className="dm-canvas-head">
+        <span className="dm-canvas-brand">Orchid <em>3</em></span>
+        <span className="dm-canvas-tools">
+          <span className="dm-canvas-pill">+</span>
+          <span className="dm-canvas-pill">≡</span>
+          <span className="dm-canvas-pill">⚙</span>
+        </span>
+      </div>
+      <div className="dm-canvas-grid">
+        <div className="dm-rf-card pos-a working">
+          <div className="dm-rf-top"><ClaudeMark /><span className="dm-rf-repo">clawpatrol</span></div>
+          <div className="dm-rf-title">tray icon flickers when state changes</div>
+          <div className="dm-rf-bar"><div className="dm-rf-bar-fill" /></div>
+        </div>
+        <div className="dm-rf-card pos-b">
+          <div className="dm-rf-top"><ClaudeMark /><span className="dm-rf-repo">deno</span></div>
+          <div className="dm-rf-title">add Node lazy-init for child_process</div>
+          <div className="dm-rf-bar"><div className="dm-rf-bar-fill" /></div>
+        </div>
+        <div className="dm-rf-card pos-c needs">
+          <div className="dm-rf-top"><ClaudeMark /><span className="dm-rf-repo">orchid</span></div>
+          <div className="dm-rf-title">avoid remote-control race during worker bootstrap</div>
+        </div>
+        <div className="dm-note pos-note-a">
+          ship before<br/>
+          Friday demo
+        </div>
+        <div className="dm-note pos-note-b">
+          revisit tmux<br/>
+          paste race?
         </div>
       </div>
     </Frame>
@@ -168,32 +217,94 @@ export function InstallMockup() {
   )
 }
 
-// ─── targets: an inbox issue card with labels routing to repos ──────
+// ─── targets: github issues + orchid canvas, side by side ───────────
 export function TargetsMockup() {
   return (
-    <Frame url="github.com/denoland/orchid/issues">
-      <div className="dm-issue">
-        <div className="dm-issue-head">
-          <span className="dm-issue-state">● Open</span>
-          <span className="dm-issue-title">fix: panic on empty input</span>
+    <div className="dm-twin">
+      <Frame url="github.com/denoland/orchid/issues">
+        <div className="gh-mock">
+          <div className="gh-tabs">
+            <span className="gh-tab active">
+              <IssueOpenIcon />
+              Issues <em>34</em>
+            </span>
+            <span className="gh-tab">Pull requests <em>7</em></span>
+          </div>
+          <div className="gh-row">
+            <span className="gh-state">○</span>
+            <div className="gh-grow">
+              <div className="gh-title">fix: tray icon flickers when state changes</div>
+              <div className="gh-meta">#184 opened 2h ago by <strong>littledivy</strong></div>
+            </div>
+            <span className="dm-lbl clawpatrol">clawpatrol</span>
+          </div>
+          <div className="gh-row">
+            <span className="gh-state">○</span>
+            <div className="gh-grow">
+              <div className="gh-title">add Node lazy-init for child_process</div>
+              <div className="gh-meta">#160 opened 1d ago by <strong>littledivy</strong></div>
+            </div>
+            <span className="dm-lbl bug">deno</span>
+          </div>
+          <div className="gh-row">
+            <span className="gh-state">○</span>
+            <div className="gh-grow">
+              <div className="gh-title">avoid remote-control race during worker bootstrap</div>
+              <div className="gh-meta">#159 opened 1d ago by <strong>littledivy</strong></div>
+            </div>
+            <span className="dm-lbl orchid">orchid</span>
+          </div>
         </div>
-        <div className="dm-issue-labels">
-          <span className="dm-lbl clawpatrol">clawpatrol</span>
-          <span className="dm-lbl bug">bug</span>
+      </Frame>
+
+      <Frame url="divy.orchid.littledivy.com">
+        <div className="dm-canvas-head">
+          <span className="dm-canvas-brand">Orchid <em>3</em></span>
+          <span className="dm-canvas-tools">
+            <span className="dm-canvas-pill">+</span>
+            <span className="dm-canvas-pill">≡</span>
+            <span className="dm-canvas-pill">⚙</span>
+          </span>
         </div>
-        <div className="dm-issue-body">
-          Reproduces on macOS 15.2. See attached pane capture…
+        <div className="dm-canvas-grid">
+          <div className="dm-rf-card pos-a working">
+            <div className="dm-rf-top">
+              <ClaudeMark />
+              <span className="dm-rf-repo">clawpatrol</span>
+            </div>
+            <div className="dm-rf-title">tray icon flickers when state changes</div>
+          </div>
+          <div className="dm-rf-card pos-b">
+            <div className="dm-rf-top">
+              <ClaudeMark />
+              <span className="dm-rf-repo">deno</span>
+            </div>
+            <div className="dm-rf-title">add Node lazy-init for child_process</div>
+          </div>
+          <div className="dm-rf-pane pos-pane">
+            <div className="dm-rf-pane-bar">
+              <span className="docs-dot r" /><span className="docs-dot a" /><span className="docs-dot g" />
+              <span className="dm-rf-pane-title">claude-3 · orchid</span>
+            </div>
+            <div className="dm-rf-pane-body">
+              <span className="t-prompt">&gt;</span> <span className="t-dim">running cargo test</span><br/>
+              <span className="t-ok">  ✓ 1842 passed</span><br/>
+              <span className="t-prompt">&gt;</span> <span className="cursor-blink">▌</span>
+            </div>
+          </div>
         </div>
-      </div>
-      <div className="dm-routing">
-        <div className="dm-arrow">↳ routes to <code>denoland/clawpatrol</code> via <code>target "clawpatrol"</code></div>
-      </div>
-    </Frame>
+      </Frame>
+    </div>
   )
 }
 
 // ─── swarm.hcl snippet ──────────────────────────────────────────────
 export function ConfigMockup() {
+  const K = (s: string) => <span className="hcl-k">{s}</span>   // block keyword
+  const L = (s: string) => <span className="hcl-l">{s}</span>   // block label
+  const A = (s: string) => <span className="hcl-a">{s}</span>   // attribute
+  const S = (s: string) => <span className="hcl-s">"{s}"</span> // string
+  const N = (s: string) => <span className="hcl-n">{s}</span>   // number
   return (
     <div className="docs-term">
       <div className="docs-term-bar">
@@ -203,26 +314,15 @@ export function ConfigMockup() {
         <span className="docs-term-title">~/.orch/swarm.hcl</span>
       </div>
       <pre className="docs-term-body hcl">
-{`github {
-  inbox_repo = "denoland/orchid"
-}
-
-orchestrator {
-  poll_interval = "30s"
-  branch_prefix = "orch/issue-"
-  bot_login     = "divybot"
-  ntfy_topic    = "orchid-divy-7f3k9"
-}
-
-target "clawpatrol" {
-  label = "clawpatrol"
-  repo  = "denoland/clawpatrol"
-}
-
-vm "fra1" {
-  host     = "orchid@worker.fra1.example.com"
-  capacity = 10
-}`}
+{K('github')} {'{\n  '}{A('inbox_repo')} = {S('denoland/orchid')}{'\n}\n\n'}
+{K('orchestrator')} {'{\n  '}{A('poll_interval')} = {S('30s')}{'\n  '}
+{A('branch_prefix')} = {S('orch/issue-')}{'\n  '}
+{A('bot_login')}     = {S('divybot')}{'\n  '}
+{A('ntfy_topic')}    = {S('orchid-divy-7f3k9')}{'\n}\n\n'}
+{K('target')} {L('"clawpatrol"')} {'{\n  '}{A('label')} = {S('clawpatrol')}{'\n  '}
+{A('repo')}  = {S('denoland/clawpatrol')}{'\n}\n\n'}
+{K('vm')} {L('"fra1"')} {'{\n  '}{A('host')}     = {S('orchid@worker.fra1.example.com')}{'\n  '}
+{A('capacity')} = {N('10')}{'\n}'}
       </pre>
     </div>
   )
