@@ -30,7 +30,7 @@ import { Composer } from './Composer'
 import {
   NoteNode, LinkNode, TextNode, StrokeNode,
   PenLayer, CollabLayer, useCollabSocket,
-  detectVariant, fetchGitHubSnippet, fetchOG,
+  detectVariant, fetchGitHubSnippet,
   type Stroke, type UserNode,
   type NoteData, type TextData, type LinkData, type StrokeData, type LinkVariant,
   NOTE_W, NOTE_H, LINK_W, LINK_H,
@@ -510,13 +510,6 @@ function DashboardInner({ state, relay }: Props) {
     if (variant === 'github-code' && !u.data.snippet) {
       const snippet = await fetchGitHubSnippet(url)
       if (snippet) updates.snippet = snippet
-    }
-    if (variant !== 'youtube' && !u.data.image) {
-      const og = await fetchOG(url)
-      if (og.image) updates.image = og.image
-      if (og.title && !u.data.title) updates.title = og.title
-      if (og.description) updates.description = og.description
-      if (og.site) updates.site = og.site
     }
     if (Object.keys(updates).length === 0) return
     Object.assign(u.data, updates)

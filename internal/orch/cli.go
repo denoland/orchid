@@ -1,4 +1,4 @@
-package main
+package orch
 
 import (
 	"bytes"
@@ -540,7 +540,7 @@ var subcommands = map[string]func([]string){
 	"join": runJoin,
 }
 
-func main() {
+func Main() {
 	if len(os.Args) >= 2 {
 		if h, ok := subcommands[os.Args[1]]; ok {
 			h(os.Args[2:])
@@ -638,16 +638,7 @@ func main() {
 				if err != nil {
 					continue
 				}
-				h := fnv64(out)
-				changed := paneActivityRecordTick(j.Tmux, h)
-				if changed {
-					msg, _ := json.Marshal(map[string]any{
-						"type": "activity",
-						"tmux": j.Tmux,
-						"ts":   time.Now().UnixMilli(),
-					})
-					globalCollabHub.broadcast(nil, msg)
-				}
+				paneActivityRecordTick(j.Tmux, fnv64(out))
 				needs := panePrompted(out, vmAgent(*vm))
 				if paneNeedsInputSet(j.Tmux, needs) {
 					if st.Bcast != nil {
@@ -681,7 +672,19 @@ func main() {
 			return st.store.PutSnap(body)
 		}
 		allowedLoginsProvider = func() []string { return append([]string(nil), cfg.Orch.AllowedLogins...) }
-		go runRelayAgent(context.Background(), *relayURL, *relayToken, cfg.Orch.HTTPSecret, cfg.Orch.HTTPAddr, cfg.Orch.AllowedLogins, httpHandler(&cfg, st), st.Bcast, func() []byte { return buildAPIStateJSON(&cfg, st) }, snapRead, snapWrite, func(s string) *VMBlock { return lookupPaneVM(&cfg, st, s) })
+		go runRelayAgent(context.Background(), RelayDeps{
+			URL:           *relayURL,
+			Token:         *relayToken,
+			HTTPSecret:    cfg.Orch.HTTPSecret,
+			LocalAddr:     cfg.Orch.HTTPAddr,
+			AllowedLogins: cfg.Orch.AllowedLogins,
+			Handler:       httpHandler(&cfg, st),
+			StateWake:     st.Bcast,
+			StatePush:     func() []byte { return buildAPIStateJSON(&cfg, st) },
+			SnapRead:      snapRead,
+			SnapWrite:     snapWrite,
+			PaneVM:        func(s string) *VMBlock { return lookupPaneVM(&cfg, st, s) },
+		})
 	}
 
 	for i := range cfg.VMs {
@@ -760,20 +763,6 @@ func main() {
 				return
 			case <-pt.C:
 				pruneOrphanWorkdirs(&cfg, st)
-			}
-		}
-	}()
-
-	go func() {
-		ot := time.NewTicker(30 * time.Second)
-		defer ot.Stop()
-		ensureOperator(&cfg)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ot.C:
-				ensureOperator(&cfg)
 			}
 		}
 	}()

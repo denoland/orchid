@@ -1,4 +1,4 @@
-package main
+package orch
 
 import (
 	"embed"
@@ -474,5 +474,5 @@ func tick(cfg *Config, st *State) {
 	}
 }
 
-//go:embed all:www/dist
+//go:embed all:embed-dist
 var wwwFS embed.FS

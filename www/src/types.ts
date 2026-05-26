@@ -54,6 +54,5 @@ export interface State {
   jobs: Job[]
   vms: VM[]
   inbox: string
-  operator: string
   quota?: Quota
 }

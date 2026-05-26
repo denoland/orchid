@@ -1,10 +1,9 @@
-package main
+package orch
 
 import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
-	"context"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -14,7 +13,6 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,7 +20,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/websocket"
 	"github.com/hashicorp/hcl/v2/hclsimple"
 )
 
@@ -44,11 +41,10 @@ type apiVMEntry struct {
 }
 
 type apiStateResp struct {
-	Jobs     []apiJobEntry `json:"jobs"`
-	VMs      []apiVMEntry  `json:"vms"`
-	Inbox    string        `json:"inbox"`
-	Operator string        `json:"operator"`
-	Quota    *apiQuota     `json:"quota,omitempty"`
+	Jobs  []apiJobEntry `json:"jobs"`
+	VMs   []apiVMEntry  `json:"vms"`
+	Inbox string        `json:"inbox"`
+	Quota *apiQuota     `json:"quota,omitempty"`
 }
 
 type apiPaneUsage struct {
@@ -124,15 +120,10 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 			Agent:    vmAgent(vm).name,
 		})
 	}
-	op := ""
-	if operatorAlive(cfg) {
-		op = operatorTmux
-	}
 	resp := apiStateResp{
-		Jobs:     jobs,
-		VMs:      vms,
-		Inbox:    cfg.GitHub.InboxRepo,
-		Operator: op,
+		Jobs:  jobs,
+		VMs:   vms,
+		Inbox: cfg.GitHub.InboxRepo,
 	}
 	if five, seven, ok := latestQuota(); ok {
 		resp.Quota = &apiQuota{
@@ -558,112 +549,6 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		})
 	}))
 
-	ogTransport := safeSSRFTransport()
-	mux.HandleFunc("/api/og", auth(func(w http.ResponseWriter, r *http.Request) {
-		raw := r.URL.Query().Get("url")
-		if raw == "" {
-			http.Error(w, "url required", http.StatusBadRequest)
-			return
-		}
-		u, err := url.Parse(raw)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			http.Error(w, "bad url", http.StatusBadRequest)
-			return
-		}
-		if u.User != nil {
-			http.Error(w, "userinfo in url not allowed", http.StatusBadRequest)
-			return
-		}
-		if isPrivateHost(u.Hostname()) {
-			http.Error(w, "host blocked", http.StatusForbidden)
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
-		defer cancel()
-		req, _ := http.NewRequestWithContext(ctx, "GET", raw, nil)
-		req.Header.Set("User-Agent", "OrchidLinkBot/1.0 (+orchid)")
-		req.Header.Set("Accept", "text/html,application/xhtml+xml")
-		client := &http.Client{
-			Transport: ogTransport,
-			Timeout:   6 * time.Second,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) > 5 {
-					return fmt.Errorf("too many redirects")
-				}
-				if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
-					return fmt.Errorf("redirect to non-http scheme blocked")
-				}
-				if isPrivateHost(req.URL.Hostname()) {
-					return fmt.Errorf("redirect to private host blocked")
-				}
-				return nil
-			},
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			http.Error(w, "fetch failed: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		out := parseOG(string(body), raw)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "public, max-age=600")
-		_ = json.NewEncoder(w).Encode(out)
-	}))
-
-	hub := globalCollabHub
-	mux.HandleFunc("/api/canvas/ws", auth(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			InsecureSkipVerify: true,
-		})
-		if err != nil {
-			return
-		}
-		defer conn.CloseNow()
-		ctx := r.Context()
-		client := &collabClient{id: tmuxPasteBuf(), ch: make(chan []byte, 64)}
-		hub.add(client)
-		defer hub.remove(client)
-
-		hello := fmt.Sprintf(`{"type":"hello","userId":%q,"peers":%s}`,
-			client.id, mustJSON(hub.peers(client)))
-		_ = conn.Write(ctx, websocket.MessageText, []byte(hello))
-		hub.broadcast(client, []byte(fmt.Sprintf(`{"type":"join","userId":%q}`, client.id)))
-
-		readDone := make(chan struct{})
-		go func() {
-			defer close(readDone)
-			for {
-				_, data, err := conn.Read(ctx)
-				if err != nil {
-					return
-				}
-				stamped := stampUserID(data, client.id)
-				hub.broadcast(client, stamped)
-			}
-		}()
-
-		for {
-			select {
-			case <-ctx.Done():
-				_ = conn.Close(websocket.StatusNormalClosure, "context done")
-				return
-			case <-readDone:
-				_ = conn.Close(websocket.StatusNormalClosure, "client closed")
-				hub.broadcast(client, []byte(fmt.Sprintf(`{"type":"leave","userId":%q}`, client.id)))
-				return
-			case msg, ok := <-client.ch:
-				if !ok {
-					return
-				}
-				if err := conn.Write(ctx, websocket.MessageText, msg); err != nil {
-					return
-				}
-			}
-		}
-	}))
-
 	mux.HandleFunc("/api/snap", auth(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -772,24 +657,11 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		}
 	}))
 
-	mux.HandleFunc("/api/operator", auth(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		if operatorAlive(cfg) {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		go spawnOperator(cfg)
-		w.WriteHeader(http.StatusAccepted)
-	}))
-
 	if cfg.Orch.Capture != nil {
 		registerCaptureRoutes(mux, cfg)
 	}
 
-	spaFS, _ := fs.Sub(wwwFS, "www/dist")
+	spaFS, _ := fs.Sub(wwwFS, "embed-dist")
 	fileServer := http.FileServerFS(spaFS)
 	mux.HandleFunc("/", auth(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/")
