@@ -3,7 +3,7 @@
   "private": true,
   "workspaces": [
     "www",
-    "lib/whiteboard",
-    "relay"
+    "www/whiteboard",
+    "cf"
   ]
 }

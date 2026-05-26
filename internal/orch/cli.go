@@ -548,7 +548,7 @@ func Main() {
 		}
 	}
 	cfgPath := flag.String("config", "swarm.hcl", "path to HCL config")
-	describeFlag := flag.Bool("describe", false, "print a CLAUDE.md-shaped description of this instance and exit")
+	describeFlag := flag.Bool("describe", false, "print a SKILL.md-shaped description of this instance and exit")
 	captureOnly := flag.Bool("capture-only", false, "run only the /api/drafts capture HTTP server (no swarm polling, no VM bootstrap); requires a capture block in the config")
 	relayURL := flag.String("relay", "", "outbound relay URL (e.g. wss://orchid.com/agent) — dashboard is reachable at <sub>.orchid.com without exposing this port")
 	relayToken := flag.String("relay-token", "", "agent token issued by the relay on signup")
