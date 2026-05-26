@@ -45,7 +45,7 @@ GH_TOKEN is stored in `/root/orch/env` (read by the unit's `EnvironmentFile=`).
 
 ```bash
 ssh root@65.20.66.139 "systemctl stop orchid"
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o orch-linux .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o orch-linux ./cmd/orch
 scp orch-linux root@65.20.66.139:/root/orch/orch && rm orch-linux
 ssh root@65.20.66.139 "systemctl start orchid && systemctl status orchid"
 ```

@@ -1,9 +1,8 @@
-package main
+package orch
 
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -18,57 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 )
-
-// collabHub broadcasts every message it receives to every other connected
-// client. Used by the canvas dashboard for cursor positions, ink strokes,
-// node moves, etc. Server is dumb — clients converge state themselves.
-type collabHub struct {
-	mu      sync.Mutex
-	clients map[*collabClient]bool
-}
-type collabClient struct {
-	id string
-	ch chan []byte
-}
-
-func newCollabHub() *collabHub { return &collabHub{clients: map[*collabClient]bool{}} }
-
-func (h *collabHub) add(c *collabClient) {
-	h.mu.Lock()
-	h.clients[c] = true
-	h.mu.Unlock()
-}
-func (h *collabHub) remove(c *collabClient) {
-	h.mu.Lock()
-	delete(h.clients, c)
-	close(c.ch)
-	h.mu.Unlock()
-}
-func (h *collabHub) peers(self *collabClient) []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make([]string, 0, len(h.clients))
-	for c := range h.clients {
-		if c == self {
-			continue
-		}
-		out = append(out, c.id)
-	}
-	return out
-}
-func (h *collabHub) broadcast(from *collabClient, msg []byte) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for c := range h.clients {
-		if c == from {
-			continue
-		}
-		select {
-		case c.ch <- msg:
-		default:
-		}
-	}
-}
 
 type Config struct {
 	GitHub              GitHubBlock   `hcl:"github,block" json:"github"`
@@ -283,31 +231,6 @@ func expand(p string) string {
 		return h + p[1:]
 	}
 	return p
-}
-
-// mustJSON marshals v or returns "null" so format strings always parse.
-func mustJSON(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "null"
-	}
-	return string(b)
-}
-
-// stampUserID rewrites the incoming JSON message to set/override `userId`
-// to the server-assigned id. Falls back to the raw payload if parsing
-// fails — broadcast still happens, attribution just relies on the client.
-func stampUserID(data []byte, id string) []byte {
-	var m map[string]any
-	if err := json.Unmarshal(data, &m); err != nil {
-		return data
-	}
-	m["userId"] = id
-	out, err := json.Marshal(m)
-	if err != nil {
-		return data
-	}
-	return out
 }
 
 // atoiClamp parses s; if invalid returns def. Result is clamped to [lo, hi].
@@ -768,8 +691,6 @@ func fnv64(s string) uint64 {
 	return h
 }
 
-var globalCollabHub = newCollabHub()
-
 var globalConfigPath string
 
 var tmuxPasteSeq atomic.Uint64
@@ -788,96 +709,6 @@ func tmuxPaste(vm VMBlock, session, msg string) error {
 		return fmt.Errorf("paste-buffer+enter: %v: %s", err, errStr)
 	}
 	return nil
-}
-
-const operatorTmux = "operator"
-
-// localVM returns the first localhost VM in the config, or nil.
-func localVM(cfg *Config) *VMBlock {
-	for i := range cfg.VMs {
-		if isLocal(cfg.VMs[i]) {
-			return &cfg.VMs[i]
-		}
-	}
-	return nil
-}
-
-// operatorAlive returns whether the operator tmux session exists on any local VM.
-func operatorAlive(cfg *Config) bool {
-	vm := localVM(cfg)
-	if vm == nil {
-		return false
-	}
-	_, _, err := sshExec(*vm, fmt.Sprintf("tmux has-session -t %s 2>/dev/null", operatorTmux))
-	return err == nil
-}
-
-// spawnOperator creates the operator tmux session running claude as the
-// session_home user, waits for the idle prompt, then enables remote-control.
-// Runs in its own goroutine — blocks up to 3 min waiting for claude to start.
-func spawnOperator(cfg *Config) {
-	vm := localVM(cfg)
-	if vm == nil {
-		return
-	}
-	sessionHome := "/home/orchid"
-	for _, v := range cfg.VMs {
-		if isLocal(v) && v.SessionHome != "" {
-			sessionHome = v.SessionHome
-			break
-		}
-	}
-	stampCmd := fmt.Sprintf(
-		`CJSON=/home/orchid/.claude.json; [ -f "$CJSON" ] || echo '{}' > "$CJSON"; `+
-			`jq --arg d %q '.projects[$d].hasTrustDialogAccepted = true' "$CJSON" > "$CJSON.tmp" && mv "$CJSON.tmp" "$CJSON"; `+
-			`chown orchid:orchid "$CJSON" 2>/dev/null || true`,
-		sessionHome,
-	)
-	_, _, _ = sshExec(*vm, stampCmd)
-	cmd := fmt.Sprintf(
-		"tmux new-session -d -s %s -c %s 'runuser -u orchid -- claude --dangerously-skip-permissions'",
-		operatorTmux, sessionHome,
-	)
-	if _, _, err := sshExec(*vm, cmd); err != nil {
-		log.Printf("operator: spawn failed: %v", err)
-		return
-	}
-	log.Printf("operator: session started, waiting for idle prompt")
-	deadline := time.Now().Add(3 * time.Minute)
-	for time.Now().Before(deadline) {
-		time.Sleep(3 * time.Second)
-		out, _, _ := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s", operatorTmux))
-		if strings.Contains(out, "trust this folder") || strings.Contains(out, "I trust") {
-			_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s '1' C-m", operatorTmux))
-			continue
-		}
-		if strings.Contains(out, "bypass permissions") {
-			log.Printf("operator: ready")
-			return
-		}
-	}
-	log.Printf("operator: timed out waiting for idle prompt")
-}
-
-// ensureOperator spawns the operator session if missing and dismisses
-// claude's trust dialog if it's blocking the pane (e.g. after an OOM
-// respawn).
-func ensureOperator(cfg *Config) {
-	vm := localVM(cfg)
-	if vm == nil {
-		return
-	}
-	_, _, err := sshExec(*vm, fmt.Sprintf("tmux has-session -t %s 2>/dev/null", operatorTmux))
-	if err != nil {
-		log.Printf("operator: session not found, spawning")
-		go spawnOperator(cfg)
-		return
-	}
-	out, _, _ := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s", operatorTmux))
-	if strings.Contains(out, "trust this folder") || strings.Contains(out, "I trust") {
-		_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s '1' C-m", operatorTmux))
-		log.Printf("operator: dismissed trust dialog")
-	}
 }
 
 // sessionName picks a tmux session id that reflects the agent running in
@@ -1208,27 +1039,6 @@ func isActionableCheck(conclusion string) bool {
 	return true
 }
 
-func headPushedByBot(v *PRView, botLogin string) bool {
-	if botLogin == "" || v.HeadRefOid == "" {
-		return false
-	}
-	for _, c := range v.Commits {
-		if c.Oid != v.HeadRefOid {
-			continue
-		}
-		if len(c.Authors) == 0 {
-			return false
-		}
-		for _, a := range c.Authors {
-			if a.Login != botLogin {
-				return false
-			}
-		}
-		return true
-	}
-	return false
-}
-
 func diffPR(j *Job, v *PRView, botLogin string) (
 	visibleReviews, visibleThread, visibleIssue []string,
 	silentReviews, silentThread, silentIssue []string,
@@ -1280,7 +1090,22 @@ func diffPR(j *Job, v *PRView, botLogin string) (
 		}
 	}
 	if j.LastHeadOID != "" && j.LastHeadOID != v.HeadRefOid {
-		pushed = !headPushedByBot(v, botLogin)
+		pushed = true
+		if botLogin != "" {
+			for _, c := range v.Commits {
+				if c.Oid != v.HeadRefOid || len(c.Authors) == 0 {
+					continue
+				}
+				pushed = false
+				for _, a := range c.Authors {
+					if a.Login != botLogin {
+						pushed = true
+						break
+					}
+				}
+				break
+			}
+		}
 	}
 	latest := map[string]string{}
 	latestAt := map[string]string{}

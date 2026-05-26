@@ -39,6 +39,7 @@ wrangler.jsonc
 www/node_modules/
 www/dist/
 www/.cache/
+internal/orch/embed-dist/
 
 # Relay (CF Worker)
 relay/node_modules/

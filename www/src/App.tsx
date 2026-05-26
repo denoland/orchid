@@ -24,7 +24,7 @@ export interface WSBus {
 export const WSBusContext = createContext<WSBus | null>(null)
 
 export default function App() {
-  const [state, setState] = useState<State>({ jobs: [], vms: [], inbox: '', operator: '' })
+  const [state, setState] = useState<State>({ jobs: [], vms: [], inbox: '' })
   const [relay, setRelay] = useState<RelayInfo | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const peerIdRef = useRef<string | null>(null)

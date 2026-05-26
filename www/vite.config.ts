@@ -94,10 +94,6 @@ export default defineConfig({
           res.statusCode = 204
           res.end()
         })
-        server.middlewares.use('/api/operator', (_req: any, res: any) => {
-          res.statusCode = 204
-          res.end()
-        })
         server.middlewares.use('/api/drafts', (req: any, res: any) => {
           let body = ''
           req.on('data', (c: any) => { body += c })
@@ -116,7 +112,8 @@ export default defineConfig({
     },
   ].filter(Boolean) as any,
   build: {
-    outDir: 'dist',
+    outDir: '../internal/orch/embed-dist',
+    emptyOutDir: true,
     assetsDir: '_a',
     chunkSizeWarningLimit: 800,
     rollupOptions: {

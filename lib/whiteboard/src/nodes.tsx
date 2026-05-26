@@ -172,7 +172,7 @@ export function LinkNode({ data }: NodeProps<Node<LinkData, 'link'>>) {
 }
 
 /// Cheap URL → variant + title classification. No network calls. Use
-/// fetchOG / fetchGitHubSnippet from this module to enrich later.
+/// fetchGitHubSnippet from this module to enrich later.
 export function detectVariant(url: string): { variant: LinkVariant; title: string; image?: string } {
   try {
     const u = new URL(url)
@@ -205,20 +205,6 @@ export async function fetchGitHubSnippet(url: string): Promise<string | undefine
     const text = await res.text()
     return text.split('\n').slice(0, 8).join('\n')
   } catch { return undefined }
-}
-
-export async function fetchOG(url: string, endpoint = '/api/og'): Promise<Partial<LinkData>> {
-  try {
-    const res = await fetch(`${endpoint}?url=${encodeURIComponent(url)}`)
-    if (!res.ok) return {}
-    const j = await res.json() as Record<string, string>
-    return {
-      image: j['image'] || undefined,
-      title: j['title'] || undefined,
-      description: j['description'] || undefined,
-      site: j['site'] || undefined,
-    }
-  } catch { return {} }
 }
 
 // ─── stroke ────────────────────────────────────────────────────────────

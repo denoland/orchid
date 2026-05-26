@@ -1,7 +1,6 @@
-package main
+package orch
 
 import (
-	"net"
 	"os"
 	"strings"
 	"sync"
@@ -270,69 +269,6 @@ func TestTmuxPasteBufUnique(t *testing.T) {
 			t.Fatalf("unique names: got %d, want %d", got, workers*perWorker)
 		}
 	})
-}
-
-func TestIsPrivateIP(t *testing.T) {
-	cases := []struct {
-		ip   string
-		want bool
-		why  string
-	}{
-		{"127.0.0.1", true, "loopback"},
-		{"::1", true, "loopback v6"},
-		{"10.0.0.1", true, "rfc1918"},
-		{"172.16.0.1", true, "rfc1918"},
-		{"192.168.1.1", true, "rfc1918"},
-		{"169.254.169.254", true, "link-local / cloud IMDS"},
-		{"100.64.0.1", true, "carrier-grade NAT"},
-		{"100.127.255.254", true, "carrier-grade NAT upper"},
-		{"0.0.0.0", true, "unspecified"},
-		{"255.255.255.255", true, "broadcast"},
-		{"224.0.0.1", true, "multicast"},
-		{"fe80::1", true, "link-local v6"},
-		{"ff02::1", true, "multicast v6"},
-		{"8.8.8.8", false, "public dns"},
-		{"1.1.1.1", false, "public dns"},
-		{"100.63.255.255", false, "just below CGNAT range"},
-		{"100.128.0.0", false, "just above CGNAT range"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.ip+"/"+tc.why, func(t *testing.T) {
-			ip := net.ParseIP(tc.ip)
-			if ip == nil {
-				t.Fatalf("ParseIP(%q) returned nil", tc.ip)
-			}
-			got := isPrivateIP(ip)
-			if got != tc.want {
-				t.Errorf("isPrivateIP(%q): got %v, want %v (%s)", tc.ip, got, tc.want, tc.why)
-			}
-		})
-	}
-}
-
-func TestIsPrivateHost(t *testing.T) {
-	cases := []struct {
-		host string
-		want bool
-	}{
-		{"", true},
-		{"localhost", true},
-		{"127.0.0.1", true},
-		{"169.254.169.254", true},
-		{"10.0.0.1", true},
-		// public DNS resolution would be flaky in a sandbox, so the
-		// non-private side of the table is covered indirectly by
-		// TestIsPrivateIP. We assert the bypass attempts we know don't
-		// need DNS.
-	}
-	for _, tc := range cases {
-		t.Run(tc.host, func(t *testing.T) {
-			got := isPrivateHost(tc.host)
-			if got != tc.want {
-				t.Errorf("isPrivateHost(%q): got %v, want %v", tc.host, got, tc.want)
-			}
-		})
-	}
 }
 
 // TestResolveDraftTargetEnforcesAllowList pins down the rule that a Draft

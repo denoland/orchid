@@ -1,4 +1,4 @@
-package main
+package orch
 
 import (
 	"encoding/json"
