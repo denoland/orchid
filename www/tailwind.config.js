@@ -5,7 +5,7 @@ export default {
     // Whiteboard primitives ship Tailwind classes in their source —
     // scan them too so amber sticky notes / link gradients / etc.
     // don't get tree-shaken out of the bundle.
-    '../lib/whiteboard/src/**/*.{ts,tsx}',
+    './whiteboard/src/**/*.{ts,tsx}',
   ],
   darkMode: 'class',
   theme: {
