@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { marked } from 'marked'
 import { DIAGRAMS } from './DocsDiagrams'
 import { ILLUSTRATIONS } from './DocsIllustrations'
+import { MOCKUPS } from './DocsMockups'
 
 interface Page { slug: string; title: string; file: string; lede?: string; section: 'start' | 'configure' | 'integrate' | 'deep' }
 const PAGES: Page[] = [
@@ -110,11 +111,12 @@ export function Docs() {
       .then((r) => r.text())
       .then((md) => {
         if (cancelled) return
-        // Replace {{diagram:name}} / {{illust:name}} markers with
-        // placeholder divs the React effect below will mount components into.
+        // Replace {{diagram:name}} / {{illust:name}} / {{mockup:name}}
+        // markers with placeholder divs the React effect mounts into.
         const transformed = md
           .replace(/\{\{diagram:([a-z0-9-]+)\}\}/g, (_, n) => `<div data-diagram="${n}"></div>`)
           .replace(/\{\{illust:([a-z0-9-]+)\}\}/g,  (_, n) => `<div data-illust="${n}"></div>`)
+          .replace(/\{\{mockup:([a-z0-9-]+)\}\}/g,  (_, n) => `<div data-mockup="${n}"></div>`)
         setBody(marked.parse(transformed) as string)
       })
     return () => { cancelled = true }
@@ -122,19 +124,21 @@ export function Docs() {
 
   // After marked renders, hunt for diagram placeholders and portal the
   // matching React component into each. New body resets the list.
+  type MountKind = 'd' | 'i' | 'm'
   const articleRef = useRef<HTMLElement | null>(null)
-  const [mounts, setMounts] = useState<{ kind: 'd' | 'i'; name: string; el: HTMLElement }[]>([])
+  const [mounts, setMounts] = useState<{ kind: MountKind; name: string; el: HTMLElement }[]>([])
   useEffect(() => {
     if (!body || !articleRef.current) { setMounts([]); return }
-    const next: { kind: 'd' | 'i'; name: string; el: HTMLElement }[] = []
-    articleRef.current.querySelectorAll<HTMLElement>('[data-diagram]').forEach((el) => {
-      const name = el.dataset.diagram
-      if (name && DIAGRAMS[name]) next.push({ kind: 'd', name, el })
-    })
-    articleRef.current.querySelectorAll<HTMLElement>('[data-illust]').forEach((el) => {
-      const name = el.dataset.illust
-      if (name && ILLUSTRATIONS[name]) next.push({ kind: 'i', name, el })
-    })
+    const next: { kind: MountKind; name: string; el: HTMLElement }[] = []
+    const collect = (sel: string, kind: MountKind, dict: Record<string, React.FC>, attr: string) => {
+      articleRef.current!.querySelectorAll<HTMLElement>(sel).forEach((el) => {
+        const name = el.dataset[attr as keyof DOMStringMap] as string | undefined
+        if (name && dict[name]) next.push({ kind, name, el })
+      })
+    }
+    collect('[data-diagram]', 'd', DIAGRAMS,      'diagram')
+    collect('[data-illust]',  'i', ILLUSTRATIONS, 'illust')
+    collect('[data-mockup]',  'm', MOCKUPS,       'mockup')
     setMounts(next)
   }, [body])
 
@@ -213,7 +217,10 @@ export function Docs() {
             <>
               <article ref={articleRef} className="docs-prose" dangerouslySetInnerHTML={{ __html: body }} />
               {mounts.map(({ kind, name, el }, i) => {
-                const C = kind === 'd' ? DIAGRAMS[name] : ILLUSTRATIONS[name]
+                const C =
+                  kind === 'd' ? DIAGRAMS[name] :
+                  kind === 'i' ? ILLUSTRATIONS[name] :
+                                 MOCKUPS[name]
                 return createPortal(<C />, el, `${kind}-${name}-${i}`)
               })}
             </>

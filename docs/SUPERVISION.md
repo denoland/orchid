@@ -2,6 +2,10 @@
 
 {{illust:chat-vine}}
 
+{{mockup:telegram}}
+
+{{diagram:supervision}}
+
 Orchid hosts a skill file at <https://orchid.littledivy.com/skill.md>. Point
 any chat-agent runtime at it and you get a Telegram/Slack/Discord bot that
 knows how to check on your swarm and kick it back to life.
