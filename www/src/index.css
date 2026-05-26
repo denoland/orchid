@@ -134,3 +134,21 @@ html.dark .card-status-watching {
 .react-flow__node-card.selected .react-flow__handle {
   opacity: 1;
 }
+
+/* Markdown docs */
+.docs-prose { font-size: 16px; line-height: 1.7; color: #18181b; }
+.docs-prose h1 { font-size: 2rem; font-weight: 600; margin: 1.5rem 0 1rem; line-height: 1.2; }
+.docs-prose h2 { font-size: 1.4rem; font-weight: 600; margin: 2rem 0 .75rem; border-bottom: 1px solid #e4e4e7; padding-bottom: .25rem; }
+.docs-prose h3 { font-size: 1.1rem; font-weight: 600; margin: 1.5rem 0 .5rem; }
+.docs-prose p { margin: .75rem 0; }
+.docs-prose a { color: #7c3aed; text-decoration: underline; }
+.docs-prose ul, .docs-prose ol { padding-left: 1.5rem; margin: .75rem 0; }
+.docs-prose li { margin: .25rem 0; }
+.docs-prose code { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: .9em; background: #f4f4f5; padding: .1em .35em; border-radius: 4px; }
+.docs-prose pre { background: #18181b; color: #e4e4e7; padding: 1rem; border-radius: 8px; overflow-x: auto; margin: 1rem 0; }
+.docs-prose pre code { background: transparent; padding: 0; color: inherit; font-size: .85rem; }
+.docs-prose blockquote { border-left: 3px solid #d4d4d8; padding-left: 1rem; color: #52525b; margin: 1rem 0; font-style: italic; }
+.docs-prose hr { border: 0; border-top: 1px solid #e4e4e7; margin: 2rem 0; }
+.docs-prose table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+.docs-prose th, .docs-prose td { padding: .5rem .75rem; border-bottom: 1px solid #e4e4e7; text-align: left; }
+.docs-prose th { font-weight: 600; background: #fafafa; }

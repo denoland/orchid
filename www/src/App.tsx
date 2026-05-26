@@ -1,5 +1,6 @@
 import { createContext, useEffect, useRef, useState } from 'react'
 import { Dashboard, setSnapBusSender } from './Dashboard'
+import { Docs } from './Docs'
 import { InstallModal } from './InstallModal'
 import type { State } from './types'
 
@@ -24,6 +25,11 @@ export interface WSBus {
 export const WSBusContext = createContext<WSBus | null>(null)
 
 export default function App() {
+  if (location.pathname.startsWith('/docs')) return <Docs />
+  return <DashboardApp />
+}
+
+function DashboardApp() {
   const [state, setState] = useState<State>({ jobs: [], vms: [], inbox: '' })
   const [relay, setRelay] = useState<RelayInfo | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
