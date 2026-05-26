@@ -1,5 +1,7 @@
 # Targets
 
+{{illust:fork-blooms}}
+
 A **target** in orchid is a routing rule: when an issue in the inbox
 repo carries a specific label, the matching target's repo is what
 Claude actually works on. One swarm can drive any number of work repos

@@ -1,6 +1,6 @@
 # Chat with your orchid
 
-{{diagram:supervision}}
+{{illust:chat-vine}}
 
 Orchid hosts a skill file at <https://orchid.littledivy.com/skill.md>. Point
 any chat-agent runtime at it and you get a Telegram/Slack/Discord bot that

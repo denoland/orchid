@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { marked } from 'marked'
 import { DIAGRAMS } from './DocsDiagrams'
+import { ILLUSTRATIONS } from './DocsIllustrations'
 
 interface Page { slug: string; title: string; file: string; lede?: string; section: 'start' | 'configure' | 'integrate' | 'deep' }
 const PAGES: Page[] = [
@@ -109,10 +110,11 @@ export function Docs() {
       .then((r) => r.text())
       .then((md) => {
         if (cancelled) return
-        // Replace {{diagram:name}} markers with placeholder divs the
-        // React effect below will mount real ReactFlow components into.
-        const transformed = md.replace(/\{\{diagram:([a-z0-9-]+)\}\}/g,
-          (_, name) => `<div data-diagram="${name}"></div>`)
+        // Replace {{diagram:name}} / {{illust:name}} markers with
+        // placeholder divs the React effect below will mount components into.
+        const transformed = md
+          .replace(/\{\{diagram:([a-z0-9-]+)\}\}/g, (_, n) => `<div data-diagram="${n}"></div>`)
+          .replace(/\{\{illust:([a-z0-9-]+)\}\}/g,  (_, n) => `<div data-illust="${n}"></div>`)
         setBody(marked.parse(transformed) as string)
       })
     return () => { cancelled = true }
@@ -121,14 +123,17 @@ export function Docs() {
   // After marked renders, hunt for diagram placeholders and portal the
   // matching React component into each. New body resets the list.
   const articleRef = useRef<HTMLElement | null>(null)
-  const [mounts, setMounts] = useState<{ name: string; el: HTMLElement }[]>([])
+  const [mounts, setMounts] = useState<{ kind: 'd' | 'i'; name: string; el: HTMLElement }[]>([])
   useEffect(() => {
     if (!body || !articleRef.current) { setMounts([]); return }
-    const els = articleRef.current.querySelectorAll<HTMLElement>('[data-diagram]')
-    const next: { name: string; el: HTMLElement }[] = []
-    els.forEach((el) => {
+    const next: { kind: 'd' | 'i'; name: string; el: HTMLElement }[] = []
+    articleRef.current.querySelectorAll<HTMLElement>('[data-diagram]').forEach((el) => {
       const name = el.dataset.diagram
-      if (name && DIAGRAMS[name]) next.push({ name, el })
+      if (name && DIAGRAMS[name]) next.push({ kind: 'd', name, el })
+    })
+    articleRef.current.querySelectorAll<HTMLElement>('[data-illust]').forEach((el) => {
+      const name = el.dataset.illust
+      if (name && ILLUSTRATIONS[name]) next.push({ kind: 'i', name, el })
     })
     setMounts(next)
   }, [body])
@@ -207,9 +212,9 @@ export function Docs() {
           {slug && page && (
             <>
               <article ref={articleRef} className="docs-prose" dangerouslySetInnerHTML={{ __html: body }} />
-              {mounts.map(({ name, el }) => {
-                const C = DIAGRAMS[name]
-                return createPortal(<C />, el)
+              {mounts.map(({ kind, name, el }, i) => {
+                const C = kind === 'd' ? DIAGRAMS[name] : ILLUSTRATIONS[name]
+                return createPortal(<C />, el, `${kind}-${name}-${i}`)
               })}
             </>
           )}

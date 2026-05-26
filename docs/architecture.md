@@ -1,5 +1,7 @@
 # Architecture
 
+{{illust:branch-tree}}
+
 A high-level map of what runs where and how the pieces talk.
 
 ## Components
