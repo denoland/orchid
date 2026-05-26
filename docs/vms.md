@@ -6,12 +6,7 @@ block), and you can add as many remote VMs as you have capacity for.
 Orch drives all of them over plain SSH — no agent, no daemon, no
 inbound ports on the worker.
 
-```
-   orch (central)  ──SSH──►  vm "fra1"
-                 │           └ tmux: claude-1, claude-2, …
-                 └─SSH──►   vm "sfo3"
-                             └ tmux: claude-1, claude-2, …
-```
+{{diagram:vm-join}}
 
 ## When to add VMs
 

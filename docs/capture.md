@@ -1,5 +1,7 @@
 # Capture
 
+{{diagram:capture}}
+
 ![Dashboard → Capture pane (composer + recent intake)](img/capture.png)
 
 The bottleneck isn't writing the issue — it's getting the thought
