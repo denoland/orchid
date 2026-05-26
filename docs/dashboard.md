@@ -1,5 +1,7 @@
 # Dashboard
 
+{{illust:spray}}
+
 Each orchid user has a personal dashboard at
 `<your-handle>.orchid.littledivy.com`. It's a single-page React app
 served by the relay; the data behind it streams over a single
@@ -19,8 +21,6 @@ WebSocket per tab.
   automatically to save bandwidth.
 
 ## Card states
-
-{{diagram:card-states}}
 
 | State | Meaning |
 |-------|---------|

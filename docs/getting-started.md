@@ -1,6 +1,6 @@
 # Getting started
 
-{{diagram:journey}}
+{{illust:bud}}
 
 Orchid is a swarm of coding agents that ship pull requests. You file
 issues; orchid spawns a `claude` (or codex) session for each one,

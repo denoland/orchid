@@ -1,6 +1,6 @@
 # Capture
 
-{{diagram:capture}}
+{{illust:hand-bud}}
 
 The bottleneck isn't writing the issue — it's getting the thought
 into orchid before it evaporates. **Orchid Capture** is the

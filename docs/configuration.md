@@ -1,5 +1,7 @@
 # Configuration
 
+{{illust:config-knot}}
+
 Orchid reads a single HCL file at `$HOME/.orch/swarm.hcl` (or wherever
 you point `--config` at). The installer writes a starter with sensible
 defaults; edit it through the dashboard's **Settings** panel or
