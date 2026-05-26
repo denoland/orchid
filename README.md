@@ -26,3 +26,10 @@ Access your dashboard at https://username.orchid.littledivy.com
 ## Configuration
 
 See [./swarm.hcl](swarm.hcl)
+
+## Supervising from your phone
+
+Orchid pairs nicely with a self-hosted chat agent (OpenClaw, Hermes Agent).
+The agent reads `CLAUDE.md` as its skill file and talks to orchid over SSH
++ `gh` so you can check status, file work, or restart the swarm from
+Telegram/Slack/Discord. See [docs/SUPERVISION.md](docs/SUPERVISION.md).
