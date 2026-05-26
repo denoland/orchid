@@ -233,7 +233,14 @@ html.dark .card-status-watching {
 .docs-hero-title em { font-style: italic; }
 .docs-hero-lede { margin-top: 18px; color: var(--muted); font-size: 17px; }
 
-.docs-index { list-style: none; padding: 0; margin: 0; display: grid; gap: 16px; }
+.docs-section { margin-top: 36px; }
+.docs-section:first-of-type { margin-top: 8px; }
+.docs-section-title {
+  font-size: 12px; font-weight: 600;
+  letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted); margin-bottom: 12px;
+}
+.docs-index { list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
 .docs-card {
   display: flex; flex-direction: column; gap: 6px;
   padding: 24px 28px;

@@ -1,13 +1,71 @@
 import { useEffect, useState } from 'react'
 import { marked } from 'marked'
 
-const PAGES: { slug: string; title: string; file: string; lede?: string }[] = [
+interface Page { slug: string; title: string; file: string; lede?: string; section: 'start' | 'configure' | 'integrate' | 'deep' }
+const PAGES: Page[] = [
+  {
+    slug: 'getting-started',
+    title: 'Getting started',
+    file: 'getting-started.md',
+    section: 'start',
+    lede: 'Sign in, install on a machine, file your first inbox issue.',
+  },
+  {
+    slug: 'dashboard',
+    title: 'Dashboard',
+    file: 'dashboard.md',
+    section: 'start',
+    lede: 'Tour the canvas, list view, panes, and settings.',
+  },
+  {
+    slug: 'configuration',
+    title: 'Configuration',
+    file: 'configuration.md',
+    section: 'configure',
+    lede: 'Every field in swarm.hcl, what it does, when to change it.',
+  },
+  {
+    slug: 'targets',
+    title: 'Targets',
+    file: 'targets.md',
+    section: 'configure',
+    lede: 'Route labels in the inbox to different work repos.',
+  },
+  {
+    slug: 'workers',
+    title: 'Workers',
+    file: 'workers.md',
+    section: 'configure',
+    lede: 'Scale the swarm to multiple VMs.',
+  },
+  {
+    slug: 'capture',
+    title: 'Capture',
+    file: 'capture.md',
+    section: 'integrate',
+    lede: 'macOS, iOS, and watchOS draft intake apps.',
+  },
   {
     slug: 'supervision',
-    title: 'Chat with your orchid',
+    title: 'Supervision',
     file: 'SUPERVISION.md',
-    lede: 'Point an OpenClaw or Hermes agent at orchid and talk to it on Telegram or Slack.',
+    section: 'integrate',
+    lede: 'Chat with your orchid on Telegram, Slack, Discord via OpenClaw or Hermes.',
   },
+  {
+    slug: 'architecture',
+    title: 'Architecture',
+    file: 'architecture.md',
+    section: 'deep',
+    lede: 'How orch, the relay, and Claude sessions fit together.',
+  },
+]
+
+const SECTIONS: { id: Page['section']; title: string }[] = [
+  { id: 'start',     title: 'Start here' },
+  { id: 'configure', title: 'Configure' },
+  { id: 'integrate', title: 'Integrate' },
+  { id: 'deep',      title: 'Under the hood' },
 ]
 
 function slugFromPath(): string | null {
@@ -61,33 +119,50 @@ export function Docs() {
           >
             Overview
           </a>
-          <div className="docs-side-section">Guides</div>
-          {PAGES.map((p) => (
-            <a
-              key={p.slug}
-              href={`/docs/${p.slug}`}
-              onClick={(e) => go(p.slug, e)}
-              className={'docs-side-link' + (slug === p.slug ? ' is-active' : '')}
-            >
-              {p.title}
-            </a>
-          ))}
+          {SECTIONS.map((s) => {
+            const items = PAGES.filter((p) => p.section === s.id)
+            if (items.length === 0) return null
+            return (
+              <div key={s.id}>
+                <div className="docs-side-section">{s.title}</div>
+                {items.map((p) => (
+                  <a
+                    key={p.slug}
+                    href={`/docs/${p.slug}`}
+                    onClick={(e) => go(p.slug, e)}
+                    className={'docs-side-link' + (slug === p.slug ? ' is-active' : '')}
+                  >
+                    {p.title}
+                  </a>
+                ))}
+              </div>
+            )
+          })}
         </aside>
         <main className="docs-main">
           {!slug && (
             <>
               <h1 className="docs-hero-title"><em>Docs</em></h1>
               <p className="docs-hero-lede">Everything orchid knows how to do — written down.</p>
-              <ul className="docs-index">
-                {PAGES.map((p) => (
-                  <li key={p.slug}>
-                    <a href={`/docs/${p.slug}`} onClick={(e) => go(p.slug, e)} className="docs-card">
-                      <span className="docs-card-title">{p.title}</span>
-                      {p.lede && <span className="docs-card-lede">{p.lede}</span>}
-                    </a>
-                  </li>
-                ))}
-              </ul>
+              {SECTIONS.map((s) => {
+                const items = PAGES.filter((p) => p.section === s.id)
+                if (items.length === 0) return null
+                return (
+                  <section key={s.id} className="docs-section">
+                    <h2 className="docs-section-title">{s.title}</h2>
+                    <ul className="docs-index">
+                      {items.map((p) => (
+                        <li key={p.slug}>
+                          <a href={`/docs/${p.slug}`} onClick={(e) => go(p.slug, e)} className="docs-card">
+                            <span className="docs-card-title">{p.title}</span>
+                            {p.lede && <span className="docs-card-lede">{p.lede}</span>}
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                )
+              })}
             </>
           )}
           {slug && !page && <p>Page not found.</p>}
