@@ -1,6 +1,6 @@
 # Getting started
 
-![Orchid dashboard, list view](img/dashboard-list.png)
+{{diagram:journey}}
 
 Orchid is a swarm of coding agents that ship pull requests. You file
 issues; orchid spawns a `claude` (or codex) session for each one,

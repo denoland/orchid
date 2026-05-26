@@ -2,8 +2,6 @@
 
 {{diagram:capture}}
 
-![Dashboard → Capture pane (composer + recent intake)](img/capture.png)
-
 The bottleneck isn't writing the issue — it's getting the thought
 into orchid before it evaporates. **Orchid Capture** is the
 low-friction intake: a menu-bar app for macOS, a voice + share

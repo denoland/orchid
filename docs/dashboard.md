@@ -5,8 +5,6 @@ Each orchid user has a personal dashboard at
 served by the relay; the data behind it streams over a single
 WebSocket per tab.
 
-![List view, grouped by job state](img/dashboard-list.png)
-
 ## Layout
 
 - **Canvas** — every active session shows up as a card. Drag to
@@ -22,6 +20,8 @@ WebSocket per tab.
 
 ## Card states
 
+{{diagram:card-states}}
+
 | State | Meaning |
 |-------|---------|
 | **Spawning** | tmux session starting, claude booting. |
@@ -30,8 +30,6 @@ WebSocket per tab.
 | **Needs you** | Claude is blocked on a permission/plan dialog. Click in. |
 | **Quiet** | Claude is idle. Usually waiting for review feedback. |
 | **Merged** | PR merged; session tearing down. |
-
-![Settings → Orchestrator](img/settings.png)
 
 ## Settings
 
