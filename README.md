@@ -27,9 +27,14 @@ Access your dashboard at https://username.orchid.littledivy.com
 
 See [./swarm.hcl](swarm.hcl)
 
-## Supervising from your phone
+## Chat with your orchid
 
-Orchid pairs nicely with a self-hosted chat agent (OpenClaw, Hermes Agent).
-The agent reads `SKILL.md` as its skill file and talks to orchid over SSH
-+ `gh` so you can check status, file work, or restart the swarm from
-Telegram/Slack/Discord. See [docs/SUPERVISION.md](docs/SUPERVISION.md).
+Point any chat-agent runtime (OpenClaw, Hermes, Claude Code) at
+<https://orchid.littledivy.com/skill.md> and you get a
+Telegram/Slack/Discord bot that knows your swarm. One paste:
+
+```bash
+npx -y @openclaw/cli@latest skill install https://orchid.littledivy.com/skill.md
+```
+
+See [docs/SUPERVISION.md](docs/SUPERVISION.md).
