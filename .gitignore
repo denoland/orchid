@@ -58,7 +58,8 @@ cf/public/docs/
 capture/macos/.build/
 capture/macos/Package.resolved
 capture/ios/OrchidCapture.xcodeproj/
-capture/ios/OrchidCaptureSources/
+capture/ios/OrchidCaptureSources/.swiftpm/
+capture/ios/OrchidCaptureSources/xcode/
 capture/ios/build/
 
 # Misc tooling
