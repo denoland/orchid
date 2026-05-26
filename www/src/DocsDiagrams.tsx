@@ -237,6 +237,60 @@ export function CardStatesDiagram() {
   return <Diagram nodes={stateNodes} edges={stateEdges} height={300} />
 }
 
+// ─── targets: one issue → label gate → three target repos ───
+const targetNodes: Node<BoxData>[] = [
+  { id: 'issue',  position: { x:   0, y: 110 }, data: { label: 'Inbox issue',      sub: 'labels: clawpatrol', tone: 'muted' } },
+  { id: 'gate',   position: { x: 260, y: 110 }, data: { label: 'Match target.label', tone: 'amber', shape: 'pill' } },
+  { id: 'deno',   position: { x: 520, y:  20 }, data: { label: 'denoland/deno',    sub: 'target "deno"',      tone: 'emerald' } },
+  { id: 'cp',     position: { x: 520, y: 110 }, data: { label: 'denoland/clawpatrol', sub: 'target "clawpatrol"', tone: 'purple' } },
+  { id: 'orchid', position: { x: 520, y: 200 }, data: { label: 'denoland/orchid',  sub: 'target "orchid"',    tone: 'muted' } },
+]
+const targetEdges: Edge[] = [
+  { id: 'e1', source: 'issue', target: 'gate',   sourceHandle: 'r', targetHandle: 'l' },
+  { id: 'e2', source: 'gate',  target: 'deno',   sourceHandle: 'r', targetHandle: 'l', label: 'label=deno',       style: { stroke: '#a1a1aa', strokeDasharray: '4 3' }, markerEnd: { type: MarkerType.ArrowClosed, color: '#a1a1aa', width: 16, height: 16 } },
+  { id: 'e3', source: 'gate',  target: 'cp',     sourceHandle: 'r', targetHandle: 'l', label: 'label=clawpatrol' },
+  { id: 'e4', source: 'gate',  target: 'orchid', sourceHandle: 'r', targetHandle: 'l', label: 'label=orchid',     style: { stroke: '#a1a1aa', strokeDasharray: '4 3' }, markerEnd: { type: MarkerType.ArrowClosed, color: '#a1a1aa', width: 16, height: 16 } },
+]
+export function TargetsDiagram() {
+  return <Diagram nodes={targetNodes} edges={targetEdges} height={320} />
+}
+
+// ─── security: defense-in-depth layers around a claude session ───
+const secNodes: Node<BoxData>[] = [
+  { id: 'issue',   position: { x:   0, y: 110 }, data: { label: 'Inbox issue',      sub: 'untrusted body',         tone: 'rose' } },
+  { id: 'orch',    position: { x: 230, y: 110 }, data: { label: 'orch',             sub: 'gates by label',         tone: 'muted' } },
+  { id: 'claw',    position: { x: 460, y: 110 }, data: { label: 'clawpatrol',       sub: 'egress allow-list',      tone: 'purple', shape: 'pill' } },
+  { id: 'user',    position: { x: 690, y: 110 }, data: { label: 'runuser → orchid', sub: 'non-root, AppArmor',     tone: 'amber' } },
+  { id: 'claude',  position: { x: 920, y: 110 }, data: { label: 'claude session',   sub: 'tmux pane',              tone: 'ink' } },
+]
+const secEdges: Edge[] = [
+  { id: 'e1', source: 'issue',  target: 'orch',   sourceHandle: 'r', targetHandle: 'l' },
+  { id: 'e2', source: 'orch',   target: 'claw',   sourceHandle: 'r', targetHandle: 'l' },
+  { id: 'e3', source: 'claw',   target: 'user',   sourceHandle: 'r', targetHandle: 'l' },
+  { id: 'e4', source: 'user',   target: 'claude', sourceHandle: 'r', targetHandle: 'l' },
+]
+export function SecurityDiagram() {
+  return <Diagram nodes={secNodes} edges={secEdges} height={260} />
+}
+
+// ─── tailnet: a few orchid nodes connected through the tailnet ───
+const tailNodes: Node<BoxData>[] = [
+  { id: 'home',    position: { x:   0, y:  20 }, data: { label: 'home box',     sub: '100.64.1.5',  tone: 'emerald' } },
+  { id: 'vps',     position: { x:   0, y: 200 }, data: { label: 'vps fra1',     sub: '100.64.1.9',  tone: 'emerald' } },
+  { id: 'phone',   position: { x:   0, y: 110 }, data: { label: 'your phone',   sub: '100.64.1.2',  tone: 'muted' } },
+  { id: 'mesh',    position: { x: 320, y: 110 }, data: { label: 'tailnet',      sub: 'WireGuard mesh',  tone: 'purple', shape: 'pill' } },
+  { id: 'central', position: { x: 640, y: 110 }, data: { label: 'orch central', sub: 'no public IP',    tone: 'ink' } },
+]
+const tailEdges: Edge[] = [
+  { id: 'e1', source: 'home',    target: 'mesh',    sourceHandle: 'r', targetHandle: 'l' },
+  { id: 'e2', source: 'phone',   target: 'mesh',    sourceHandle: 'r', targetHandle: 'l' },
+  { id: 'e3', source: 'vps',     target: 'mesh',    sourceHandle: 'r', targetHandle: 'l' },
+  { id: 'e4', source: 'mesh',    target: 'central', sourceHandle: 'r', targetHandle: 'l', label: 'ssh / https' },
+]
+export function TailnetDiagram() {
+  return <Diagram nodes={tailNodes} edges={tailEdges} height={320} />
+}
+
 // ─── registry: marker name → component ───
 export const DIAGRAMS: Record<string, React.FC> = {
   architecture: ArchitectureDiagram,
@@ -246,4 +300,7 @@ export const DIAGRAMS: Record<string, React.FC> = {
   capture:      CaptureDiagram,
   journey:      SignupJourneyDiagram,
   'card-states': CardStatesDiagram,
+  targets:      TargetsDiagram,
+  security:     SecurityDiagram,
+  tailnet:      TailnetDiagram,
 }

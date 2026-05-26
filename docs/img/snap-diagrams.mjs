@@ -12,6 +12,9 @@ const shots = [
   { file: 'diagram-capture.png',      path: '/docs/capture' },
   { file: 'diagram-journey.png',      path: '/docs/getting-started' },
   { file: 'diagram-card-states.png',  path: '/docs/dashboard' },
+  { file: 'diagram-targets.png',      path: '/docs/targets' },
+  { file: 'diagram-security.png',     path: '/docs/security' },
+  { file: 'diagram-tailnet.png',      path: '/docs/tailscale' },
 ]
 
 async function main() {

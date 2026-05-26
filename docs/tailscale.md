@@ -2,6 +2,8 @@
 
 {{illust:vine-mesh}}
 
+{{diagram:tailnet}}
+
 The relay (`orchid.littledivy.com`) is one way to reach your
 dashboard without a public IP. **Tailscale** is the other: spin up
 your own private mesh, run orch on a node, and hit it from any

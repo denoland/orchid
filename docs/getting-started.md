@@ -2,6 +2,8 @@
 
 {{illust:bud}}
 
+{{diagram:journey}}
+
 Orchid is a swarm of coding agents that ship pull requests. You file
 issues; orchid spawns a `claude` (or codex) session for each one,
 relays reviews and CI, and tears down once the PR merges. This guide
@@ -13,6 +15,8 @@ Visit [orchid.littledivy.com](https://orchid.littledivy.com) and click
 **Sign in with GitHub**. After OAuth, you're given a personal
 subdomain — `<your-github-handle>.orchid.littledivy.com` — and an
 agent token.
+
+{{mockup:install}}
 
 ## 2. Install on a machine
 
