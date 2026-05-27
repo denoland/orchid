@@ -4,10 +4,13 @@ go 1.25.0
 
 require (
 	github.com/coder/websocket v1.8.14
+	github.com/divy/orchid/cfrelaytun/go/cfrelaytun v0.0.0-00010101000000-000000000000
 	github.com/hashicorp/hcl/v2 v2.20.1
 	github.com/zclconf/go-cty v1.13.0
 	modernc.org/sqlite v1.50.0
 )
+
+replace github.com/divy/orchid/cfrelaytun/go/cfrelaytun => ./cfrelaytun/go/cfrelaytun
 
 require (
 	github.com/agext/levenshtein v1.2.1 // indirect

@@ -1,0 +1,35 @@
+{
+  "name": "cfrelaytun",
+  "version": "0.1.0",
+  "description": "Self-hosted ngrok-style HTTP tunnel on Cloudflare Workers + Durable Objects.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "module": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "wrangler.example.jsonc",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc --noEmit",
+    "deploy:example": "wrangler deploy --config example/wrangler.jsonc"
+  },
+  "peerDependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "hono": "^4.0.0",
+    "typescript": "^5.4.0",
+    "wrangler": "^4.0.0"
+  }
+}
