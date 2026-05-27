@@ -56,16 +56,31 @@ say()  { printf "\033[1;35m▶\033[0m %s\n" "$*"; }
 note() { printf "  %s\n" "$*"; }
 die()  { printf "\033[1;31m✗\033[0m %s\n" "$*" >&2; exit 1; }
 
-# Refuse to keep running as root — the script is designed around a
-# user-owned install. Root-mode installs are the legacy path; nothing
-# below assumes / wants UID 0.
-if [ "$(id -u)" -eq 0 ]; then
-  die "run as your normal user, not root. sudo is invoked internally only where needed."
+# Detect privilege + init system. The default path is a user-owned
+# install on a systemd box; running as root in a container (no sudo,
+# no systemd) is supported too — common on exe.dev / fly machines /
+# bare docker — by falling back to a nohup-managed launch script.
+IS_ROOT=0
+[ "$(id -u)" -eq 0 ] && IS_ROOT=1
+HAS_SYSTEMD=0
+# Probing the binary isn't enough — containers ship the systemctl CLI
+# even when PID 1 is some other init. /run/systemd/system only exists
+# when systemd is actually running as the system manager.
+[ -d /run/systemd/system ] && HAS_SYSTEMD=1
+
+if [ "$IS_ROOT" -eq 0 ] && ! command -v sudo >/dev/null; then
+  die "sudo not found — install sudo, or run as root inside a container"
 fi
 
-if ! command -v sudo >/dev/null; then
-  die "sudo not found — install sudo (or run inside a shell with it on PATH)"
-fi
+# as_root runs the given command with root privilege. When already
+# root, it execs directly; otherwise it goes through sudo.
+as_root() {
+  if [ "$IS_ROOT" -eq 1 ]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
 
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; esac
@@ -73,8 +88,7 @@ if [ "$OS" != linux ]; then
   cat >&2 <<EOF
 ✗ unsupported OS: $OS
 
-The orch daemon is Linux-only (uses systemd for the user service and
-unix permissions on the worker home dirs). On macOS, sign up at
+The orch daemon is Linux-only. On macOS, sign up at
 https://orchid.littledivy.com instead and use \`orch join\` to attach
 this Mac as a worker — the central daemon stays in the cloud.
 
@@ -83,16 +97,44 @@ container or VM (Docker, OrbStack, Lima, etc).
 EOF
   exit 1
 fi
-command -v systemctl >/dev/null || die "systemd required"
 
-say "installing prerequisites (will prompt for sudo)"
+# Pick a package manager + install prereqs. apt and dnf both ship `gh`
+# from their own repos on recent distros; for older ones the install
+# may need https://cli.github.com/packages instructions instead.
+say "installing prerequisites${IS_ROOT:+ (as root)}"
 if command -v apt-get >/dev/null; then
-  sudo apt-get update -qq
-  sudo apt-get install -y -qq git tmux openssl openssh-client openssh-server curl gh jq >/dev/null
+  as_root apt-get update -qq
+  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    git tmux openssl openssh-client openssh-server curl jq ca-certificates >/dev/null
 elif command -v dnf >/dev/null; then
-  sudo dnf install -y -q git tmux openssl openssh-clients openssh-server curl gh jq >/dev/null
+  as_root dnf install -y -q git tmux openssl openssh-clients openssh-server curl jq >/dev/null
 else
-  die "no apt-get or dnf — install git tmux openssl openssh curl gh jq manually"
+  die "no apt-get or dnf — install git tmux openssl openssh curl jq manually"
+fi
+
+# Always install gh from GitHub's own apt/dnf repo: the version shipped
+# by older distros (e.g. Ubuntu 22.04 → gh 2.4) is missing flags this
+# script uses for non-interactive auth setup. Already-current installs
+# are a no-op.
+GH_OK=0
+if command -v gh >/dev/null; then
+  GH_VER=$(gh --version 2>/dev/null | awk 'NR==1{print $3}' | cut -d. -f1)
+  [ "${GH_VER:-0}" -ge 2 ] && gh auth setup-git --help >/dev/null 2>&1 && GH_OK=1
+fi
+if [ "$GH_OK" -ne 1 ]; then
+  if command -v apt-get >/dev/null; then
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get -y -qq purge gh >/dev/null 2>&1 || true
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
+      as_root dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg status=none
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
+      as_root tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+    as_root apt-get update -qq
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh >/dev/null
+  elif command -v dnf >/dev/null; then
+    as_root dnf install -y -q 'dnf-command(config-manager)' >/dev/null
+    as_root dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo >/dev/null
+    as_root dnf install -y -q gh >/dev/null
+  fi
 fi
 
 # gh handles its own credential helper; orch shells out to `gh` for every
@@ -164,12 +206,37 @@ EMBED_DIR="$SRC_DIR/internal/orch/embed-dist"
 mkdir -p "$EMBED_DIR"
 [ -e "$EMBED_DIR/.placeholder" ] || echo "served via relay" > "$EMBED_DIR/.placeholder"
 if [ -d "$SRC_DIR/www" ] && [ -f "$SRC_DIR/www/package.json" ]; then
-  if ! command -v bun >/dev/null; then
-    say "installing bun (needed to build the dashboard)"
-    curl -fsSL https://bun.sh/install | bash >/dev/null
-    export PATH="$HOME/.bun/bin:$PATH"
+  # Vite needs Node 20+. Ubuntu 22.04 ships node 12 in the default repo,
+  # so check the version and fall back to NodeSource for a current LTS.
+  NODE_OK=0
+  if command -v node >/dev/null; then
+    NODE_MAJOR=$(node -e 'process.stdout.write(String(process.versions.node.split(".")[0]))' 2>/dev/null || echo 0)
+    [ "${NODE_MAJOR:-0}" -ge 20 ] && NODE_OK=1
   fi
-  ( cd "$SRC_DIR/www" && bun install --silent && bun run build >/dev/null )
+  if [ "$NODE_OK" -ne 1 ]; then
+    say "installing nodejs 20 (needed to build the dashboard)"
+    if command -v apt-get >/dev/null; then
+      # Strip any old packaged libnode/nodejs first — the NodeSource .deb
+      # ships overlapping /usr/include/node files and dpkg refuses to
+      # overwrite a distro-managed file from another package.
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get -y -qq purge \
+        nodejs libnode-dev libnode72 'node-*' >/dev/null 2>&1 || true
+      if [ "$IS_ROOT" -eq 1 ]; then
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+      else
+        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null
+      fi
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs >/dev/null
+    elif command -v dnf >/dev/null; then
+      if [ "$IS_ROOT" -eq 1 ]; then
+        curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null
+      else
+        curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo -E bash - >/dev/null
+      fi
+      as_root dnf install -y -q nodejs >/dev/null
+    fi
+  fi
+  ( cd "$SRC_DIR/www" && npm install --silent --no-audit --no-fund && npm run build --silent >/dev/null )
 fi
 
 say "building orch binary"
@@ -189,9 +256,16 @@ fi
 
 if [ "$WORKER" = "1" ]; then
   # Worker hosts don't run the orchestrator daemon — central drives them
-  # over SSH. Just make sure sshd is up so `orch join vm` can hand the
+  # over SSH. Make sure sshd is up so `orch join vm` can hand the
   # central host a working SSH endpoint.
-  sudo systemctl enable --now ssh 2>/dev/null || sudo systemctl enable --now sshd 2>/dev/null || true
+  if [ "$HAS_SYSTEMD" -eq 1 ]; then
+    as_root systemctl enable --now ssh 2>/dev/null || as_root systemctl enable --now sshd 2>/dev/null || true
+  else
+    # Container path: start sshd directly. exe.dev / docker images ship
+    # the daemon but no service manager.
+    as_root mkdir -p /run/sshd
+    pgrep -x sshd >/dev/null || as_root /usr/sbin/sshd -D >/dev/null 2>&1 &
+  fi
   cat <<EOF
 
 \033[1;32m✓ orchid worker prerequisites installed\033[0m
@@ -283,23 +357,25 @@ EOF
 chmod 600 "$INSTALL_DIR/env"
 
 # Disable AppArmor's restriction on unprivileged user namespaces so
-# claude can build its own sandbox. Persists to /etc/sysctl.d.
+# claude can build its own sandbox. Best-effort: containers have
+# read-only /proc, so swallow failures.
 if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-  echo "kernel.apparmor_restrict_unprivileged_userns=0" | sudo tee /etc/sysctl.d/99-orchid.conf >/dev/null
-  sudo sysctl -p /etc/sysctl.d/99-orchid.conf >/dev/null 2>&1 || true
+  echo "kernel.apparmor_restrict_unprivileged_userns=0" | as_root tee /etc/sysctl.d/99-orchid.conf >/dev/null 2>&1 || true
+  as_root sysctl -p /etc/sysctl.d/99-orchid.conf >/dev/null 2>&1 || true
 fi
 
-# Enable user-service lingering so the daemon keeps running after the
-# install shell exits. Requires root; everything else below is per-user.
-sudo loginctl enable-linger "$USER" >/dev/null
+LAUNCH_CMD="$BIN_DIR/orch -config $INSTALL_DIR/swarm.hcl"
 
-# Make sure systemctl --user can reach the user manager from this shell.
-# Linger guarantees the manager is up; XDG_RUNTIME_DIR points us at it.
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [ "$HAS_SYSTEMD" -eq 1 ]; then
+  # Standard path: per-user systemd service + linger so it survives logout.
+  if [ "$IS_ROOT" -eq 0 ]; then
+    as_root loginctl enable-linger "$USER" >/dev/null
+  fi
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
-UNIT_DIR="$HOME/.config/systemd/user"
-mkdir -p "$UNIT_DIR"
-cat > "$UNIT_DIR/orchid.service" <<EOF
+  UNIT_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/orchid.service" <<EOF
 [Unit]
 Description=Orchid swarm orchestrator (user)
 After=network.target
@@ -309,7 +385,7 @@ Type=simple
 # RELAY_URL / RELAY_TOKEN come from $INSTALL_DIR/env after the operator
 # runs \`orch join <url> <token>\`. Empty values turn the relay agent
 # into a no-op so the daemon still runs locally pre-join.
-ExecStart=$BIN_DIR/orch -config $INSTALL_DIR/swarm.hcl -relay=\${RELAY_URL} -relay-token=\${RELAY_TOKEN}
+ExecStart=$LAUNCH_CMD -relay=\${RELAY_URL} -relay-token=\${RELAY_TOKEN}
 EnvironmentFile=$INSTALL_DIR/env
 WorkingDirectory=$INSTALL_DIR
 Restart=always
@@ -321,22 +397,57 @@ StandardError=append:$INSTALL_DIR/orch.log
 WantedBy=default.target
 EOF
 
-systemctl --user daemon-reload
-systemctl --user enable --now orchid
+  systemctl --user daemon-reload
+  systemctl --user enable --now orchid
 
-sleep 2
-if systemctl --user is-active --quiet orchid; then
-  IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-  cat <<EOF
+  sleep 2
+  systemctl --user is-active --quiet orchid || die "orchid failed to start. check: journalctl --user -u orchid -n 50"
+  LOG_HINT="journalctl --user -u orchid -f   (or $INSTALL_DIR/orch.log)"
+  STOP_HINT="systemctl --user stop orchid"
+else
+  # Container fallback: no systemd, manage with nohup + a pidfile. The
+  # daemon respawn loop is more anemic than systemd's, but tmux sessions
+  # outlive the orch process so this is fine for development swarms.
+  cat > "$INSTALL_DIR/run.sh" <<EOF
+#!/usr/bin/env bash
+# Boot orchid in the background. Re-run to restart.
+set -e
+PIDFILE="$INSTALL_DIR/orch.pid"
+if [ -f "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE")" 2>/dev/null; then
+  kill "\$(cat "\$PIDFILE")"
+  sleep 1
+fi
+# shellcheck disable=SC1091
+set -a; . "$INSTALL_DIR/env"; set +a
+cd "$INSTALL_DIR"
+nohup $LAUNCH_CMD -relay="\${RELAY_URL:-}" -relay-token="\${RELAY_TOKEN:-}" \\
+  >> "$INSTALL_DIR/orch.log" 2>&1 &
+echo \$! > "\$PIDFILE"
+echo "orchid: started pid=\$(cat "\$PIDFILE"). tail $INSTALL_DIR/orch.log"
+EOF
+  chmod +x "$INSTALL_DIR/run.sh"
+  "$INSTALL_DIR/run.sh"
+  sleep 2
+  PID=$(cat "$INSTALL_DIR/orch.pid" 2>/dev/null || echo "")
+  if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
+    die "orchid failed to start. check: tail -50 $INSTALL_DIR/orch.log"
+  fi
+  LOG_HINT="tail -F $INSTALL_DIR/orch.log"
+  STOP_HINT="kill \$(cat $INSTALL_DIR/orch.pid)   (or re-run $INSTALL_DIR/run.sh)"
+fi
+
+IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+cat <<EOF
 
 \033[1;32m✓ orchid is running\033[0m
 
   dashboard : http://${IP:-localhost}:8000/?token=$HTTP_SECRET
   capture   : http://${IP:-localhost}:8000/api/drafts
                  header X-Capture-Token: $CAPTURE_TOKEN
-  state     : $INSTALL_DIR/state.json
-  log       : journalctl --user -u orchid -f   (or $INSTALL_DIR/orch.log)
+  state     : $INSTALL_DIR/state.db
+  log       : $LOG_HINT
   config    : $INSTALL_DIR/swarm.hcl
+  stop      : $STOP_HINT
 
 If $BIN_DIR isn't on your PATH, add to ~/.bashrc / ~/.zshrc:
   export PATH="$BIN_DIR:\$PATH"
@@ -347,6 +458,3 @@ next:
   - add a worker VM: on that VM run install.sh with WORKER=1, then
       orch join vm http://${IP:-this-host}:8000 $HTTP_SECRET
 EOF
-else
-  die "orchid failed to start. check: journalctl --user -u orchid -n 50"
-fi
