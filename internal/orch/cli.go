@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	osuser "os/user"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -333,17 +334,19 @@ func knownHostHas(path, host string) bool {
 	return false
 }
 
-// lookupHome returns the home directory for a system user.
+// lookupHome returns the home directory for a system user. Uses Go's
+// os/user (cgo path on darwin reads dscl; pure-Go on linux reads
+// /etc/passwd) so the worker join works on both platforms without
+// shelling out to getent (which only exists on glibc systems).
 func lookupHome(user string) (string, error) {
-	out, err := exec.Command("getent", "passwd", user).Output()
+	u, err := osuser.Lookup(user)
 	if err != nil {
-		return "", fmt.Errorf("getent passwd %s: %w", user, err)
+		return "", fmt.Errorf("lookup %s: %w", user, err)
 	}
-	parts := strings.Split(strings.TrimSpace(string(out)), ":")
-	if len(parts) < 6 {
-		return "", fmt.Errorf("malformed passwd entry for %s", user)
+	if u.HomeDir == "" {
+		return "", fmt.Errorf("user %s has no home directory", user)
 	}
-	return parts[5], nil
+	return u.HomeDir, nil
 }
 
 // handleVMJoin is the server-side counterpart to runJoinVM. Auth is
@@ -634,12 +637,11 @@ func Main() {
 				if vm == nil {
 					continue
 				}
-				out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s -S -120 2>/dev/null | tail -120", j.Tmux))
+				out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s 2>/dev/null | tail -8", j.Tmux))
 				if err != nil {
 					continue
 				}
 				paneActivityRecordTick(j.Tmux, fnv64(out))
-				canvasInjectLinks(st, j.Tmux, out)
 				needs := panePrompted(out, vmAgent(*vm))
 				if paneNeedsInputSet(j.Tmux, needs) {
 					if st.Bcast != nil {
@@ -652,7 +654,6 @@ func Main() {
 			}
 			paneActivityPrune(live)
 			paneNeedsInputPrune(live)
-			seenLinksPrune(live)
 		}
 	}()
 
