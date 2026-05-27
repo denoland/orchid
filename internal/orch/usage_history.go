@@ -256,12 +256,5 @@ func backfillIssue(projectsRoot string, store *Store) (int, error) {
 // claude-user on the given VM. Mirrors the lookup in tailStatusLine
 // so both feeds read from the same home dir.
 func projectsRootFor(vm VMBlock) string {
-	home := vm.SessionHome
-	if home == "" && vm.User != "" {
-		home = "/home/" + vm.User
-	}
-	if home == "" {
-		home = "/home/orchid"
-	}
-	return fmt.Sprintf("%s/.claude/projects", home)
+	return fmt.Sprintf("%s/.claude/projects", claudeHome(vm))
 }

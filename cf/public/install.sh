@@ -69,7 +69,20 @@ fi
 
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; esac
-[ "$OS" = linux ] || die "unsupported OS: $OS (orchid needs systemd, Linux only)"
+if [ "$OS" != linux ]; then
+  cat >&2 <<EOF
+✗ unsupported OS: $OS
+
+The orch daemon is Linux-only (uses systemd for the user service and
+unix permissions on the worker home dirs). On macOS, sign up at
+https://orchid.littledivy.com instead and use \`orch join\` to attach
+this Mac as a worker — the central daemon stays in the cloud.
+
+If you want to self-host the daemon, run install.sh inside a Linux
+container or VM (Docker, OrbStack, Lima, etc).
+EOF
+  exit 1
+fi
 command -v systemctl >/dev/null || die "systemd required"
 
 say "installing prerequisites (will prompt for sudo)"
@@ -142,13 +155,25 @@ else
   gh repo clone "$ORCHID_REPO" "$SRC_DIR" -- --quiet --depth 1
 fi
 
+say "building dashboard SPA"
+# The orch binary //go:embed internal/orch/embed-dist for the self-hosted
+# dashboard. Relay-served deploys serve the SPA from CF's ASSETS binding,
+# so for those a placeholder is enough; here we always build the SPA so
+# `http://host:8000/` actually loads in a browser.
+EMBED_DIR="$SRC_DIR/internal/orch/embed-dist"
+mkdir -p "$EMBED_DIR"
+[ -e "$EMBED_DIR/.placeholder" ] || echo "served via relay" > "$EMBED_DIR/.placeholder"
+if [ -d "$SRC_DIR/www" ] && [ -f "$SRC_DIR/www/package.json" ]; then
+  if ! command -v bun >/dev/null; then
+    say "installing bun (needed to build the dashboard)"
+    curl -fsSL https://bun.sh/install | bash >/dev/null
+    export PATH="$HOME/.bun/bin:$PATH"
+  fi
+  ( cd "$SRC_DIR/www" && bun install --silent && bun run build >/dev/null )
+fi
+
 say "building orch binary"
-# orch.go //go:embed www/dist for the self-hosted dashboard. Relay-served
-# deploys serve the SPA from CF's ASSETS binding, so the embedded copy
-# is unused there — a placeholder is enough to satisfy //go:embed.
-mkdir -p "$SRC_DIR/www/dist"
-[ -e "$SRC_DIR/www/dist/.placeholder" ] || echo "served via relay" > "$SRC_DIR/www/dist/.placeholder"
-( cd "$SRC_DIR" && CGO_ENABLED=0 "$GO_BIN" build -o "$BIN_DIR/orch.new" . )
+( cd "$SRC_DIR" && CGO_ENABLED=0 "$GO_BIN" build -o "$BIN_DIR/orch.new" ./cmd/orch )
 mv "$BIN_DIR/orch.new" "$BIN_DIR/orch"
 chmod +x "$BIN_DIR/orch"
 
@@ -201,6 +226,13 @@ fi
 HTTP_SECRET=${HTTP_SECRET:-$(openssl rand -hex 16)}
 CAPTURE_TOKEN=${CAPTURE_TOKEN:-$(openssl rand -hex 16)}
 
+# Bot login = GitHub account orch commits/PRs as. Defaults to the logged-in
+# gh user. Orchid refuses to start without one set.
+BOT_LOGIN=${BOT_LOGIN:-$(gh api user --jq .login 2>/dev/null || echo "")}
+if [ -z "$BOT_LOGIN" ]; then
+  die "could not detect a GitHub login via gh. Set BOT_LOGIN=<your-gh-user> and re-run."
+fi
+
 mkdir -p "$INSTALL_DIR/captures" "$INSTALL_DIR/vm-keys" "$INSTALL_DIR/orch-work"
 chmod 700 "$INSTALL_DIR/vm-keys"
 
@@ -212,6 +244,7 @@ github {
 }
 
 orchestrator {
+  bot_login     = "$BOT_LOGIN"
   poll_interval = "30s"
   state_db      = "$INSTALL_DIR/state.db"
   branch_prefix = "orch/"
