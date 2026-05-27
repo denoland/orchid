@@ -1,115 +1,62 @@
-/// Per-user Durable Object. Holds the agent's outbound WebSocket and routes
-/// requests/responses across it. Frame protocol is inlined below — every
-/// frame either carries JSON (control) or a 4-byte big-endian stream-id
-/// prefix followed by a raw body chunk (binary).
-type Frame =
-  | { t: 'req'; id: number; method: string; path: string; headers: [string, string][]; hasBody: boolean }
-  | { t: 'req-end'; id: number }
-  | { t: 'res-head'; id: number; status: number; headers: [string, string][]; streaming: boolean }
-  | { t: 'res-end'; id: number }
-  | { t: 'cancel'; id: number }
-  | { t: 'hello'; userId: number; login: string }
-  | { t: 'pong' }
-  | { t: 'ws-open'; id: number; path: string; headers: [string, string][] }
-  | { t: 'ws-text'; id: number; data: string }
-  | { t: 'ws-close'; id: number; code?: number; reason?: string }
-  // Orch pushes a fresh /api/state body on every change. Relay caches
-  // the latest and fans out to every browser subscribed via
-  // /api/events/ws — replaces the dashboard's 3s polling loop.
-  | { t: 'state-update'; state: unknown }
-  // Snap (dashboard layout) push: orch ships the latest snap.json
-  // body to relay on every reconnect, relay caches it in DO storage
-  // and fans it out to events subscribers. Browser writes flow back
-  // through the same channel as `snap-put` frames.
-  | { t: 'snap'; snap: unknown }
-  | { t: 'snap-put'; snap: unknown }
-  // Pane mux: browser asks orch (via relay) to start/stop a tmux
-  // capture stream, frames come back as `pane` carrying the same
-  // base64+gzip body the SSE endpoint used to write.
-  | { t: 'pane-sub'; paneId: string; cols?: number; rows?: number }
-  | { t: 'pane-unsub'; paneId: string }
-  | { t: 'pane'; paneId: string; data: string }
-
-function encodeBinary(streamId: number, chunk: Uint8Array): Uint8Array {
-  const out = new Uint8Array(4 + chunk.byteLength)
-  new DataView(out.buffer).setUint32(0, streamId, false)
-  out.set(chunk, 4)
-  return out
-}
-function decodeBinary(buf: ArrayBuffer): { streamId: number; chunk: Uint8Array } {
-  return { streamId: new DataView(buf).getUint32(0, false), chunk: new Uint8Array(buf, 4) }
-}
+/// Per-user Durable Object. Subclasses cfrelaytun's TunnelSession for the
+/// HTTP/WS proxy protocol (req/res/ws-* frames, stream multiplex, agent
+/// hibernation) and layers orchid-specific behavior on top:
+///   - GitHub OAuth-derived owner + allowedLogins gating
+///   - /api/state push fanout to dashboard tabs (state-update frame)
+///   - snap.json layout sync (snap, snap-put frames)
+///   - tmux pane stream fanout (pane frame)
+///   - per-tab cursor + presence broadcast on the events WS
+import { defineTunnelSession } from 'cfrelaytun'
 
 interface Env {
   USER: DurableObjectNamespace
   ROOT_DOMAIN: string
 }
 
-interface PendingStream {
-  res: { resolve: (r: Response) => void; reject: (e: Error) => void }
-  status?: number
-  headers?: Headers
-  body?: { controller: ReadableStreamDefaultController<Uint8Array>; stream: ReadableStream<Uint8Array> }
-  streaming?: boolean
-  ws?: WebSocket // browser-side WS for ws-multiplexed streams
-}
-
 export function userSubdomain(login: string): string {
   return login.toLowerCase().replace(/[^a-z0-9-]/g, '')
 }
 
-export class UserSession {
-  state: DurableObjectState
-  env: Env
-  agentWS: WebSocket | null = null
+// Token validation lives in the subclass (per-DO state) so the agentToken
+// option here returns null — handleAgent is overridden below.
+const Base = defineTunnelSession<Env>({
+  // routing/rootDomain isn't used: the orchid Worker (cf/src/index.ts)
+  // handles routing and calls into the DO directly.
+  routing: { mode: 'subdomain', rootDomain: '' },
+  agentToken: () => null,
+})
+
+export class UserSession extends Base {
   agentToken: string | null = null
   uid: number | null = null
   login: string | null = null
   ghToken: string | null = null  // user's GitHub OAuth access token; lets the dashboard fetch their repo list
+
   // Lowercased GitHub logins the orch operator allows in addition to the
   // owner. Pushed by the agent on connect via the "config" frame so the
   // source of truth stays in the operator's swarm.hcl. Not persisted —
   // if the agent reconnects with a new list, that's what counts.
   allowedLogins: string[] = []
-  nextStreamId = 1
-  streams = new Map<number, PendingStream>()
-  // In-memory snapshot of the user's GitHub repo list. Cached for the DO
-  // isolate's lifetime up to TTL — the Settings page is opened rarely,
-  // but when it is it pulls 3 pages × 100 repos from api.github.com every
-  // open. A 5-minute TTL keeps the dropdown fresh without re-fanning out.
+
   reposCache: { body: string; expires: number } | null = null
-  // Latest /api/state body the agent pushed. Held in memory so a fresh
-  // subscriber gets the current snapshot immediately on /api/events/ws
-  // open — they don't have to wait for the next state change to render.
   lastState: string | null = null
-  // Cached snap (dashboard layout). Mirrors orch's snap.json so new
-  // tabs render their canvas without a separate fetch. Persisted to DO
-  // storage so it survives eviction even if orch is offline.
   lastSnap: string | null = null
+  lastSubCount = -1
 
   constructor(state: DurableObjectState, env: Env) {
-    this.state = state
-    this.env = env
+    super(state, env)
     state.blockConcurrencyWhile(async () => {
       this.agentToken = (await state.storage.get('token')) ?? null
       this.uid = (await state.storage.get('uid')) ?? null
       this.login = (await state.storage.get('login')) ?? null
       this.ghToken = (await state.storage.get('ghToken')) ?? null
       this.lastSnap = (await state.storage.get('lastSnap')) ?? null
-      // Resurrect the agent WS that Cloudflare held open across DO
-      // eviction. Without this, every cold start reports
-      // `connected: false` until the agent's next reconnect — which
-      // can be minutes away if the original socket is still alive.
-      const existing = state.getWebSockets('agent')
-      if (existing.length > 0) {
-        this.agentWS = existing[0] as unknown as WebSocket
-      }
     })
   }
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url)
-    if (url.pathname === '/agent') return this.handleAgent(req)
+    if (url.pathname === '/agent') return this.handleAgentOrchid(req)
     if (url.pathname === '/_mint') return this.handleMint(req)
     if (url.pathname === '/_proxy') return this.handleProxy(req)
     if (url.pathname === '/_proxy_ws') return this.handleProxyWS(req)
@@ -122,25 +69,279 @@ export class UserSession {
     return new Response('not found', { status: 404 })
   }
 
-  // Stash the just-completed-OAuth user's access token. Used later by
-  // the Settings page to list their repos for the inbox / target
-  // pickers without re-running the OAuth dance.
+  // Overridden agent handshake: validates against the per-DO stored token
+  // (the lib's options.agentToken hook can't reach DO state) and sends an
+  // orchid-flavoured hello with the resolved uid/login.
+  private async handleAgentOrchid(req: Request): Promise<Response> {
+    if (req.headers.get('upgrade') !== 'websocket') {
+      return new Response('expected websocket', { status: 426 })
+    }
+    const url = new URL(req.url)
+    const token = url.searchParams.get('token') ?? req.headers.get('x-agent-token')
+    if (!this.agentToken || token !== this.agentToken) {
+      return new Response('auth', { status: 401 })
+    }
+
+    const pair = new WebSocketPair()
+    const client = pair[0]
+    const server = pair[1]
+    if (this.agentWS) {
+      try { this.agentWS.close(4000, 'replaced by new agent') } catch {}
+    }
+    this.state.acceptWebSocket(server, ['agent'])
+    this.agentWS = server
+    server.send(JSON.stringify({ t: 'hello', userId: this.uid ?? 0, login: this.login ?? '' }))
+    this.broadcastRelayInfo()
+    this.lastSubCount = -1
+    this.notifySubs(true)
+    return new Response(null, { status: 101, webSocket: client })
+  }
+
+  // Class-level hibernation hook. Intercepts events-tagged subscriber
+  // frames and orchid-specific agent extension frames before delegating
+  // the HTTP/WS protocol frames to the base class.
+  async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer) {
+    try {
+      const tags = this.state.getTags(ws) ?? []
+      if (tags.includes('events')) {
+        return this.handleEventsFrame(ws, data)
+      }
+      // Agent WS: try orchid extension frames first.
+      if (typeof data === 'string') {
+        let f: any
+        try { f = JSON.parse(data) } catch { return }
+        if (this.handleAgentExtension(f)) return
+      }
+      // Fall through to the base lib (req/res/cancel/ws-* + binary stream).
+      return super.webSocketMessage(ws, data)
+    } catch {}
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    const wasAgent = this.agentWS === ws
+    await super.webSocketClose(ws, code, reason, wasClean)
+    if (wasAgent) {
+      this.broadcastRelayInfo()
+      return
+    }
+    this.notifySubs()
+    // events-WS departure → tell remaining peers so they can drop the
+    // stale cursor from their map without waiting for GC, and tell orch
+    // to refcount-down any pane captures this WS was holding open
+    // (browser closes don't always send pane-unsub).
+    try {
+      const a = ws.deserializeAttachment() as { id?: string; panes?: string[] } | null
+      const id = a?.id
+      if (id) {
+        const out = JSON.stringify({ t: 'leave', userId: id })
+        for (const peer of this.state.getWebSockets('events')) {
+          if (peer === ws) continue
+          try { peer.send(out) } catch {}
+        }
+      }
+      const panes = a?.panes ?? []
+      if (panes.length > 0 && this.agentWS) {
+        for (const paneId of panes) {
+          try { this.agentWS.send(JSON.stringify({ t: 'pane-unsub', paneId })) } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  // ─── orchid agent extension frames ─────────────────────────────────
+
+  // handleAgentExtension returns true if it consumed the frame.
+  private handleAgentExtension(f: any): boolean {
+    if (!f || typeof f.t !== 'string') return false
+    switch (f.t) {
+      case 'config': {
+        const list = Array.isArray(f.allowed_logins) ? f.allowed_logins : []
+        this.allowedLogins = list
+          .map((s: any) => String(s).toLowerCase().trim())
+          .filter(Boolean)
+        return true
+      }
+      case 'pane': {
+        const wrapped = `{"t":"pane","paneId":${JSON.stringify(f.paneId ?? '')},"data":${JSON.stringify(f.data ?? '')}}`
+        for (const sub of this.state.getWebSockets('events')) {
+          try { sub.send(wrapped) } catch {}
+        }
+        return true
+      }
+      case 'snap': {
+        const body = JSON.stringify(f.snap ?? {})
+        if (body !== this.lastSnap) {
+          this.lastSnap = body
+          this.state.storage.put('lastSnap', body).catch(() => {})
+          const wrapped = `{"t":"snap","snap":${body}}`
+          for (const sub of this.state.getWebSockets('events')) {
+            try { sub.send(wrapped) } catch {}
+          }
+        }
+        return true
+      }
+      case 'state-update': {
+        const body = JSON.stringify(f.state ?? {})
+        if (body === this.lastState) return true
+        this.lastState = body
+        const wrapped = `{"t":"state","state":${body}}`
+        for (const sub of this.state.getWebSockets('events')) {
+          try { sub.send(wrapped) } catch {}
+        }
+        return true
+      }
+    }
+    return false
+  }
+
+  // ─── events WS (per-tab subscriber) ────────────────────────────────
+
+  // handleEventsFrame consumes a browser-tab WS message. Frames recognized:
+  //   cursor — broadcast peer cursor to other tabs
+  //   pane-sub/pane-unsub — refcount pane captures via the agent
+  //   snap-put — write a fresh canvas snap, fan out + forward to agent
+  private handleEventsFrame(ws: WebSocket, data: string | ArrayBuffer) {
+    if (typeof data !== 'string') return
+    let f: any
+    try { f = JSON.parse(data) } catch { return }
+    if (!f) return
+    if (f.t === 'cursor') {
+      const id = this.wsId(ws)
+      const out = JSON.stringify({ t: 'cursor', userId: id, x: f.x, y: f.y })
+      for (const peer of this.state.getWebSockets('events')) {
+        if (peer === ws) continue
+        try { peer.send(out) } catch {}
+      }
+      return
+    }
+    if ((f.t === 'pane-sub' || f.t === 'pane-unsub') && typeof f.paneId === 'string') {
+      const a = (ws.deserializeAttachment() as { id?: string; panes?: string[] }) || {}
+      const set = new Set<string>(a.panes ?? [])
+      if (f.t === 'pane-sub') set.add(f.paneId)
+      else set.delete(f.paneId)
+      try { ws.serializeAttachment({ ...a, panes: Array.from(set) }) } catch {}
+      if (this.agentWS) {
+        try {
+          this.agentWS.send(JSON.stringify({
+            t: f.t, paneId: f.paneId,
+            cols: typeof f.cols === 'number' ? f.cols : undefined,
+            rows: typeof f.rows === 'number' ? f.rows : undefined,
+          }))
+        } catch {}
+      }
+      return
+    }
+    if (f.t === 'snap-put' && f.snap !== undefined) {
+      const body = JSON.stringify(f.snap ?? {})
+      if (body === this.lastSnap) return
+      this.lastSnap = body
+      this.state.storage.put('lastSnap', body).catch(() => {})
+      const wrapped = `{"t":"snap","snap":${body}}`
+      for (const peer of this.state.getWebSockets('events')) {
+        if (peer === ws) continue
+        try { peer.send(wrapped) } catch {}
+      }
+      if (this.agentWS) {
+        try { this.agentWS.send(JSON.stringify({ t: 'snap-put', snap: f.snap })) } catch {}
+      }
+      return
+    }
+  }
+
+  // handleEventsWS accepts a dashboard tab WS. Receives the current
+  // relay-info + last cached state + snap on open; gets state/snap/pane
+  // pushes thereafter.
+  private async handleEventsWS(req: Request): Promise<Response> {
+    if (req.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
+      return new Response('expected websocket', { status: 426 })
+    }
+    const isOwner = req.headers.get('x-orchid-owner') === '1'
+    const pair = new WebSocketPair()
+    const client = pair[0]
+    const server = pair[1]
+    const tags = isOwner ? ['events', 'owner'] : ['events', 'collab']
+    this.state.acceptWebSocket(server, tags)
+    const id = crypto.randomUUID().replaceAll('-', '').slice(0, 12)
+    try { server.serializeAttachment({ id }) } catch {}
+    try { server.send(JSON.stringify({ t: 'hello', userId: id })) } catch {}
+    this.notifySubs()
+    try { server.send(JSON.stringify(this.relayInfoFrame(isOwner))) } catch {}
+    if (this.lastState) {
+      try { server.send(JSON.stringify({ t: 'state', state: JSON.parse(this.lastState) })) } catch {}
+    }
+    if (this.lastSnap) {
+      try { server.send(`{"t":"snap","snap":${this.lastSnap}}`) } catch {}
+    }
+    return new Response(null, { status: 101, webSocket: client })
+  }
+
+  // Stable per-WS identity so peer cursors line up across messages.
+  private wsId(ws: WebSocket): string {
+    const a = ws.deserializeAttachment() as { id?: string } | null
+    if (a?.id) return a.id
+    const id = crypto.randomUUID().replaceAll('-', '').slice(0, 12)
+    try { ws.serializeAttachment({ id }) } catch {}
+    return id
+  }
+
+  private relayInfoFrame(isOwner: boolean) {
+    return {
+      t: 'relay-info',
+      connected: !!this.agentWS,
+      root: this.env.ROOT_DOMAIN,
+      login: this.login,
+      // The token grants full agent impersonation. Only the subdomain
+      // owner ever gets it — collab WSs get it as null.
+      token: isOwner ? this.agentToken : null,
+    }
+  }
+
+  // Tell the agent how many dashboard tabs are currently subscribed
+  // to the events channel. Orch uses this to skip emitting state-update
+  // frames when nobody's looking — saves the WS write + the DO wake
+  // on the relay side. Only sent when the count crosses 0 or > 0 so
+  // we don't spam the agent on every reload.
+  private notifySubs(force = false) {
+    if (!this.agentWS) return
+    const count = this.state.getWebSockets('events').length
+    const transitioned =
+      (this.lastSubCount <= 0 && count > 0) ||
+      (this.lastSubCount > 0 && count === 0)
+    const send = force || transitioned
+    this.lastSubCount = count
+    if (!send) return
+    try {
+      this.agentWS.send(JSON.stringify({ t: 'subs', count }))
+    } catch {}
+  }
+
+  // Broadcast a relay-info frame to every subscriber. Owner and collab
+  // groups get separate payloads because the token field is privileged.
+  private broadcastRelayInfo() {
+    const ownerFrame = JSON.stringify(this.relayInfoFrame(true))
+    const collabFrame = JSON.stringify(this.relayInfoFrame(false))
+    for (const ws of this.state.getWebSockets('owner')) {
+      try { ws.send(ownerFrame) } catch {}
+    }
+    for (const ws of this.state.getWebSockets('collab')) {
+      try { ws.send(collabFrame) } catch {}
+    }
+  }
+
+  // ─── orchid-specific HTTP endpoints ────────────────────────────────
+
   private async handleSetGhToken(req: Request): Promise<Response> {
     const body = (await req.json()) as { token?: string }
     if (!body.token) return new Response('missing token', { status: 400 })
     this.ghToken = body.token
-    // Different token may see a different repo set (private repos in
-    // particular). Drop the cache so the next /repos call re-fetches.
     this.reposCache = null
     await this.state.storage.put('ghToken', body.token)
     return Response.json({ ok: true })
   }
 
   // Owner-only repo browser. Cached in-memory for the DO isolate's
-  // lifetime (TTL below) so the Settings dropdown doesn't fan out to
-  // api.github.com on every open. The response also carries a private
-  // Cache-Control so the browser doesn't refetch on tab switches.
-  // `q` filters client-side; full list is paginated up to ~300 repos.
+  // lifetime so the Settings dropdown doesn't fan out to api.github.com
+  // on every open.
   private async handleGhRepos(_req: Request): Promise<Response> {
     if (!this.ghToken) return new Response('no gh token', { status: 412 })
     const now = Date.now()
@@ -171,7 +372,6 @@ export class UserSession {
         },
       })
       if (!r.ok) {
-        // Don't poison the cache with partial / error pages.
         return Response.json({ error: 'gh ' + r.status, repos: out }, { status: 200 })
       }
       const page_data = (await r.json()) as Repo[]
@@ -197,9 +397,6 @@ export class UserSession {
     })
   }
 
-  // Owner-only: wipe the current agent token and force a fresh mint on
-  // the next OAuth sign-in. Closes any live agent connection so the old
-  // token can't reconnect even if it stayed in someone's clipboard.
   private async handleRevoke(): Promise<Response> {
     this.agentToken = null
     await this.state.storage.delete('token')
@@ -210,9 +407,6 @@ export class UserSession {
     return Response.json({ ok: true })
   }
 
-  // Owner-or-allowed check. Called from the relay middleware before
-  // tunnelling subdomain requests. The allowedLogins list comes from the
-  // operator's swarm.hcl via the agent connect frame.
   private async handleCheckAccess(req: Request): Promise<Response> {
     const url = new URL(req.url)
     const login = (url.searchParams.get('login') ?? '').toLowerCase()
@@ -243,445 +437,9 @@ export class UserSession {
     }
     return Response.json({ token: this.agentToken })
   }
-
-  private async handleAgent(req: Request): Promise<Response> {
-    if (req.headers.get('upgrade') !== 'websocket') {
-      return new Response('expected websocket', { status: 426 })
-    }
-    const url = new URL(req.url)
-    const token = url.searchParams.get('token') ?? req.headers.get('x-agent-token')
-    if (!this.agentToken || token !== this.agentToken) {
-      return new Response('auth', { status: 401 })
-    }
-
-    const pair = new WebSocketPair()
-    const client = pair[0]
-    const server = pair[1]
-    if (this.agentWS) {
-      try { this.agentWS.close(4000, 'replaced by new agent') } catch {}
-    }
-    // Tag the WS so the constructor can find it again via
-    // state.getWebSockets('agent') after CF evicts this DO instance.
-    // The class-level webSocketMessage/webSocketClose hooks below
-    // replace the per-instance addEventListener pattern.
-    this.state.acceptWebSocket(server, ['agent'])
-    this.agentWS = server
-    server.send(JSON.stringify({ t: 'hello', userId: this.uid ?? 0, login: this.login ?? '' } satisfies Frame))
-    // Dashboards subscribed via /_events_ws used to poll
-    // /api/_relay/info to detect the "agent online" transition. Push
-    // it instead so the install modal hides the moment orch dials in.
-    this.broadcastRelayInfo()
-    // Reset and push the current sub count so a freshly-connected
-    // agent skips state pushes immediately if nobody's watching.
-    this.lastSubCount = -1
-    this.notifySubs(true)
-    return new Response(null, { status: 101, webSocket: client })
-  }
-
-  // Class-level hibernation hooks. CF calls these for any WS the DO
-  // accepted via state.acceptWebSocket. Routes everything through the
-  // same handler the old addEventListener path used.
-  async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer) {
-    try {
-      const tags = this.state.getTags(ws) ?? []
-      // /_events_ws subscribers send a narrow set of frames — cursor
-      // moves get broadcast to every other subscriber in the same DO
-      // so collab cursors never have to round-trip through orch.
-      // Anything else from an events WS is silently dropped to keep
-      // the channel from becoming a back-door into the agent.
-      if (tags.includes('events')) {
-        if (typeof data !== 'string') return
-        let f: any
-        try { f = JSON.parse(data) } catch { return }
-        if (f && f.t === 'cursor') {
-          const id = this.wsId(ws)
-          const out = JSON.stringify({
-            t: 'cursor', userId: id, x: f.x, y: f.y,
-          })
-          for (const peer of this.state.getWebSockets('events')) {
-            if (peer === ws) continue
-            try { peer.send(out) } catch {}
-          }
-        } else if (f && (f.t === 'pane-sub' || f.t === 'pane-unsub') && typeof f.paneId === 'string') {
-          // Track this WS's pane subscriptions in its hibernation
-          // attachment so a hard browser close (no explicit pane-unsub)
-          // is cleaned up in webSocketClose. Orch refcounts subscribers
-          // per session and stops the tmux capture goroutine when the
-          // last subscriber leaves.
-          const a = (ws.deserializeAttachment() as { id?: string; panes?: string[] }) || {}
-          const set = new Set<string>(a.panes ?? [])
-          if (f.t === 'pane-sub') set.add(f.paneId)
-          else set.delete(f.paneId)
-          try { ws.serializeAttachment({ ...a, panes: Array.from(set) }) } catch {}
-          if (this.agentWS) {
-            try {
-              this.agentWS.send(JSON.stringify({
-                t: f.t, paneId: f.paneId,
-                cols: typeof f.cols === 'number' ? f.cols : undefined,
-                rows: typeof f.rows === 'number' ? f.rows : undefined,
-              }))
-            } catch {}
-          }
-        } else if (f && f.t === 'snap-put' && f.snap !== undefined) {
-          // Browser-side layout write. Cache + persist immediately so
-          // late-arriving tabs see the latest layout even if orch is
-          // offline. Mirror to other tabs in the same DO and forward
-          // to orch over the agent WS for durable disk persistence.
-          const body = JSON.stringify(f.snap ?? {})
-          if (body !== this.lastSnap) {
-            this.lastSnap = body
-            this.state.storage.put('lastSnap', body).catch(() => {})
-            const wrapped = `{"t":"snap","snap":${body}}`
-            for (const peer of this.state.getWebSockets('events')) {
-              if (peer === ws) continue
-              try { peer.send(wrapped) } catch {}
-            }
-            if (this.agentWS) {
-              try {
-                this.agentWS.send(JSON.stringify({ t: 'snap-put', snap: f.snap }))
-              } catch {}
-            }
-          }
-        }
-        return
-      }
-      if (this.agentWS == null) this.agentWS = ws
-      this.onAgentMessage({ data } as MessageEvent)
-    } catch {}
-  }
-
-  // Stable per-WS identity so peer cursors line up across messages.
-  // We stash it in the WS attachment on accept; if it's missing
-  // (older accepted sockets), we mint one lazily and stick it back.
-  private wsId(ws: WebSocket): string {
-    const a = ws.deserializeAttachment() as { id?: string } | null
-    if (a?.id) return a.id
-    const id = crypto.randomUUID().replaceAll('-', '').slice(0, 12)
-    try { ws.serializeAttachment({ id }) } catch {}
-    return id
-  }
-  async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean) {
-    const wasAgent = this.agentWS === ws
-    if (wasAgent) this.agentWS = null
-    for (const s of this.streams.values()) {
-      s.res.reject(new Error('agent disconnected'))
-      try { s.body?.controller.close() } catch {}
-      try { s.ws?.close(1011, 'agent disconnected') } catch {}
-    }
-    this.streams.clear()
-    if (wasAgent) {
-      this.broadcastRelayInfo()
-    } else {
-      this.notifySubs()
-      // events-WS departure → tell remaining peers so they can drop
-      // the stale cursor from their map without waiting for GC, and
-      // tell orch to refcount-down any pane captures this WS was
-      // holding open (browser closes don't always send pane-unsub).
-      try {
-        const a = ws.deserializeAttachment() as { id?: string; panes?: string[] } | null
-        const id = a?.id
-        if (id) {
-          const out = JSON.stringify({ t: 'leave', userId: id })
-          for (const peer of this.state.getWebSockets('events')) {
-            if (peer === ws) continue
-            try { peer.send(out) } catch {}
-          }
-        }
-        const panes = a?.panes ?? []
-        if (panes.length > 0 && this.agentWS) {
-          for (const paneId of panes) {
-            try { this.agentWS.send(JSON.stringify({ t: 'pane-unsub', paneId })) } catch {}
-          }
-        }
-      } catch {}
-    }
-  }
-  async webSocketError(ws: WebSocket, _err: unknown) {
-    if (this.agentWS === ws) this.agentWS = null
-  }
-
-  private async handleProxy(req: Request): Promise<Response> {
-    // Brief grace period for the agent to (re)connect — the most common
-    // 503 happens right after an orch deploy. Wait up to ~3s instead of
-    // failing immediately so the dashboard doesn't flash error toasts on
-    // every restart.
-    if (!this.agentWS) {
-      await this.waitForAgent(3000)
-    }
-    if (!this.agentWS) return new Response('agent offline', { status: 503 })
-    try {
-      const innerReq = await innerRequestFromProxyBody(req)
-      return await this.send(innerReq)
-    } catch (e) {
-      return new Response('proxy error: ' + (e as Error).message, { status: 502 })
-    }
-  }
-
-  private async waitForAgent(ms: number): Promise<void> {
-    const deadline = Date.now() + ms
-    while (!this.agentWS && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 100))
-    }
-  }
-
-  // Read-only event channel for the dashboard. One WS per tab, accepted
-  // via state.acceptWebSocket so CF hibernates idle sockets — a
-  // backgrounded tab costs zero DO CPU until the next state change.
-  // Multiplexes two frame kinds:
-  //   {t:'state', state}       — full /api/state body, fanned out on
-  //                               every orch push
-  //   {t:'relay-info', ...}    — connectivity status + (owner-only)
-  //                               agent token, replaces the old
-  //                               /api/_relay/info polling endpoint
-  //
-  // The owner tag controls whether the agent token shows up in
-  // relay-info frames — collaborators see connected/root/login only.
-  private async handleEventsWS(req: Request): Promise<Response> {
-    if (req.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
-      return new Response('expected websocket', { status: 426 })
-    }
-    const isOwner = req.headers.get('x-orchid-owner') === '1'
-    const pair = new WebSocketPair()
-    const client = pair[0]
-    const server = pair[1]
-    const tags = isOwner ? ['events', 'owner'] : ['events', 'collab']
-    this.state.acceptWebSocket(server, tags)
-    // Mint a stable peer id and stash it in the WS attachment. Used
-    // for the cursor channel so other tabs can tell our moves apart.
-    const id = crypto.randomUUID().replaceAll('-', '').slice(0, 12)
-    try { server.serializeAttachment({ id }) } catch {}
-    try { server.send(JSON.stringify({ t: 'hello', userId: id })) } catch {}
-    this.notifySubs()
-    try { server.send(JSON.stringify(this.relayInfoFrame(isOwner))) } catch {}
-    if (this.lastState) {
-      try { server.send(JSON.stringify({ t: 'state', state: JSON.parse(this.lastState) })) } catch {}
-    }
-    if (this.lastSnap) {
-      try { server.send(`{"t":"snap","snap":${this.lastSnap}}`) } catch {}
-    }
-    return new Response(null, { status: 101, webSocket: client })
-  }
-
-  private relayInfoFrame(isOwner: boolean) {
-    return {
-      t: 'relay-info',
-      connected: !!this.agentWS,
-      root: this.env.ROOT_DOMAIN,
-      login: this.login,
-      // The token grants full agent impersonation. Only the subdomain
-      // owner ever gets it — collab WSs get it as null.
-      token: isOwner ? this.agentToken : null,
-    }
-  }
-
-  // Tell the agent how many dashboard tabs are currently subscribed
-  // to the events channel. Orch uses this to skip emitting state-update
-  // frames when nobody's looking — saves the WS write + the DO wake
-  // on the relay side. Only sent when the count crosses 0 or > 0 so
-  // we don't spam the agent on every reload.
-  private lastSubCount = -1
-  private notifySubs(force = false) {
-    if (!this.agentWS) return
-    const count = this.state.getWebSockets('events').length
-    const transitioned =
-      (this.lastSubCount <= 0 && count > 0) ||
-      (this.lastSubCount > 0 && count === 0)
-    const send = force || transitioned
-    this.lastSubCount = count
-    if (!send) return
-    try {
-      this.agentWS.send(JSON.stringify({ t: 'subs', count }))
-    } catch {}
-  }
-
-  // Broadcast a relay-info frame to every subscriber. Owner and collab
-  // groups get separate payloads because the token field is privileged.
-  private broadcastRelayInfo() {
-    const ownerFrame = JSON.stringify(this.relayInfoFrame(true))
-    const collabFrame = JSON.stringify(this.relayInfoFrame(false))
-    for (const ws of this.state.getWebSockets('owner')) {
-      try { ws.send(ownerFrame) } catch {}
-    }
-    for (const ws of this.state.getWebSockets('collab')) {
-      try { ws.send(collabFrame) } catch {}
-    }
-  }
-
-  private async handleProxyWS(req: Request): Promise<Response> {
-    if (!this.agentWS) return new Response('agent offline', { status: 503 })
-    const innerPath = req.headers.get('x-orchid-inner-url') ?? '/'
-    const innerHeaders = parseHeaderBlockList(req.headers.get('x-orchid-inner-headers') ?? '')
-
-    const pair = new WebSocketPair()
-    const client = pair[0]
-    const server = pair[1]
-    server.accept()
-
-    const id = this.nextStreamId++
-    this.streams.set(id, { res: { resolve: () => {}, reject: () => {} }, ws: server })
-
-    this.agentWS.send(JSON.stringify({
-      t: 'ws-open', id, path: innerPath, headers: innerHeaders,
-    } satisfies Frame))
-
-    server.addEventListener('message', (ev) => {
-      if (!this.agentWS) return
-      if (typeof ev.data === 'string') {
-        this.agentWS.send(JSON.stringify({ t: 'ws-text', id, data: ev.data } satisfies Frame))
-      } else {
-        this.agentWS.send(encodeBinary(id, new Uint8Array(ev.data as ArrayBuffer)))
-      }
-    })
-    server.addEventListener('close', (ev) => {
-      if (this.agentWS) {
-        try {
-          this.agentWS.send(JSON.stringify({ t: 'ws-close', id, code: ev.code, reason: ev.reason } satisfies Frame))
-        } catch {}
-      }
-      this.streams.delete(id)
-    })
-
-    return new Response(null, { status: 101, webSocket: client })
-  }
-
-  private async send(req: Request): Promise<Response> {
-    const id = this.nextStreamId++
-    const headerList: [string, string][] = []
-    req.headers.forEach((v, k) => headerList.push([k, v]))
-    const body = req.body
-    const hasBody = !!body
-
-    const promise = new Promise<Response>((resolve, reject) => {
-      this.streams.set(id, { res: { resolve, reject } })
-    })
-
-    this.agentWS!.send(JSON.stringify({
-      t: 'req', id, method: req.method, path: new URL(req.url).pathname + new URL(req.url).search,
-      headers: headerList, hasBody,
-    } satisfies Frame))
-
-    if (hasBody && body) {
-      const reader = body.getReader()
-      while (true) {
-        const { value, done } = await reader.read()
-        if (done) break
-        if (value) this.agentWS!.send(encodeBinary(id, value))
-      }
-    }
-    this.agentWS!.send(JSON.stringify({ t: 'req-end', id } satisfies Frame))
-
-    return promise
-  }
-
-  private onAgentMessage(ev: MessageEvent) {
-    const data = ev.data
-    if (typeof data === 'string') {
-      let f: any
-      try { f = JSON.parse(data) } catch { return }
-      // Operator-defined allowlist pushed at connect time. Source of
-      // truth lives in swarm.hcl — we just cache the latest snapshot.
-      if (f.t === 'config') {
-        const list = Array.isArray(f.allowed_logins) ? f.allowed_logins : []
-        this.allowedLogins = list
-          .map((s: any) => String(s).toLowerCase().trim())
-          .filter(Boolean)
-        return
-      }
-      // State push from orch. Cache the latest body so newly-arriving
-      // subscribers get the current snapshot, and fan out to every
-      // active /_events_ws subscriber. Hibernated WSs survive across
-      // DO eviction so this works even after the relay restarts.
-      //
-      // The whole block is wrapped in try/catch — an unhandled throw
-      // inside webSocketMessage causes CF to close the calling WS,
-      // which is the agent socket. A bad sub.send() (zombie client,
-      // 1MiB frame, etc.) would otherwise take down the tunnel.
-      // Snap push from orch on (re)connect — fan it out to subs and
-      // persist into DO storage so an evicted DO can hand the layout
-      // straight to the next new tab without waiting for orch.
-      // Pane frame from orch — fan out to every events sub. Pane.tsx
-      // filters by paneId on the client side; that's cheaper than
-      // tracking per-WS subscription sets across hibernation here.
-      if (f.t === 'pane') {
-        try {
-          const wrapped = `{"t":"pane","paneId":${JSON.stringify(f.paneId ?? '')},"data":${JSON.stringify(f.data ?? '')}}`
-          for (const sub of this.state.getWebSockets('events')) {
-            try { sub.send(wrapped) } catch {}
-          }
-        } catch {}
-        return
-      }
-      if (f.t === 'snap') {
-        try {
-          const body = JSON.stringify(f.snap ?? {})
-          if (body !== this.lastSnap) {
-            this.lastSnap = body
-            this.state.storage.put('lastSnap', body).catch(() => {})
-            const wrapped = `{"t":"snap","snap":${body}}`
-            for (const sub of this.state.getWebSockets('events')) {
-              try { sub.send(wrapped) } catch {}
-            }
-          }
-        } catch {}
-        return
-      }
-      if (f.t === 'state-update') {
-        try {
-          const body = JSON.stringify(f.state ?? {})
-          // Skip the fanout when the body hasn't actually changed —
-          // saves N sends across all hibernated subs for no-op ticks.
-          if (body === this.lastState) return
-          this.lastState = body
-          // Wrap as a discriminated frame so the same WS can carry
-          // state pushes and relay-info events to the dashboard.
-          const wrapped = `{"t":"state","state":${body}}`
-          for (const sub of this.state.getWebSockets('events')) {
-            try { sub.send(wrapped) } catch {}
-          }
-        } catch {}
-        return
-      }
-      const id = (f as any).id as number | undefined
-      const s = id !== undefined ? this.streams.get(id) : undefined
-      if (f.t === 'res-head' && s) {
-        s.status = f.status
-        s.headers = new Headers(f.headers)
-        s.streaming = f.streaming
-        let bodyController!: ReadableStreamDefaultController<Uint8Array>
-        const stream = new ReadableStream<Uint8Array>({
-          start: (controller) => { bodyController = controller },
-        })
-        s.body = { controller: bodyController, stream }
-        // Statuses 1xx, 204, 205, 304 must have null body — passing a
-        // stream into the Response constructor with these statuses throws.
-        const nullBodyStatus = s.status === 101 || s.status === 204 ||
-          s.status === 205 || s.status === 304 || (s.status >= 100 && s.status < 200)
-        s.res.resolve(new Response(nullBodyStatus ? null : stream, { status: s.status, headers: s.headers }))
-      } else if (f.t === 'res-end' && s) {
-        try { s.body?.controller.close() } catch {}
-        this.streams.delete(f.id)
-      } else if (f.t === 'cancel' && s) {
-        try { s.body?.controller.error(new Error('cancelled')) } catch {}
-        this.streams.delete(f.id)
-      } else if (f.t === 'ws-text' && s?.ws) {
-        try { s.ws.send(f.data) } catch {}
-      } else if (f.t === 'ws-close' && s?.ws) {
-        try { s.ws.close(f.code ?? 1000, f.reason ?? '') } catch {}
-        this.streams.delete(f.id)
-      }
-    } else if (data instanceof ArrayBuffer) {
-      const { streamId, chunk } = decodeBinary(data)
-      const s = this.streams.get(streamId)
-      if (s?.ws) {
-        try { s.ws.send(chunk) } catch {}
-      } else if (s?.body) {
-        try { s.body.controller.enqueue(chunk) } catch {}
-      }
-    }
-  }
 }
 
-/// Mint or fetch an agent token for a user. Called from the OAuth callback.
+// Re-exported for the OAuth callback in oauth.ts.
 export async function mintAgentToken(
   do_: DurableObjectStub,
   uid: number,
@@ -695,31 +453,3 @@ export async function mintAgentToken(
   return j.token
 }
 
-// Reconstructs the original Request from the sidecar headers added by the
-// outer proxy worker before forwarding to the DO.
-async function innerRequestFromProxyBody(req: Request): Promise<Request> {
-  const inner = req.headers.get('x-orchid-inner-url')
-  if (!inner) throw new Error('missing inner url')
-  // Workers Request constructor requires an absolute URL. Use a sentinel
-  // host; only the pathname+search is forwarded across the tunnel.
-  return new Request('https://agent.internal' + inner, {
-    method: req.headers.get('x-orchid-inner-method') ?? 'GET',
-    headers: parseHeaderBlock(req.headers.get('x-orchid-inner-headers') ?? ''),
-    body: req.body,
-  })
-}
-function parseHeaderBlock(b: string): Headers {
-  const h = new Headers()
-  try {
-    const arr = JSON.parse(atob(b)) as [string, string][]
-    for (const [k, v] of arr) h.append(k, v)
-  } catch {}
-  return h
-}
-function parseHeaderBlockList(b: string): [string, string][] {
-  try {
-    return JSON.parse(atob(b)) as [string, string][]
-  } catch {
-    return []
-  }
-}

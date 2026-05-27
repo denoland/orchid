@@ -66,3 +66,4 @@ capture/ios/build/
 *.swp
 *.swo
 node_modules/
+cfrelaytun/go/example/example
