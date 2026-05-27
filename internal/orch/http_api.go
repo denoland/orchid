@@ -23,6 +23,15 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsimple"
 )
 
+const (
+	// Cap on /api/pane POST bodies. Pane input is keystrokes — never
+	// large; oversized requests are dropped at the limit reader.
+	maxPaneInputBytes = 4096
+	// SSE keepalive cadence for /api/pane/stream so middleboxes don't
+	// idle-close the connection between frames.
+	paneStreamKeepalive = 20 * time.Second
+)
+
 type apiJobEntry struct {
 	Issue int `json:"issue"`
 	Job
@@ -387,7 +396,7 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			http.Error(w, "POST only — use /api/pane/stream for snapshots", http.StatusMethodNotAllowed)
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxPaneInputBytes))
 		if err != nil || len(body) == 0 {
 			http.Error(w, "bad body", http.StatusBadRequest)
 			return
@@ -520,7 +529,7 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			return "z:" + base64.StdEncoding.EncodeToString(gzbuf.Bytes())
 		}
 
-		keepalive := time.NewTicker(20 * time.Second)
+		keepalive := time.NewTicker(paneStreamKeepalive)
 		defer keepalive.Stop()
 		var last string
 		for {

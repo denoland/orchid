@@ -37,6 +37,11 @@ function DashboardApp() {
   const subsRef = useRef<Set<(msg: any) => void>>(new Set())
 
   useEffect(() => {
+    // Polling cadence when the events WS is down. Kept tight because
+    // the UI feels stale fast — the WS path is the steady state.
+    const FALLBACK_POLL_MS = 5000
+    // Cap on the exponential WS-reopen backoff.
+    const RECONNECT_MAX_MS = 30_000
     let cancelled = false
     let pollTimer: ReturnType<typeof setInterval> | undefined
     let reopenTimer: ReturnType<typeof setTimeout> | undefined
@@ -62,7 +67,7 @@ function DashboardApp() {
     const startFallback = () => {
       if (pollTimer) return
       fetchOnce()
-      pollTimer = setInterval(fetchOnce, 5000)
+      pollTimer = setInterval(fetchOnce, FALLBACK_POLL_MS)
     }
 
     const stopFallback = () => {
@@ -106,9 +111,10 @@ function DashboardApp() {
           peerIdRef.current = f.userId ?? null
         }
         // Fan out every frame to bus subscribers (collab hooks etc.).
-        // They filter by `t` themselves.
+        // They filter by `t` themselves. A throwing subscriber is a bug,
+        // not a benign race — log it so it gets noticed.
         for (const fn of subsRef.current) {
-          try { fn(f) } catch {}
+          try { fn(f) } catch (e) { console.error('bus subscriber:', e) }
         }
       }
       ws.onclose = () => {
@@ -118,7 +124,7 @@ function DashboardApp() {
         peerIdRef.current = null
         startFallback()
         reopenTimer = setTimeout(openWS, reopenDelay)
-        reopenDelay = Math.min(reopenDelay * 2, 30000)
+        reopenDelay = Math.min(reopenDelay * 2, RECONNECT_MAX_MS)
       }
       ws.onerror = () => {}
     }

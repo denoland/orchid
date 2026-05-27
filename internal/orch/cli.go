@@ -24,6 +24,21 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsimple"
 )
 
+const (
+	// HTTP client timeout for `orch join` calls against central — local
+	// network latency only, so 30s is plenty.
+	joinHTTPTimeout = 30 * time.Second
+	// `orch run` calls into central can take longer because the spawn
+	// pipeline contacts a worker VM over SSH before responding.
+	adhocHTTPTimeout = 60 * time.Second
+	// Max bytes to read from a non-2xx response body when surfacing the
+	// error message to the user.
+	errBodySnippet = 4096
+	// Cadence at which the assignment-tick claims unassigned issues for
+	// bot accounts.
+	assignmentTickInterval = 60 * time.Second
+)
+
 func runJoin(args []string) {
 	if len(args) >= 1 {
 		switch args[0] {
@@ -153,7 +168,7 @@ func runJoinVM(args []string) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: joinHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "central: %v\n", err)
@@ -161,7 +176,7 @@ func runJoinVM(args []string) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, errBodySnippet))
 		fmt.Fprintf(os.Stderr, "central returned %d: %s\n", resp.StatusCode, strings.TrimSpace(string(msg)))
 		os.Exit(1)
 	}
@@ -724,14 +739,14 @@ func runRun(args []string) {
 	req, _ := http.NewRequest(http.MethodPost, strings.TrimRight(centralURL, "/")+"/api/adhoc", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: adhocHTTPTimeout}).Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "orch run: central unreachable: %v\n", err)
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, errBodySnippet))
 		fmt.Fprintf(os.Stderr, "orch run: central returned %d: %s\n", resp.StatusCode, strings.TrimSpace(string(msg)))
 		os.Exit(1)
 	}
@@ -950,7 +965,7 @@ func Main() {
 
 	if len(botLogins(&cfg)) > 0 {
 		go func() {
-			at := time.NewTicker(60 * time.Second)
+			at := time.NewTicker(assignmentTickInterval)
 			defer at.Stop()
 			assignmentTick(&cfg, st)
 			for {

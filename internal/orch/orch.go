@@ -184,6 +184,8 @@ const runAttempts = 4
 
 const maxKillsPerTick = 2
 
+const vmHealthProbeInterval = 15 * time.Second
+
 // killBudget tracks dead-session respawns issued so far this tick. Use
 // tryUse to attempt a kill; it returns false once the per-tick cap is hit.
 type killBudget struct {
@@ -795,7 +797,7 @@ func runVMHealthLoop(ctx context.Context, cfg *Config, st *State) {
 		}
 	}
 	probe()
-	t := time.NewTicker(15 * time.Second)
+	t := time.NewTicker(vmHealthProbeInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -1029,6 +1031,16 @@ func loadState(dbPath string) (*State, error) {
 		}
 	}
 	return s, nil
+}
+
+// saveStateLogged calls saveState and logs any persistence error.
+// tick.go writes happen on every state mutation in the scheduler loop;
+// callers that have no way to surface the error to a request use this
+// instead of `_ = saveState(...)` so failures don't silently rot.
+func saveStateLogged(s *State) {
+	if err := saveState(s); err != nil {
+		log.Printf("saveState: %v", err)
+	}
 }
 
 // saveState writes the in-memory State back to sqlite and refreshes the

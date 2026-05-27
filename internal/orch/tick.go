@@ -169,7 +169,7 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 			n, j.Schedule, cron.ScheduleStr, j.Timeout, cron.TimeoutStr)
 		j.Schedule = cron.ScheduleStr
 		j.Timeout = cron.TimeoutStr
-		_ = saveState(st)
+		saveStateLogged(st)
 	}
 	now := time.Now()
 	if j.Tmux != "" {
@@ -186,14 +186,14 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 					j.Tmux = ""
 					j.VM = ""
 					j.FireStartedAt = time.Time{}
-					_ = saveState(st)
+					saveStateLogged(st)
 				}
 				return
 			}
 			j.Tmux = ""
 			j.VM = ""
 			j.FireStartedAt = time.Time{}
-			_ = saveState(st)
+			saveStateLogged(st)
 		}
 	}
 	if now.Before(j.NextFireAt) {
@@ -211,7 +211,7 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 	fireDoneAt := time.Now()
 	j.NextFireAt = fireDoneAt.Add(cron.Schedule)
 	j.FireStartedAt = fireDoneAt
-	_ = saveState(st)
+	saveStateLogged(st)
 }
 
 // Mention is one @-mention of a configured bot found in a comment on an
@@ -270,7 +270,7 @@ func tick(cfg *Config, st *State) {
 			}
 			log.Printf("issue #%d: registered cron job (target=%s, schedule=%s, timeout=%s)",
 				n, r.target.Name, cron.ScheduleStr, cron.TimeoutStr)
-			_ = saveState(st)
+			saveStateLogged(st)
 			continue
 		}
 		vm := freeVM(cfg, st)
@@ -282,7 +282,7 @@ func tick(cfg *Config, st *State) {
 			log.Printf("issue #%d: spawn failed on %s: %v", n, vm.Name, err)
 			continue
 		}
-		_ = saveState(st)
+		saveStateLogged(st)
 	}
 
 	budget := killBudget{max: maxKillsPerTick}
@@ -295,7 +295,7 @@ func tick(cfg *Config, st *State) {
 			if vm == nil {
 				log.Printf("adhoc %s: vm %q gone, dropping", j.Tmux, j.VM)
 				delete(st.Jobs, n)
-				_ = saveState(st)
+				saveStateLogged(st)
 				continue
 			}
 			if h := st.VMHealth(vm.Name); !h.LastOK.IsZero() && !h.Online {
@@ -308,7 +308,7 @@ func tick(cfg *Config, st *State) {
 			if !alive {
 				log.Printf("adhoc %s: tmux gone, dropping", j.Tmux)
 				delete(st.Jobs, n)
-				_ = saveState(st)
+				saveStateLogged(st)
 			}
 			continue
 		}
@@ -320,12 +320,12 @@ func tick(cfg *Config, st *State) {
 				log.Printf("issue #%d: lifecycle drift (have=%q want=%s) — dropping for re-registration",
 					n, j.Lifecycle, map[bool]string{true: "cron", false: "oneshot"}[wantCron])
 				tearDown(cfg, st, n)
-				_ = saveState(st)
+				saveStateLogged(st)
 				continue
 			}
 		} else if _, stillOpen := allOpen[n]; !stillOpen {
 			tearDown(cfg, st, n)
-			_ = saveState(st)
+			saveStateLogged(st)
 			continue
 		}
 		if j.Lifecycle == "cron" {
@@ -333,7 +333,7 @@ func tick(cfg *Config, st *State) {
 			if !ok {
 				log.Printf("issue #%d: cron job no longer in open list, dropping", n)
 				tearDown(cfg, st, n)
-				_ = saveState(st)
+				saveStateLogged(st)
 				continue
 			}
 			tickCron(cfg, st, n, j, r.is, r.target)
@@ -343,7 +343,7 @@ func tick(cfg *Config, st *State) {
 		if vm == nil {
 			log.Printf("issue #%d: vm %q gone from config, dropping", n, j.VM)
 			delete(st.Jobs, n)
-			_ = saveState(st)
+			saveStateLogged(st)
 			continue
 		}
 		// VM is currently offline per probe — keep the job in state
@@ -373,7 +373,7 @@ func tick(cfg *Config, st *State) {
 				log.Printf("issue #%d: tmux session %q gone, tearing down", n, j.Tmux)
 				tearDown(cfg, st, n)
 			}
-			_ = saveState(st)
+			saveStateLogged(st)
 			continue
 		}
 		if j.PR == 0 {
@@ -390,7 +390,7 @@ func tick(cfg *Config, st *State) {
 						if strings.Contains(err.Error(), "already exists") {
 							log.Printf("issue #%d: branch %s already has a PR by another account, tearing down", n, j.Branch)
 							tearDown(cfg, st, n)
-							_ = saveState(st)
+							saveStateLogged(st)
 							continue
 						}
 						log.Printf("issue #%d: auto-create PR: %v", n, err)
@@ -409,7 +409,7 @@ func tick(cfg *Config, st *State) {
 				fmt.Sprintf("PR opened: issue #%d", n),
 				fmt.Sprintf("%s\n%s", j.Branch, prURL),
 				prURL)
-			_ = saveState(st)
+			saveStateLogged(st)
 		}
 		v, err := ghPRView(j.TargetRepo, j.PR)
 		viewedAt := time.Now()
@@ -426,7 +426,7 @@ func tick(cfg *Config, st *State) {
 					prURL)
 			}
 			tearDown(cfg, st, n)
-			_ = saveState(st)
+			saveStateLogged(st)
 			continue
 		}
 		botLogin, _ := vmBotIdentity(cfg.Orch, *vm)
@@ -441,7 +441,7 @@ func tick(cfg *Config, st *State) {
 				j.SeenReviewIDs = append(j.SeenReviewIDs, sr...)
 				j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, st_...)
 				j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, si...)
-				_ = saveState(st)
+				saveStateLogged(st)
 			}
 			continue
 		}
@@ -455,7 +455,7 @@ func tick(cfg *Config, st *State) {
 				if _, _, e := sshExec(*vm, fmt.Sprintf("tmux rename-session -t %s %s", j.Tmux, want)); e == nil {
 					log.Printf("issue #%d: tmux renamed %s → %s (detected %s in pane)", n, j.Tmux, want, detected)
 					j.Tmux = want
-					_ = saveState(st)
+					saveStateLogged(st)
 				}
 			}
 		}
@@ -471,7 +471,7 @@ func tick(cfg *Config, st *State) {
 			} else if fresh.State == "MERGED" || fresh.State == "CLOSED" {
 				log.Printf("issue #%d: PR %s between view and poke — skipping poke and tearing down", n, fresh.State)
 				tearDown(cfg, st, n)
-				_ = saveState(st)
+				saveStateLogged(st)
 				continue
 			}
 		}
@@ -500,7 +500,7 @@ func tick(cfg *Config, st *State) {
 				j.LastCheckConclusions[c.Name] = c.Conclusion
 			}
 		}
-		_ = saveState(st)
+		saveStateLogged(st)
 		log.Printf("issue #%d: poked PR #%d", n, j.PR)
 	}
 }
