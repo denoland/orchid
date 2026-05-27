@@ -14,32 +14,49 @@ struct JobsView: View {
 
     var body: some View {
         NavigationStack {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("Orchid")
+                        .font(.system(size: 36, weight: .medium, design: .serif).italic())
+                        .foregroundStyle(.primary)
+                    if !jobs.isEmpty {
+                        Text("\(jobs.count)")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button { Task { await refresh() } } label: {
+                        Image(systemName: "arrow.clockwise").font(.system(size: 16))
+                            .foregroundStyle(.secondary)
+                    }.disabled(loading)
+                }
+                .padding(.horizontal, 20).padding(.top, 32).padding(.bottom, 4)
+                Color.clear.frame(height: 90)
             Group {
                 if endpoint.isEmpty {
                     setupCard
                 } else if jobs.isEmpty && lastError == nil {
-                    ContentUnavailableView("No jobs yet",
-                        systemImage: "tray",
-                        description: Text("File an inbox issue to spawn a session."))
+                    placeholder("tray", "No jobs yet",
+                                "File an inbox issue to spawn a session.")
                 } else if let err = lastError, jobs.isEmpty {
-                    ContentUnavailableView("Couldn't reach orchid",
-                        systemImage: "wifi.exclamationmark",
-                        description: Text(err))
+                    placeholder("wifi.exclamationmark", "Couldn't reach orchid", err)
                 } else {
                     list
                 }
             }
-            .navigationTitle("Orchid")
-            .navigationBarTitleDisplayMode(.large)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { Task { await refresh() } } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .disabled(loading)
-                }
-            }
             .refreshable { await refresh() }
+            }
+            .overlay(alignment: .topLeading) {
+                Image("orchid-spray")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 280, height: 210)
+                    .offset(x: -80, y: -50)
+                    .opacity(0.30)
+                    .foregroundStyle(Color(red: 0.49, green: 0.23, blue: 0.93))
+                    .allowsHitTesting(false)
+            }
+            .navigationBarHidden(true)
         }
         .task { await refresh() }
         .onAppear {
@@ -48,6 +65,21 @@ struct JobsView: View {
             }
         }
         .onDisappear { refreshTimer?.invalidate(); refreshTimer = nil }
+    }
+
+    private func placeholder(_ icon: String, _ title: String, _ subtitle: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 44, weight: .thin))
+                .foregroundStyle(.secondary)
+            Text(title).font(.system(.body, design: .monospaced))
+            Text(subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(40)
     }
 
     private var setupCard: some View {
@@ -79,10 +111,16 @@ struct JobsView: View {
         if !items.isEmpty {
             Section {
                 ForEach(items) { row in
-                    NavigationLink {
-                        PaneView(tmux: row.id, title: "\(row.repo) · #\(row.issue)")
-                    } label: {
+                    if row.tmux.isEmpty {
+                        // Cron row not currently running — no pane to open.
                         JobCell(row: row, dotColor: color)
+                    } else {
+                        NavigationLink {
+                            PaneView(tmux: row.tmux,
+                                     title: "\(row.repo) · #\(row.issue)")
+                        } label: {
+                            JobCell(row: row, dotColor: color)
+                        }
                     }
                 }
             } header: {
@@ -193,13 +231,14 @@ private struct JobAPI: Decodable {
 struct JobRow: Identifiable {
     let id: String
     let issue: Int
+    let tmux: String
     let pr: Int
     let title: String
     let repo: String
     let group: Group
     enum Group { case needs, working, review, quiet }
 
-    static func from(_ j: JobAPI) -> JobRow {
+    fileprivate static func from(_ j: JobAPI) -> JobRow {
         let repoLabel: String = {
             if let r = j.target_repo, !r.isEmpty { return String(r.split(separator: "/").last ?? Substring(r)) }
             return j.target ?? "—"
@@ -216,8 +255,11 @@ struct JobRow: Identifiable {
             return .working
         }()
         return JobRow(
-            id: j.tmux,
+            // Issue # disambiguates cron rows that haven't fired and have
+            // empty tmux — otherwise ForEach trips on duplicate ids.
+            id: "\(j.issue)-\(j.tmux)",
             issue: j.issue,
+            tmux: j.tmux,
             pr: j.pr ?? 0,
             title: j.issue_title ?? "",
             repo: repoLabel,
