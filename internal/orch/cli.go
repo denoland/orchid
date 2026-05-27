@@ -178,6 +178,9 @@ func runJoinVM(args []string) {
 		fmt.Fprintf(os.Stderr, "install ssh material: %v\n", err)
 		os.Exit(1)
 	}
+	if err := writeWorkerEnv(centralURL, token, got.Name); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not save worker env (%v) — `orch run` will need --central/--token explicitly\n", err)
+	}
 	fmt.Printf("orch: joined as VM %q. Central can now SSH in as %s@%s.\n", got.Name, *sshUser, host)
 	if got.BotGithubPrivateKey == "" {
 		fmt.Println("warning: central did not push a bot github key — make sure this host has its own SSH access to github (e.g. `gh auth login` + ssh-keygen + add to github bot account) or claude sessions won't be able to `git clone` here.")
@@ -562,6 +565,74 @@ func generateVMAccessKey(configPath, name string) (string, []byte, error) {
 	return keyPath, pub, nil
 }
 
+// handleAdhoc is the server-side counterpart to `orch run <title>`. A
+// worker POSTs {title, vm} here; we ssh into that VM, spawn a tmux
+// session running the VM's configured session_cmd, and record the
+// result as a Job under a negative synthetic issue id so it surfaces
+// in the dashboard alongside real PR work.
+func handleAdhoc(w http.ResponseWriter, r *http.Request, cfg *Config, st *State) error {
+	defer r.Body.Close()
+	var req struct {
+		Title string `json:"title"`
+		VM    string `json:"vm"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return err
+	}
+	req.Title = strings.TrimSpace(req.Title)
+	req.VM = strings.TrimSpace(req.VM)
+	if req.Title == "" || req.VM == "" {
+		http.Error(w, "title and vm required", http.StatusBadRequest)
+		return fmt.Errorf("missing title/vm")
+	}
+	vm := vmByName(cfg, req.VM)
+	if vm == nil {
+		http.Error(w, "unknown vm "+req.VM, http.StatusBadRequest)
+		return fmt.Errorf("unknown vm %q", req.VM)
+	}
+
+	st.mu.Lock()
+	id := -1
+	for k := range st.Jobs {
+		if k <= id {
+			id = k - 1
+		}
+	}
+	session := fmt.Sprintf("adhoc-%d", -id)
+	workdir := strings.TrimRight(vmWorkdirRoot(cfg.Orch, *vm), "/") + "/" + session
+
+	sessionCmd := vm.SessionCmd
+	if sessionCmd == "" {
+		sessionCmd = "claude --dangerously-skip-permissions"
+	}
+	script := fmt.Sprintf(`set -e
+mkdir -p %q
+tmux kill-session -t %q 2>/dev/null || true
+tmux new-session -d -c %q -s %q %q
+`, workdir, session, workdir, session, sessionCmd)
+	if _, errStr, err := sshExecIn(*vm, script, "bash -s"); err != nil {
+		st.mu.Unlock()
+		http.Error(w, "spawn: "+strings.TrimSpace(errStr), http.StatusInternalServerError)
+		return fmt.Errorf("spawn: %v: %s", err, errStr)
+	}
+
+	st.Jobs[id] = &Job{
+		VM:         vm.Name,
+		Tmux:       session,
+		IssueTitle: req.Title,
+		Lifecycle:  "adhoc",
+	}
+	st.mu.Unlock()
+	if err := saveState(st); err != nil {
+		log.Printf("adhoc: saveState: %v", err)
+	}
+	log.Printf("adhoc: spawned %s on %s — %q (id=%d)", session, vm.Name, req.Title, id)
+
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(map[string]any{"tmux": session, "id": id, "vm": vm.Name})
+}
+
 // readBotGithubKey returns the (private, public) bytes of the bot's
 // github ssh key when discoverable. Empty strings on miss; the worker
 // prints a warning but the join still succeeds.
@@ -589,6 +660,90 @@ func readBotGithubKey(configured string) (priv, pub string) {
 // adding one entry here — no chained `if os.Args[1] == ...` ladders.
 var subcommands = map[string]func([]string){
 	"join": runJoin,
+	"run":  runRun,
+}
+
+// workerEnvPath is where `orch join vm` saves enough state for later
+// `orch run` invocations to phone home to central without re-typing
+// the URL + token every time.
+func workerEnvPath() string {
+	if p := os.Getenv("ORCH_WORKER_ENV"); p != "" {
+		return p
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "orch", "worker.env")
+}
+
+func writeWorkerEnv(centralURL, token, vmName string) error {
+	p := workerEnvPath()
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	body := fmt.Sprintf("CENTRAL_URL=%s\nCENTRAL_TOKEN=%s\nVM_NAME=%s\n",
+		centralURL, token, vmName)
+	return os.WriteFile(p, []byte(body), 0o600)
+}
+
+func readWorkerEnv() (url, token, vm string, err error) {
+	b, err := os.ReadFile(workerEnvPath())
+	if err != nil {
+		return "", "", "", err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(k) {
+		case "CENTRAL_URL":
+			url = strings.TrimSpace(v)
+		case "CENTRAL_TOKEN":
+			token = strings.TrimSpace(v)
+		case "VM_NAME":
+			vm = strings.TrimSpace(v)
+		}
+	}
+	if url == "" || token == "" || vm == "" {
+		return "", "", "", fmt.Errorf("incomplete worker env at %s", workerEnvPath())
+	}
+	return
+}
+
+// runRun is the worker-side `orch run <title>` entry point — pings
+// central to spawn a tmux session on this host running the configured
+// agent. The title becomes the card label; lifecycle is adhoc so the
+// job sticks around until the operator kills the pane.
+func runRun(args []string) {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		fmt.Fprintln(os.Stderr, "usage: orch run <title>")
+		os.Exit(2)
+	}
+	title := strings.Join(args, " ")
+	centralURL, token, vmName, err := readWorkerEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "orch run: %v\n  (this host hasn't been joined yet — run `orch join vm <central-url> <token>` first)\n", err)
+		os.Exit(1)
+	}
+	body, _ := json.Marshal(map[string]string{"title": title, "vm": vmName})
+	req, _ := http.NewRequest(http.MethodPost, strings.TrimRight(centralURL, "/")+"/api/adhoc", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "orch run: central unreachable: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		fmt.Fprintf(os.Stderr, "orch run: central returned %d: %s\n", resp.StatusCode, strings.TrimSpace(string(msg)))
+		os.Exit(1)
+	}
+	var reply struct {
+		Tmux string `json:"tmux"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&reply)
+	fmt.Printf("orch run: started %s — view in dashboard.\n", reply.Tmux)
 }
 
 func Main() {

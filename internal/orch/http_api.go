@@ -672,6 +672,16 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		}
 	}))
 
+	mux.HandleFunc("/api/adhoc", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := handleAdhoc(w, r, cfg, st); err != nil {
+			log.Printf("adhoc: %v", err)
+		}
+	}))
+
 	if cfg.Orch.Capture != nil {
 		registerCaptureRoutes(mux, cfg)
 	}
