@@ -64,9 +64,19 @@ function emptySnap(): Snap {
 }
 function normalizeSnap(raw: any): Snap {
   if (!raw || typeof raw !== 'object') return emptySnap()
+  const users: any[] = Array.isArray(raw.user) ? raw.user : []
+  // Backfill: any auto-injected link node missing the compact flag
+  // (added later) should render as a chip too.
+  for (const u of users) {
+    if (u && typeof u === 'object' && u.type === 'link'
+        && typeof u.id === 'string' && u.id.startsWith('auto-')
+        && u.data && u.data.compact !== true) {
+      u.data.compact = true
+    }
+  }
   return {
     cards: raw.cards ?? {},
-    user: raw.user ?? [],
+    user: users,
     strokes: raw.strokes ?? [],
     edges: raw.edges ?? [],
     viewport: raw.viewport,

@@ -97,11 +97,15 @@ export type LinkData = {
   description?: string
   site?: string
   snippet?: string
+  compact?: boolean
+  source?: string
   onDelete: () => void
 }
 
 export const LINK_W = 280
 export const LINK_H = 230
+export const LINK_CHIP_W = 220
+export const LINK_CHIP_H = 36
 
 const VARIANT_STYLE: Record<LinkVariant, { icon: string; bg: string; ring: string; text: string }> = {
   youtube:       { icon: '▶',  bg: 'bg-red-50 dark:bg-red-900/20',           ring: 'ring-red-200 dark:ring-red-700/40',         text: 'text-red-700 dark:text-red-300' },
@@ -117,6 +121,47 @@ const VARIANT_STYLE: Record<LinkVariant, { icon: string; bg: string; ring: strin
 export function LinkNode({ data }: NodeProps<Node<LinkData, 'link'>>) {
   const s = VARIANT_STYLE[data.variant]
   const host = (() => { try { return new URL(data.url).hostname.replace(/^www\./, '') } catch { return data.url } })()
+  if (data.compact) {
+    const label = (() => {
+      try {
+        const u = new URL(data.url)
+        // gist: show "gist · abc1234". GH: "<owner>/<repo>#N" for PR/issue.
+        if (data.variant === 'gist') {
+          const id = u.pathname.split('/').filter(Boolean).pop() ?? ''
+          return `gist · ${id.slice(0, 8)}`
+        }
+        if (data.variant === 'pr' || data.variant === 'issue') {
+          const m = u.pathname.match(/^\/([^/]+)\/([^/]+)\/(?:pull|issues)\/(\d+)/)
+          if (m) return `${m[2]}#${m[3]}`
+        }
+        if (data.variant === 'github-code') {
+          const m = u.pathname.match(/^\/([^/]+)\/([^/]+)\/blob\/[^/]+\/(.+)/)
+          if (m) return `${m[2]} · ${m[3].split('/').pop()}`
+        }
+        return host + (u.pathname.length > 1 ? u.pathname : '')
+      } catch { return data.url }
+    })()
+    return (
+      <a
+        href={data.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+        className={`${s.bg} ring-1 ${s.ring} rounded-full shadow-sm hover:shadow-md flex items-center gap-2 px-3 group no-underline`}
+        style={{ width: LINK_CHIP_W, height: LINK_CHIP_H }}
+        title={data.source ? `${label}  (from ${data.source})` : label}
+      >
+        <span className={`${s.text} text-[12px]`}>{s.icon}</span>
+        <span className={`mono text-[11px] truncate flex-1 ${s.text}`}>{label}</span>
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); data.onDelete() }}
+          className="text-zinc-400 hover:text-rose-600 text-[12px] opacity-0 group-hover:opacity-100 transition-opacity"
+        >×</button>
+      </a>
+    )
+  }
   return (
     <div
       className={`${s.bg} ring-1 ${s.ring} rounded-xl shadow-sm hover:shadow-md overflow-hidden flex flex-col group`}
