@@ -6,6 +6,14 @@
 ///   - snap.json layout sync (snap, snap-put frames)
 ///   - tmux pane stream fanout (pane frame)
 ///   - per-tab cursor + presence broadcast on the events WS
+///
+/// On silent error handling: WS sends in this file are wrapped in
+/// `try { ws.send(...) } catch {}` by design. A peer can disconnect at
+/// any instant between our last delivery and the next send; throwing on
+/// every such race would make this file unreadable and add nothing.
+/// Hibernation + close handlers do the real cleanup (refcounts, presence
+/// leaves). The outer message-handler catch logs to console.error so a
+/// genuine bug surfaces in wrangler tail.
 import { defineTunnelSession } from 'cfrelaytun'
 
 interface Env {
@@ -114,7 +122,9 @@ export class UserSession extends Base {
       }
       // Fall through to the base lib (req/res/cancel/ws-* + binary stream).
       return super.webSocketMessage(ws, data)
-    } catch {}
+    } catch (e) {
+      console.error('webSocketMessage:', e)
+    }
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {

@@ -94,7 +94,7 @@ func refreshMaintainers(cfg *Config, st *State, ttl time.Duration) error {
 	st.Maintainers = &MaintainerCache{FetchedAt: time.Now(), Members: humans}
 	log.Printf("mentions: refreshed maintainer cache for %s (%d humans, %d bots filtered)",
 		cfg.Orch.Mentions.Org, len(humans), len(members)-len(humans))
-	_ = saveState(st)
+	saveStateLogged(st)
 	return nil
 }
 
@@ -506,6 +506,6 @@ func mentionTick(cfg *Config, st *State) {
 	}
 	if maxSeen.After(since) {
 		st.MentionCursor = &maxSeen
-		_ = saveState(st)
+		saveStateLogged(st)
 	}
 }

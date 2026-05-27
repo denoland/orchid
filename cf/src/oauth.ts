@@ -19,6 +19,9 @@ interface Session {
 }
 
 const COOKIE = 'orchid_session'
+// Session cookie lifetime. 30 days matches the GitHub OAuth refresh
+// window — re-prompting the user before then offers no real benefit.
+const SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 // Short-lived cookie that binds an in-flight OAuth state to the browser
 // that started the flow. Defends against login-CSRF: an attacker who
 // initiates /login can obtain a state value, but without the matching
@@ -141,7 +144,7 @@ export async function handleOAuthCallback(env: Env, req: Request): Promise<Respo
   const cookie = await signSession(env.SESSION_KEY, session)
   const headers = new Headers()
   headers.append('set-cookie',
-    `${COOKIE}=${cookie}; Domain=.${env.ROOT_DOMAIN}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`)
+    `${COOKIE}=${cookie}; Domain=.${env.ROOT_DOMAIN}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_MAX_AGE_SECONDS}`)
   // Burn the one-shot state cookie — it's no longer useful and would
   // linger as an idle target for the next CSRF attempt.
   headers.append('set-cookie',

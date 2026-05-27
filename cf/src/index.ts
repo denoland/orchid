@@ -29,9 +29,10 @@ interface Env {
 const app = new Hono<{ Bindings: Env }>()
 
 // Per-isolate cache for non-owner access checks. Cuts the DO round-trip
-// to one per (sub, login) per 60s — the operator-defined allowlist
-// changes rarely (when the agent reconnects with a fresh
+// to one per (sub, login) per ACCESS_CACHE_TTL_MS — the operator-defined
+// allowlist changes rarely (when the agent reconnects with a fresh
 // `allowed_logins` frame) and a brief lag is fine.
+const ACCESS_CACHE_TTL_MS = 60_000
 const accessCache = new Map<string, { ok: boolean; expires: number }>()
 async function checkAllowed(env: Env, sub: string, login: string): Promise<boolean> {
   const key = sub + '|' + login.toLowerCase()
@@ -43,7 +44,7 @@ async function checkAllowed(env: Env, sub: string, login: string): Promise<boole
       'https://internal/_check_access?login=' + encodeURIComponent(login),
     ))
     const j = (await r.json()) as { ok: boolean }
-    accessCache.set(key, { ok: !!j.ok, expires: Date.now() + 60_000 })
+    accessCache.set(key, { ok: !!j.ok, expires: Date.now() + ACCESS_CACHE_TTL_MS })
     return !!j.ok
   } catch {
     return false
