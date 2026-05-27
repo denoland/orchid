@@ -11,17 +11,21 @@ Visit https://orchid.littledivy.com to get started
 
 ### Setup
 
-On a Linux/macOS machine run:
-```
-curl -fsSL https://orchid.littledivy.com/install.sh | sh
+The orch daemon runs on Linux (systemd + tmux + ssh). To self-host:
+
+```bash
+curl -fsSL https://orchid.littledivy.com/install.sh | bash
 ```
 
-Login https://orchid.littledivy.com and copy your setup token
-```
+Or sign in at https://orchid.littledivy.com and run `orch join` to attach
+this machine as a worker — the daemon stays in the cloud and your local
+box (Linux or macOS) acts as the agent host:
+
+```bash
 orch join wss://username.orchid.littledivy.com/agent <TOKEN>
 ```
 
-Access your dashboard at https://username.orchid.littledivy.com
+Then access your dashboard at https://username.orchid.littledivy.com
 
 ## Configuration
 

@@ -5,12 +5,33 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"sync"
 	"time"
 )
+
+// claudeHome returns the home directory containing ~/.claude for the
+// user that runs claude on the given VM. Per-VM session_home wins;
+// otherwise local VMs use the orch daemon's own $HOME (correct on Mac
+// + Linux dev installs) and remote VMs assume /home/<user> (workers
+// are Linux).
+func claudeHome(vm VMBlock) string {
+	if vm.SessionHome != "" {
+		return vm.SessionHome
+	}
+	if isLocal(vm) {
+		if h, err := os.UserHomeDir(); err == nil && h != "" {
+			return h
+		}
+	}
+	if vm.User != "" {
+		return "/home/" + vm.User
+	}
+	return "/home/orchid"
+}
 
 // RateLimit mirrors Claude Code's statusline rate_limits payload — a
 // used_percentage 0-100 plus a unix-second reset timestamp. The same
@@ -111,14 +132,7 @@ func latestQuota() (RateLimit, RateLimit, bool) {
 }
 
 func tailStatusLine(ctx context.Context, vm VMBlock, bcast chan<- struct{}) {
-	home := vm.SessionHome
-	if home == "" && vm.User != "" {
-		home = "/home/" + vm.User
-	}
-	if home == "" {
-		home = "/home/orchid"
-	}
-	path := home + "/.claude/statusline.jsonl"
+	path := claudeHome(vm) + "/.claude/statusline.jsonl"
 	log.Printf("usage: tailing %s on %s", path, vm.Name)
 	for ctx.Err() == nil {
 		var cmd *exec.Cmd
