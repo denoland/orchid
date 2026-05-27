@@ -1,11 +1,13 @@
 import SwiftUI
+import UIKit
 import Compression
+import SwiftTerm
 
-/// Live tmux pane viewer.
-///
-/// Opens an SSE stream at /api/pane/stream?s=<tmux>. Each frame is
-/// `data: z:<base64-gzip>` — we gunzip, strip ANSI escapes, and show
-/// the latest snapshot. Send keystrokes back with POST /api/pane.
+/// Live tmux pane viewer powered by SwiftTerm. The orch SSE stream
+/// delivers gzipped tmux capture-pane frames; we gunzip and feed the
+/// raw bytes (with ANSI escapes intact) to a SwiftTerm view so the
+/// TUI renders properly. Keystrokes from the on-screen keyboard +
+/// quick-key bar POST back through /api/pane.
 struct PaneView: View {
     let tmux: String
     let title: String
@@ -13,23 +15,18 @@ struct PaneView: View {
     @AppStorage("orchid.endpoint")    private var endpoint: String = ""
     @AppStorage("orchid.http_secret") private var httpSecret: String = ""
 
-    @State private var screen: String = ""
-    @State private var input: String = ""
     @State private var streamTask: Task<Void, Never>?
-    @State private var connected = false
     @State private var errorMsg: String?
-    @FocusState private var inputFocused: Bool
+
+    // The TerminalView is created once and shared with the bridge so we
+    // can `.feed()` it from the network task.
+    @StateObject private var bridge = TermBridge()
 
     var body: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                Text(screen.isEmpty ? "connecting…" : screen)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-                    .textSelection(.enabled)
-            }
+            TerminalRepresentable(bridge: bridge, onSend: { data in
+                Task { await self.send(data: data) }
+            })
             .background(Color.black)
 
             if let err = errorMsg {
@@ -42,7 +39,6 @@ struct PaneView: View {
             }
 
             keyBar
-            inputBar
         }
         .background(Color.black)
         .navigationTitle(title)
@@ -54,7 +50,7 @@ struct PaneView: View {
         .onDisappear { stop() }
     }
 
-    // ─── key bar (Esc / Tab / Ctrl-C / Enter shortcuts) ─────────────
+    // ─── key bar (Esc / Tab / arrows / Ctrl-C / Enter) ───────────────
     private var keyBar: some View {
         HStack(spacing: 6) {
             keyButton("Esc")  { Task { await send("\u{1B}") } }
@@ -80,42 +76,7 @@ struct PaneView: View {
         }
     }
 
-    // ─── input bar ──────────────────────────────────────────────────
-    private var inputBar: some View {
-        HStack(spacing: 8) {
-            TextField("type, send with ⏎", text: $input, axis: .horizontal)
-                .font(.system(size: 13, design: .monospaced))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 10).padding(.vertical, 8)
-                .background(Color(white: 0.18))
-                .cornerRadius(6)
-                .focused($inputFocused)
-                .autocorrectionDisabled()
-                .textInputAutocapitalization(.never)
-                .submitLabel(.send)
-                .onSubmit {
-                    let payload = input + "\r"
-                    input = ""
-                    Task { await send(payload) }
-                }
-            Button {
-                let payload = input
-                input = ""
-                Task { await send(payload) }
-            } label: {
-                Image(systemName: "paperplane.fill")
-                    .foregroundStyle(.white)
-                    .padding(10)
-                    .background(Color.accentColor)
-                    .clipShape(Circle())
-            }
-            .disabled(input.isEmpty)
-        }
-        .padding(8)
-        .background(Color.black)
-    }
-
-    // ─── stream lifecycle ───────────────────────────────────────────
+    // ─── SSE stream lifecycle ───────────────────────────────────────
     private func start() {
         guard let base = baseURL(),
               let url = URL(string: "\(base.absoluteString)/api/pane/stream?s=\(tmux)&cols=80&rows=30")
@@ -124,31 +85,53 @@ struct PaneView: View {
         streamTask = Task {
             var req = URLRequest(url: url)
             req.timeoutInterval = 0
+            req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             if !httpSecret.isEmpty {
                 req.setValue("Bearer \(httpSecret)", forHTTPHeaderField: "Authorization")
             }
             req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+            let session = makeSSESession()
+            let stream = AsyncThrowingStream<Data, Error> { continuation in
+                let delegate = SSEDelegate(continuation: continuation)
+                let task = session.dataTask(with: req)
+                task.delegate = delegate
+                continuation.onTermination = { _ in task.cancel() }
+                task.resume()
+            }
             do {
-                let (bytes, resp) = try await URLSession.shared.bytes(for: req)
-                if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
-                    errorMsg = "stream http \(http.statusCode)"; return
-                }
-                errorMsg = nil
-                connected = true
-                for try await line in bytes.lines {
+                var buffer = Data()
+                for try await chunk in stream {
                     guard !Task.isCancelled else { return }
-                    if line.hasPrefix("data: z:") {
-                        let b64 = String(line.dropFirst("data: z:".count))
-                        if let snap = decodeFrame(b64) {
-                            await MainActor.run { self.screen = snap }
+                    buffer.append(chunk)
+                    while let nl = buffer.firstIndex(of: 0x0A) {
+                        let line = buffer.prefix(upTo: nl)
+                        buffer.removeSubrange(0...nl)
+                        guard let s = String(data: line, encoding: .utf8) else { continue }
+                        let trimmed = s.hasSuffix("\r") ? String(s.dropLast()) : s
+                        if trimmed.hasPrefix("data: z:") {
+                            let b64 = String(trimmed.dropFirst("data: z:".count))
+                            if let raw = decodeFrame(b64) {
+                                let clear: [UInt8] = [0x1B, 0x5B, 0x48, 0x1B, 0x5B, 0x32, 0x4A]
+                                await bridge.feed(clear + Array(raw))
+                            }
                         }
                     }
                 }
             } catch {
-                if !Task.isCancelled { errorMsg = error.localizedDescription }
+                if !Task.isCancelled {
+                    await MainActor.run { errorMsg = error.localizedDescription }
+                }
             }
-            connected = false
         }
+    }
+
+    private func makeSSESession() -> URLSession {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 0
+        cfg.timeoutIntervalForResource = 0
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        cfg.waitsForConnectivity = false
+        return URLSession(configuration: cfg)
     }
 
     private func stop() {
@@ -158,18 +141,23 @@ struct PaneView: View {
 
     // ─── send keystrokes ────────────────────────────────────────────
     private func send(_ s: String) async {
-        guard !s.isEmpty,
+        await send(data: Array(s.utf8))
+    }
+    private func send(data bytes: [UInt8]) async {
+        guard !bytes.isEmpty,
               let base = baseURL(),
               let url = URL(string: "\(base.absoluteString)/api/pane?s=\(tmux)")
         else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.httpBody = s.data(using: .utf8)
+        req.httpBody = Data(bytes)
         if !httpSecret.isEmpty {
             req.setValue("Bearer \(httpSecret)", forHTTPHeaderField: "Authorization")
         }
         do { _ = try await URLSession.shared.data(for: req) }
-        catch { errorMsg = error.localizedDescription }
+        catch {
+            await MainActor.run { errorMsg = error.localizedDescription }
+        }
     }
 
     private func baseURL() -> URL? {
@@ -182,45 +170,109 @@ struct PaneView: View {
     }
 }
 
-// ─── gunzip + ANSI strip ────────────────────────────────────────────
+// ─── SSE delegate ────────────────────────────────────────────────────
+// URLSession's bytes(for:) buffers SSE bodies before delivering lines,
+// which made the pane appear to hang for ~30s before any frame showed.
+// A plain delegate-driven data task pushes each `didReceive` straight
+// into an AsyncThrowingStream so frames arrive as the server flushes.
 
-private func decodeFrame(_ b64: String) -> String? {
-    guard let gz = Data(base64Encoded: b64) else { return nil }
-    guard let raw = gunzip(gz) else { return nil }
-    let s = String(decoding: raw, as: UTF8.self)
-    return stripANSI(s)
+final class SSEDelegate: NSObject, URLSessionDataDelegate {
+    let continuation: AsyncThrowingStream<Data, Error>.Continuation
+    init(continuation: AsyncThrowingStream<Data, Error>.Continuation) {
+        self.continuation = continuation
+    }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive data: Data) {
+        continuation.yield(data)
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
+        if let error { continuation.finish(throwing: error) }
+        else { continuation.finish() }
+    }
 }
 
-/// In-place gunzip via Compression framework. Inflates a complete
-/// gzip stream into one buffer — pane frames are small (a few KB).
+// ─── SwiftTerm bridge ────────────────────────────────────────────────
+
+/// Shared handle to a TerminalView that SwiftUI lifecycle owns and the
+/// SSE task feeds into. Lives in a StateObject so it survives view
+/// re-renders without dropping scrollback.
+final class TermBridge: ObservableObject {
+    var terminal: TerminalView?
+
+    @MainActor
+    func feed(_ bytes: [UInt8]) {
+        terminal?.feed(byteArray: bytes[...])
+    }
+}
+
+private struct TerminalRepresentable: UIViewRepresentable {
+    let bridge: TermBridge
+    let onSend: ([UInt8]) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onSend: onSend) }
+
+    func makeUIView(context: Context) -> TerminalView {
+        let tv = TerminalView()
+        tv.terminalDelegate = context.coordinator
+        tv.backgroundColor = .black
+        tv.nativeForegroundColor = .white
+        tv.nativeBackgroundColor = .black
+        // Match the cols/rows we request from the server.
+        bridge.terminal = tv
+        return tv
+    }
+
+    func updateUIView(_ uiView: TerminalView, context: Context) {}
+
+    final class Coordinator: NSObject, TerminalViewDelegate {
+        let onSend: ([UInt8]) -> Void
+        init(onSend: @escaping ([UInt8]) -> Void) { self.onSend = onSend }
+        func send(source: TerminalView, data: ArraySlice<UInt8>) { onSend(Array(data)) }
+        func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {}
+        func scrolled(source: TerminalView, position: Double) {}
+        func setTerminalTitle(source: TerminalView, title: String) {}
+        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+        func requestOpenLink(source: TerminalView, link: String, params: [String : String]) {}
+        func bell(source: TerminalView) {}
+        func clipboardCopy(source: TerminalView, content: Data) {}
+        func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
+    }
+}
+
+// ─── gunzip ─────────────────────────────────────────────────────────
+
+private func decodeFrame(_ b64: String) -> Data? {
+    guard let gz = Data(base64Encoded: b64) else { return nil }
+    return gunzip(gz)
+}
+
+/// Gunzip via Apple's libcompression. orch frames are gzip — magic
+/// 1f 8b 08 ... followed by raw DEFLATE then a CRC+ISIZE trailer.
+/// COMPRESSION_ZLIB on Apple platforms decodes raw deflate (no zlib
+/// header), so strip the 10-byte gzip header + 8-byte trailer and
+/// hand the deflate body to the framework.
 private func gunzip(_ data: Data) -> Data? {
+    guard data.count > 18, data[0] == 0x1f, data[1] == 0x8b else { return nil }
     let chunk = 64 * 1024
     var out = Data()
     return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Data? in
         let src = raw.bindMemory(to: UInt8.self).baseAddress!
-        let stream = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
-        defer { stream.deallocate() }
-        var s = compression_stream(dst_ptr: UnsafeMutablePointer<UInt8>.allocate(capacity: chunk),
-                                   dst_size: chunk,
-                                   src_ptr: src,
-                                   src_size: data.count,
+        let dst = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { dst.deallocate() }
+        var s = compression_stream(dst_ptr: dst, dst_size: chunk,
+                                   src_ptr: src.advanced(by: 10),
+                                   src_size: data.count - 10 - 8,
                                    state: nil)
-        defer { s.dst_ptr.advanced(by: -(chunk - s.dst_size)).deallocate() }
-        let dstStart = s.dst_ptr
-        guard compression_stream_init(&s, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else { return nil }
+        guard compression_stream_init(&s, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB)
+              == COMPRESSION_STATUS_OK else { return nil }
         defer { compression_stream_destroy(&s) }
-        // Skip gzip header (10 bytes minimum): magic 1f 8b, method 08, flags,
-        // mtime(4), xfl, os. Trailing 8 bytes (crc32 + isize) ignored by raw zlib.
-        let headerLen = 10
-        if data.count <= headerLen { return nil }
-        s.src_ptr  = src.advanced(by: headerLen)
-        s.src_size = data.count - headerLen - 8
         while true {
             let status = compression_stream_process(&s, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
             let produced = chunk - s.dst_size
             if produced > 0 {
-                out.append(Data(bytes: dstStart, count: produced))
-                s.dst_ptr = dstStart
+                out.append(Data(bytes: dst, count: produced))
+                s.dst_ptr = dst
                 s.dst_size = chunk
             }
             switch status {
@@ -230,41 +282,4 @@ private func gunzip(_ data: Data) -> Data? {
             }
         }
     }
-}
-
-/// Drop ANSI CSI / OSC escape sequences and most control bytes so the
-/// text is legible in SwiftUI without a full terminal renderer.
-private func stripANSI(_ s: String) -> String {
-    var out = String(); out.reserveCapacity(s.count)
-    let chars = Array(s.unicodeScalars)
-    var i = 0
-    while i < chars.count {
-        let c = chars[i]
-        if c == "\u{001B}" {
-            // ESC [...] sequence
-            i += 1
-            if i < chars.count && (chars[i] == "[" || chars[i] == "(" || chars[i] == ")") {
-                i += 1
-                while i < chars.count {
-                    let x = chars[i]; i += 1
-                    if (x.value >= 0x40 && x.value <= 0x7E) { break }
-                }
-            } else if i < chars.count && chars[i] == "]" {
-                // OSC — terminated by BEL or ESC \
-                i += 1
-                while i < chars.count {
-                    if chars[i] == "\u{0007}" { i += 1; break }
-                    if chars[i] == "\u{001B}" && i + 1 < chars.count && chars[i+1] == "\\" { i += 2; break }
-                    i += 1
-                }
-            } else {
-                i += 1
-            }
-            continue
-        }
-        if c.value < 0x20 && c != "\n" && c != "\t" { i += 1; continue }
-        out.unicodeScalars.append(c)
-        i += 1
-    }
-    return out
 }
