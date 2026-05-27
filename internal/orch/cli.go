@@ -739,7 +739,17 @@ func runRun(args []string) {
 		Tmux string `json:"tmux"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&reply)
-	fmt.Printf("orch run: started %s — view in dashboard.\n", reply.Tmux)
+	fmt.Printf("orch run: started %s — attaching (detach with Ctrl-b d).\n", reply.Tmux)
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "orch run: tmux not on PATH (%v) — pane is live on this host, attach manually: tmux attach -t %s\n", err, reply.Tmux)
+		return
+	}
+	// Replace ourselves with tmux so the user lands directly in the
+	// pane and Ctrl-C / detach behave normally.
+	if err := syscall.Exec(tmux, []string{"tmux", "attach-session", "-t", reply.Tmux}, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "orch run: exec tmux: %v\n", err)
+	}
 }
 
 func Main() {
