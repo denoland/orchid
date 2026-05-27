@@ -124,13 +124,19 @@ app.use('*', async (c, next) => {
   const isCapture = c.req.raw.method === 'POST' &&
     (url.pathname === '/api/drafts' || url.pathname.startsWith('/captures/'))
   const isVMJoin = c.req.raw.method === 'POST' && url.pathname === '/api/vm/join'
+  // Any /api/* request that already carries a Bearer token gets to skip
+  // the session-cookie gate — orch will reject the bearer itself if wrong.
+  // This is what the iOS app + scripted callers use: paste http_secret
+  // into Authorization and hit /api/state directly.
+  const isApiBearer = url.pathname.startsWith('/api/') &&
+    (c.req.raw.headers.get('authorization') ?? '').toLowerCase().startsWith('bearer ')
 
   // currentUser() runs an HMAC verify on the session cookie; skip it for
   // capture POSTs and /api/vm/join which never carry a session cookie
   // (they carry their own bearer tokens checked inside orch). user stays
   // null in those cases — DO-side auth is the real gate.
   let user: Awaited<ReturnType<typeof currentUser>> = null
-  if (!isCapture && !isVMJoin) {
+  if (!isCapture && !isVMJoin && !isApiBearer) {
     // Everything else on a subdomain is private. Two ways in:
     //   1. Owner (cookie.subdomain === host's subdomain).
     //   2. Allowed login (operator-defined list pushed by the agent from
