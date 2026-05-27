@@ -287,6 +287,31 @@ func tick(cfg *Config, st *State) {
 
 	budget := killBudget{max: maxKillsPerTick}
 	for n, j := range st.Jobs {
+		// Adhoc jobs (from `orch run <title>`) aren't backed by a
+		// GitHub issue — skip the open/allOpen lifecycle gates and the
+		// PR machinery below. Tmux liveness alone decides their fate.
+		if j.Lifecycle == "adhoc" {
+			vm := vmByName(cfg, j.VM)
+			if vm == nil {
+				log.Printf("adhoc %s: vm %q gone, dropping", j.Tmux, j.VM)
+				delete(st.Jobs, n)
+				_ = saveState(st)
+				continue
+			}
+			if h := st.VMHealth(vm.Name); !h.LastOK.IsZero() && !h.Online {
+				continue
+			}
+			alive, err := tmuxHasSession(*vm, j.Tmux)
+			if err != nil {
+				continue
+			}
+			if !alive {
+				log.Printf("adhoc %s: tmux gone, dropping", j.Tmux)
+				delete(st.Jobs, n)
+				_ = saveState(st)
+			}
+			continue
+		}
 		if r, routedOpen := open[n]; routedOpen {
 			j.IssueTitle = r.is.Title
 			wantCron := r.is.hasLabel("cron")
