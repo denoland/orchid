@@ -125,6 +125,12 @@ type State struct {
 	httpSnap      atomic.Value
 	Bcast         chan struct{} `json:"-"`
 
+	// Monotonic counter for synthetic ids on adhoc jobs (orch run).
+	// Decrements without ever colliding even when concurrent calls
+	// happen while tick() holds st.mu. Initialised from min(Jobs key)
+	// at startup so restarts don't reuse ids.
+	adhocSeq atomic.Int64
+
 	// VM reachability snapshot, updated by the SSH probe loop. Not
 	// persisted — a fresh process starts with everything unknown and
 	// fills in within one probe interval.
@@ -1015,6 +1021,12 @@ func loadState(dbPath string) (*State, error) {
 		Maintainers:   maint,
 		store:         store,
 		Bcast:         make(chan struct{}, 1),
+	}
+	// Seed the adhoc counter so reissued ids skip everything persisted.
+	for k := range jobs {
+		if int64(k) < s.adhocSeq.Load() {
+			s.adhocSeq.Store(int64(k))
+		}
 	}
 	return s, nil
 }

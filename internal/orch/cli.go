@@ -592,19 +592,9 @@ func handleAdhoc(w http.ResponseWriter, r *http.Request, cfg *Config, st *State)
 		return fmt.Errorf("unknown vm %q", req.VM)
 	}
 
-	// Allocate the id under the lock, then drop it before the SSH —
-	// tick() holds st.mu for its whole pass and the spawn ssh can take
-	// seconds, so holding the lock here would serialize /api/adhoc
-	// behind every tick respawn.
-	st.mu.Lock()
-	id := -1
-	for k := range st.Jobs {
-		if k <= id {
-			id = k - 1
-		}
-	}
-	st.mu.Unlock()
-
+	// Synthetic id off the atomic counter — no st.mu wait, so /api/adhoc
+	// returns even when tick() holds the state lock for a full pass.
+	id := int(st.adhocSeq.Add(-1))
 	session := fmt.Sprintf("adhoc-%d", -id)
 	workdir := strings.TrimRight(vmWorkdirRoot(cfg.Orch, *vm), "/") + "/" + session
 
