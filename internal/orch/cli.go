@@ -109,6 +109,10 @@ func runJoinVM(args []string) {
 	sshUser := fs.String("user", "orchid", "SSH user on this VM central connects as (must already exist)")
 	name := fs.String("name", "", "VM name central should record (default: central allocates)")
 	insecure := fs.Bool("insecure-http", false, "allow plain-http central-url (required to send bot github keys over the wire)")
+	// Go's flag.Parse stops at the first non-flag arg, so flags placed
+	// after positionals are silently ignored. Re-order so flags come
+	// first — lets users type `orch join vm URL TOKEN --user=...` too.
+	args = reorderFlagsFirst(args)
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
@@ -178,6 +182,39 @@ func runJoinVM(args []string) {
 	if got.BotGithubPrivateKey == "" {
 		fmt.Println("warning: central did not push a bot github key — make sure this host has its own SSH access to github (e.g. `gh auth login` + ssh-keygen + add to github bot account) or claude sessions won't be able to `git clone` here.")
 	}
+}
+
+// reorderFlagsFirst moves --flag / -flag tokens (and their values) to
+// the front of args so flag.Parse picks them up regardless of placement.
+// Stops splitting on `--` so trailing pass-through args still work.
+func reorderFlagsFirst(args []string) []string {
+	var flags, pos []string
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if a == "--" {
+			pos = append(pos, args[i:]...)
+			break
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			flags = append(flags, a)
+			// `--flag value` form: pull the next token too unless it
+			// itself looks like a flag.
+			if !strings.Contains(a, "=") && i+1 < len(args) {
+				next := args[i+1]
+				if !strings.HasPrefix(next, "-") {
+					flags = append(flags, next)
+					i += 2
+					continue
+				}
+			}
+			i++
+			continue
+		}
+		pos = append(pos, a)
+		i++
+	}
+	return append(flags, pos...)
 }
 
 func detectPublicAddr() string {
@@ -383,6 +420,17 @@ func handleVMJoin(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	name := req.Name
+	if name == "" {
+		// Reuse an existing join_managed block whose host+user match,
+		// so a worker retrying after a failed install doesn't spawn a
+		// duplicate vm-N entry every attempt.
+		for _, v := range current.VMs {
+			if v.JoinManaged && v.Host == req.Hostname && v.User == req.SSHUser {
+				name = v.Name
+				break
+			}
+		}
+	}
 	if name == "" {
 		name = allocVMName(&current, req.Hostname)
 	}
