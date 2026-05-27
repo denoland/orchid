@@ -592,6 +592,10 @@ func handleAdhoc(w http.ResponseWriter, r *http.Request, cfg *Config, st *State)
 		return fmt.Errorf("unknown vm %q", req.VM)
 	}
 
+	// Allocate the id under the lock, then drop it before the SSH —
+	// tick() holds st.mu for its whole pass and the spawn ssh can take
+	// seconds, so holding the lock here would serialize /api/adhoc
+	// behind every tick respawn.
 	st.mu.Lock()
 	id := -1
 	for k := range st.Jobs {
@@ -599,6 +603,8 @@ func handleAdhoc(w http.ResponseWriter, r *http.Request, cfg *Config, st *State)
 			id = k - 1
 		}
 	}
+	st.mu.Unlock()
+
 	session := fmt.Sprintf("adhoc-%d", -id)
 	workdir := strings.TrimRight(vmWorkdirRoot(cfg.Orch, *vm), "/") + "/" + session
 
@@ -612,11 +618,11 @@ tmux kill-session -t %q 2>/dev/null || true
 tmux new-session -d -c %q -s %q %q
 `, workdir, session, workdir, session, sessionCmd)
 	if _, errStr, err := sshExecIn(*vm, script, "bash -s"); err != nil {
-		st.mu.Unlock()
 		http.Error(w, "spawn: "+strings.TrimSpace(errStr), http.StatusInternalServerError)
 		return fmt.Errorf("spawn: %v: %s", err, errStr)
 	}
 
+	st.mu.Lock()
 	st.Jobs[id] = &Job{
 		VM:         vm.Name,
 		Tmux:       session,
