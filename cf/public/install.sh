@@ -15,7 +15,6 @@
 # Env overrides:
 #   ORCHID_VERSION   release tag to install (default: latest)
 #   INBOX_REPO       inbox repo (prompted; central only)
-#   BOT_LOGIN        GitHub bot account (default: invoker's gh user)
 #   HTTP_SECRET      dashboard token (default: random 32 hex)
 #   CAPTURE_TOKEN    capture API token (default: random 32 hex)
 #
@@ -49,8 +48,6 @@ if [ "$(id -u)" -ne 0 ]; then
 else
   SUDO=""
 fi
-
-INVOKER=${SUDO_USER:-$USER}
 
 say "checking prerequisites"
 missing=()
@@ -107,25 +104,6 @@ if [ -z "${INBOX_REPO:-}" ]; then
   INBOX_REPO=${INBOX_REPO:-denoland/orchid}
 fi
 
-# Hand the orchid user the invoker's gh auth so the daemon can talk to
-# GitHub without a separate login step. Falls back to a noisy hint if
-# the invoker has no gh token of their own.
-if [ -n "${GH_TOKEN:-}" ]; then
-  TOKEN="$GH_TOKEN"
-elif command -v gh >/dev/null && [ "$INVOKER" != "root" ] && sudo -u "$INVOKER" gh auth status -h github.com >/dev/null 2>&1; then
-  TOKEN=$(sudo -u "$INVOKER" gh auth token 2>/dev/null || true)
-else
-  TOKEN=""
-fi
-if [ -n "$TOKEN" ]; then
-  printf '%s' "$TOKEN" | \
-    $SUDO -u "$ORCHID_USER" gh auth login --hostname github.com --git-protocol https --with-token
-  $SUDO -u "$ORCHID_USER" gh auth setup-git -h github.com >/dev/null
-fi
-
-BOT_LOGIN=${BOT_LOGIN:-$($SUDO -u "$ORCHID_USER" gh api user --jq .login 2>/dev/null || echo "")}
-[ -n "$BOT_LOGIN" ] || die "could not detect a GitHub login for orchid. \`sudo -u $ORCHID_USER gh auth login\` then re-run, or pass BOT_LOGIN=<user>."
-
 HTTP_SECRET=${HTTP_SECRET:-$(openssl rand -hex 16)}
 CAPTURE_TOKEN=${CAPTURE_TOKEN:-$(openssl rand -hex 16)}
 
@@ -141,7 +119,6 @@ github {
 }
 
 orchestrator {
-  bot_login     = "$BOT_LOGIN"
   poll_interval = "30s"
   state_db      = "$ORCHID_HOME/state.db"
   branch_prefix = "orch/"

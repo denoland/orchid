@@ -817,9 +817,17 @@ func Main() {
 	if err != nil {
 		log.Fatalf("poll_interval: %v", err)
 	}
+	// Auto-detect bot_login from gh's logged-in user when the operator
+	// didn't pin one in swarm.hcl. Saves the install path from having
+	// to know what GitHub account orchid will commit as.
+	if cfg.Orch.BotLogin == "" {
+		if out, _, err := run("gh", "api", "user", "--jq", ".login"); err == nil {
+			cfg.Orch.BotLogin = strings.TrimSpace(out)
+		}
+	}
 	for _, vm := range cfg.VMs {
 		if login, _ := vmBotIdentity(cfg.Orch, vm); login == "" {
-			log.Fatalf("vm %q: bot_login not set; configure orchestrator.bot_login or vm.%s.bot_login", vm.Name, vm.Name)
+			log.Fatalf("vm %q: bot_login not set and `gh api user` returned nothing. Either log gh in (`gh auth login` as the orchid user) or set orchestrator.bot_login in swarm.hcl.", vm.Name)
 		}
 	}
 	tnames := make([]string, 0, len(cfg.Targets))
