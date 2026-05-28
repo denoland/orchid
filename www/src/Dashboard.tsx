@@ -547,7 +547,7 @@ function DashboardInner({ state, relay }: Props) {
   // reverted card positions to their pre-drag values.
   const draggingRef = useRef(false)
   const [view, setView] = useState<'canvas' | 'list'>('canvas')
-  const [showSettings, setShowSettings] = useState(false)
+  const [showSettings, setShowSettings] = useState<false | SectionId>(false)
   const [showCapture, setShowCapture] = useState(false)
   // In list view, clicking a row opens this pane modal instead of a
   // canvas node (which doesn't render in list mode).
@@ -1057,14 +1057,18 @@ function DashboardInner({ state, relay }: Props) {
             snapRef.current.view = v
             persist()
           }}
-          onOpenSettings={() => setShowSettings(true)}
+          onOpenSettings={() => setShowSettings('orch')}
           onOpenCapture={() => setShowCapture(true)}
         />
       )}
-      {!showSettings && !showCapture && state.connect && !state.connect.github.connected && (
-        <ConnectBanner onOpen={() => setShowSettings(true)} />
+      {!showSettings && !showCapture && (
+        <WarningStack
+          githubConnected={!!state.connect?.github.connected}
+          inbox={state.inbox}
+          openSettings={(s) => setShowSettings(s)}
+        />
       )}
-      {showSettings && <SettingsPage jobs={jobs} state={state} relay={relay} onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsPage jobs={jobs} state={state} relay={relay} initialSection={showSettings} onClose={() => setShowSettings(false)} />}
       {showCapture && <CapturePage jobs={jobs} inbox={inbox} onClose={() => setShowCapture(false)} />}
       {view === 'canvas' && !showSettings && !showCapture && (
         <FloatingToolbar tool={tool} setTool={setTool} addNote={addNote} />
@@ -1387,14 +1391,66 @@ function DocsButton() {
   )
 }
 
-function ConnectBanner({ onOpen }: { onOpen: () => void }) {
+// Stacked top-center warnings. Lives above the header (z-50) so the
+// capture composer doesn't sit on top of it. Each row is dismissed by
+// fixing the underlying config (GitHub auth, target repos, etc), not
+// by a close button — keeps the dashboard honest about whether orchid
+// can actually do anything.
+function WarningStack({
+  githubConnected, inbox, openSettings,
+}: {
+  githubConnected: boolean
+  inbox?: string
+  openSettings: (section: SectionId) => void
+}) {
+  const [targetsOK, setTargetsOK] = useState<boolean | null>(null)
+  useEffect(() => {
+    let alive = true
+    fetch('/api/config', { credentials: 'include', cache: 'no-store' })
+      .then((r) => r.ok ? r.json() : null)
+      .then((j) => { if (alive) setTargetsOK(Array.isArray(j?.targets) && j.targets.length > 0) })
+      .catch(() => { if (alive) setTargetsOK(true) /* don't nag if probe fails */ })
+    return () => { alive = false }
+  }, [])
+
+  const rows: { label: string; cta: string; onClick: () => void }[] = []
+  if (!githubConnected) {
+    rows.push({
+      label: 'GitHub not connected — sessions are paused.',
+      cta: 'Connect',
+      onClick: () => openSettings('integrations'),
+    })
+  }
+  if (targetsOK === false) {
+    rows.push({
+      label: 'No targets configured — issues won’t match any repo.',
+      cta: 'Add target',
+      onClick: () => openSettings('targets'),
+    })
+  }
+  if (!inbox) {
+    rows.push({
+      label: 'Inbox repo not set — orchid has nothing to poll.',
+      cta: 'Set inbox',
+      onClick: () => openSettings('orch'),
+    })
+  }
+  if (rows.length === 0) return null
+
   return (
-    <div className="absolute top-16 left-1/2 -translate-x-1/2 z-20 mono text-[12px] px-3 py-1.5 rounded-md ring-1 ring-amber-300 dark:ring-amber-700/60 bg-amber-50 dark:bg-amber-900/30 text-amber-900 dark:text-amber-200 flex items-center gap-3 shadow-sm">
-      <span>GitHub not connected — sessions are paused.</span>
-      <button
-        onClick={onOpen}
-        className="px-2 py-0.5 rounded ring-1 ring-amber-300 dark:ring-amber-700 hover:bg-amber-100 dark:hover:bg-amber-900/50"
-      >Connect</button>
+    <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-2 items-center pointer-events-none">
+      {rows.map((r) => (
+        <div
+          key={r.label}
+          className="mono text-[12px] px-3 py-1.5 rounded-md ring-1 ring-amber-300 dark:ring-amber-700/60 bg-amber-50 dark:bg-amber-900/30 text-amber-900 dark:text-amber-200 flex items-center gap-3 shadow-sm pointer-events-auto"
+        >
+          <span>{r.label}</span>
+          <button
+            onClick={r.onClick}
+            className="px-2 py-0.5 rounded ring-1 ring-amber-300 dark:ring-amber-700 hover:bg-amber-100 dark:hover:bg-amber-900/50"
+          >{r.cta}</button>
+        </div>
+      ))}
     </div>
   )
 }
@@ -1732,10 +1788,11 @@ function timeAgo(iso?: string | null): string {
 
 type SectionId = 'orch' | 'integrations' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
 
-function SettingsPage({ jobs, state, relay, onClose }: {
+function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
   jobs: Job[]
   state: State
   relay: RelayInfo | null
+  initialSection?: SectionId
   onClose: () => void
 }) {
   const [cfg, setCfg] = useState<OrchestratorCfg | null>(null)
@@ -1746,7 +1803,7 @@ function SettingsPage({ jobs, state, relay, onClose }: {
     cfg: OrchestratorCfg; gh: GhCfg; targets: TargetCfg[]
   } | null>(null)
   const [status, setStatus] = useState<string>('')
-  const [section, setSection] = useState<SectionId>('orch')
+  const [section, setSection] = useState<SectionId>(initialSection ?? 'orch')
   const { repos, error: reposError } = useRepos(true)
 
   useEffect(() => {
