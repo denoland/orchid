@@ -84,13 +84,23 @@ function normalizeSnap(raw: any): Snap {
     view: raw.view === 'list' ? 'list' : 'canvas',
   }
 }
+// Current canvas id. Pulled from `?c=<id>` once at load; switching canvases
+// is a full page navigation (resetting React Flow's state mid-swap is more
+// trouble than a 200ms reload). 'default' is the canvas every orchid ships
+// with after the multi-canvas migration.
+export const CURRENT_CANVAS_ID =
+  (typeof location !== 'undefined' && new URLSearchParams(location.search).get('c')) || 'default'
+const SNAP_URL = CURRENT_CANVAS_ID === 'default'
+  ? '/api/snap'
+  : `/api/canvases/${encodeURIComponent(CURRENT_CANVAS_ID)}/snap`
+
 /// Fetches the layout snap from orch. Returns `null` on any failure
 /// (network, auth, parse). The caller must NOT treat null as "empty
 /// snap" — that would defeat the persisted layout the first time a
 /// request blips. Use `null` to keep the rebuild effect parked.
 async function fetchSnap(): Promise<Snap | null> {
   try {
-    const r = await fetch('/api/snap', { credentials: 'include', cache: 'no-store' })
+    const r = await fetch(SNAP_URL, { credentials: 'include', cache: 'no-store' })
     if (!r.ok) return null
     return normalizeSnap(await r.json())
   } catch { return null }
@@ -106,11 +116,14 @@ export function setSnapBusSender(fn: ((msg: any) => void) | null) { saveBusSende
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 let savePending: Snap | null = null
 function doPut(body: Snap) {
-  if (saveBusSender) {
+  // The bus protocol only carries one snap stream — the default canvas.
+  // Non-default canvases must round-trip through HTTP so the right row
+  // gets the update.
+  if (saveBusSender && CURRENT_CANVAS_ID === 'default') {
     try { saveBusSender({ t: 'snap-put', snap: body }) } catch {}
     return Promise.resolve()
   }
-  return fetch('/api/snap', {
+  return fetch(SNAP_URL, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
     credentials: 'include',
@@ -136,14 +149,14 @@ function flushSnap() {
   const body = savePending
   savePending = null
   if (!body) return
-  if (saveBusSender) {
+  if (saveBusSender && CURRENT_CANVAS_ID === 'default') {
     try { saveBusSender({ t: 'snap-put', snap: body }) } catch {}
     return
   }
   // sendBeacon survives navigation when the bus isn't available.
   const json = JSON.stringify(body)
   const sent = typeof navigator !== 'undefined' && navigator.sendBeacon &&
-    navigator.sendBeacon('/api/snap', new Blob([json], { type: 'application/json' }))
+    navigator.sendBeacon(SNAP_URL, new Blob([json], { type: 'application/json' }))
   if (!sent) doPut(body)
 }
 if (typeof window !== 'undefined') {
@@ -1070,6 +1083,7 @@ function DashboardInner({ state, relay }: Props) {
       )}
       {showSettings && <SettingsPage jobs={jobs} state={state} relay={relay} initialSection={showSettings} onClose={() => setShowSettings(false)} />}
       {showCapture && <CapturePage jobs={jobs} inbox={inbox} onClose={() => setShowCapture(false)} />}
+      {!showSettings && !showCapture && <CanvasSwitcher current={CURRENT_CANVAS_ID} />}
       {view === 'canvas' && !showSettings && !showCapture && (
         <FloatingToolbar tool={tool} setTool={setTool} addNote={addNote} />
       )}
@@ -1388,6 +1402,102 @@ function DocsButton() {
         <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
       </svg>
     </a>
+  )
+}
+
+// CanvasSwitcher renders a small dropdown pill at the top-left showing
+// the current canvas name + a list to jump between canvases. Switching
+// is a navigation (?c=<id>) so React Flow + collab tear down cleanly.
+function CanvasSwitcher({ current }: { current: string }) {
+  const [open, setOpen] = useState(false)
+  const [list, setList] = useState<{ id: string; name: string; updated_at: number }[] | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const refresh = async () => {
+    try {
+      const r = await fetch('/api/canvases', { credentials: 'include', cache: 'no-store' })
+      if (r.ok) setList(await r.json())
+    } catch { /* ignore */ }
+  }
+
+  useEffect(() => { refresh() }, [])
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open])
+
+  const currentRow = list?.find((c) => c.id === current)
+  const label = currentRow?.name ?? (current === 'default' ? 'Home' : current)
+
+  const goTo = (id: string) => {
+    const url = new URL(location.href)
+    if (id === 'default') url.searchParams.delete('c')
+    else url.searchParams.set('c', id)
+    location.href = url.toString()
+  }
+
+  const create = async () => {
+    const name = prompt('Canvas name')
+    if (!name) return
+    setBusy(true)
+    try {
+      const r = await fetch('/api/canvases', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      if (!r.ok) { alert('create failed: ' + await r.text()); return }
+      const j = await r.json()
+      goTo(j.id)
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="fixed top-3 left-3 z-40">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="mono text-[12px] px-2.5 py-1 rounded-md ring-1 ring-zinc-200 dark:ring-zinc-800 bg-white/90 dark:bg-zinc-950/80 backdrop-blur text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-900 flex items-center gap-2 shadow-sm"
+        title="Switch canvas"
+      >
+        <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
+          <rect x="3" y="4" width="18" height="14" rx="2" />
+        </svg>
+        <span>{label}</span>
+        <svg width={10} height={10} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </button>
+      {open && (
+        <div className="absolute top-9 left-0 w-56 rounded-md ring-1 ring-zinc-200 dark:ring-zinc-800 bg-white dark:bg-zinc-950 shadow-lg p-1">
+          <div className="max-h-72 overflow-auto">
+            {list === null && <div className="text-[11px] text-zinc-400 px-2 py-1.5">loading…</div>}
+            {list?.length === 0 && <div className="text-[11px] text-zinc-400 px-2 py-1.5">no canvases</div>}
+            {list?.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => goTo(c.id)}
+                className={
+                  'w-full text-left mono text-[12px] px-2 py-1 rounded ' +
+                  (c.id === current
+                    ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100'
+                    : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-900')
+                }
+              >{c.name}</button>
+            ))}
+          </div>
+          <div className="border-t border-zinc-200 dark:border-zinc-800 mt-1 pt-1">
+            <button
+              disabled={busy}
+              onClick={create}
+              className="w-full text-left mono text-[12px] px-2 py-1 rounded text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-900 disabled:opacity-50"
+            >+ new canvas</button>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
