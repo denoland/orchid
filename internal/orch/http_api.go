@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -18,10 +19,44 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/hashicorp/hcl/v2/hclsimple"
 )
+
+// eventsHub tracks active /api/events/ws subscribers so state pushes
+// and snap fanout reach every dashboard tab.
+type eventsHub struct {
+	mu   sync.RWMutex
+	subs map[*websocket.Conn]bool
+}
+
+var globalEventsHub = &eventsHub{subs: map[*websocket.Conn]bool{}}
+
+func (h *eventsHub) add(c *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.subs[c] = true
+}
+func (h *eventsHub) remove(c *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.subs, c)
+}
+func (h *eventsHub) broadcast(payload []byte, except *websocket.Conn) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for c := range h.subs {
+		if c == except {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = c.Write(ctx, websocket.MessageText, payload)
+		cancel()
+	}
+}
 
 const (
 	// Cap on /api/pane POST bodies. Pane input is keystrokes — never
@@ -697,6 +732,79 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 	if cfg.Orch.Capture != nil {
 		registerCaptureRoutes(mux, cfg)
 	}
+
+	// Background pusher: when the daemon broadcasts a state change
+	// (tick saves state, VM health flips, usage tick), push the latest
+	// /api/state JSON to every connected dashboard. Saves the SPA the
+	// 5s polling cadence and powers live card updates.
+	go func() {
+		if st.Bcast == nil {
+			return
+		}
+		for range st.Bcast {
+			body := buildAPIStateJSON(cfg, st)
+			var raw json.RawMessage = body
+			out, _ := json.Marshal(map[string]any{"t": "state", "state": raw})
+			globalEventsHub.broadcast(out, nil)
+		}
+	}()
+
+	mux.HandleFunc("/api/events/ws", auth(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify:  true, // same-origin only via the auth() gate
+			OriginPatterns:      []string{"*"},
+			CompressionMode:     websocket.CompressionDisabled,
+		})
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		globalEventsHub.add(c)
+		defer globalEventsHub.remove(c)
+
+		// Initial pushes: current state + snap so the dashboard renders
+		// without a fallback /api/state fetch.
+		ctx := r.Context()
+		stateBody := buildAPIStateJSON(cfg, st)
+		var raw json.RawMessage = stateBody
+		if msg, err := json.Marshal(map[string]any{"t": "state", "state": raw}); err == nil {
+			ictx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			_ = c.Write(ictx, websocket.MessageText, msg)
+			cancel()
+		}
+		if snapBody, err := st.store.GetSnap(); err == nil && len(snapBody) > 0 {
+			var snapRaw json.RawMessage = snapBody
+			if msg, err := json.Marshal(map[string]any{"t": "snap", "snap": snapRaw}); err == nil {
+				ictx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				_ = c.Write(ictx, websocket.MessageText, msg)
+				cancel()
+			}
+		}
+
+		// Reader loop: handle snap-put from one tab and fan out to others.
+		for {
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				return
+			}
+			var f struct {
+				T    string          `json:"t"`
+				Snap json.RawMessage `json:"snap"`
+			}
+			if err := json.Unmarshal(data, &f); err != nil {
+				continue
+			}
+			switch f.T {
+			case "snap-put":
+				if len(f.Snap) > 0 && json.Valid(f.Snap) {
+					if err := st.store.PutSnap(f.Snap); err == nil {
+						out, _ := json.Marshal(map[string]any{"t": "snap", "snap": f.Snap})
+						globalEventsHub.broadcast(out, c)
+					}
+				}
+			}
+		}
+	}))
 
 	mux.HandleFunc("/api/connect/status", auth(func(w http.ResponseWriter, r *http.Request) {
 		// Cheap to recompute on demand; the dashboard polls this while
