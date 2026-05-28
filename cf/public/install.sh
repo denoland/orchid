@@ -71,15 +71,22 @@ say "creating orchid system user"
 id "$ORCHID_USER" >/dev/null 2>&1 || \
   $SUDO useradd --system --create-home --home-dir "$ORCHID_HOME" --shell /bin/bash "$ORCHID_USER"
 
+# Fetch the release tarball through gh so a private orchid repo Just
+# Works — gh reuses the caller's existing auth. Run as the invoking
+# user (not via $SUDO) so we pick up their gh config in $HOME.
 say "downloading orch ($ORCHID_VERSION, linux-$ARCH)"
-if [ "$ORCHID_VERSION" = "latest" ]; then
-  TARBALL_URL="https://github.com/denoland/orchid/releases/latest/download/orch-linux-${ARCH}.tar.gz"
-else
-  TARBALL_URL="https://github.com/denoland/orchid/releases/download/${ORCHID_VERSION}/orch-linux-${ARCH}.tar.gz"
+if ! gh auth status -h github.com >/dev/null 2>&1; then
+  die "gh is not authenticated. Run \`gh auth login --hostname github.com --git-protocol https --web\` then re-run."
 fi
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
-curl -fsSL "$TARBALL_URL" | tar -xz -C "$TMPDIR"
+TAG=""
+[ "$ORCHID_VERSION" != "latest" ] && TAG="$ORCHID_VERSION"
+gh release download $TAG \
+  --repo denoland/orchid \
+  --pattern "orch-linux-${ARCH}.tar.gz" \
+  --dir "$TMPDIR" --clobber
+tar -xzf "$TMPDIR/orch-linux-${ARCH}.tar.gz" -C "$TMPDIR"
 $SUDO install -m 0755 "$TMPDIR/orch" "$ORCHID_BIN"
 
 if [ "$WORKER" = "1" ]; then
