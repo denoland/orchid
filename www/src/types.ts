@@ -53,9 +53,14 @@ export interface Quota {
   seven_day_resets_at: number
 }
 
+export interface ConnectStatus {
+  github: { connected: boolean; login?: string }
+}
+
 export interface State {
   jobs: Job[]
   vms: VM[]
   inbox: string
   quota?: Quota
+  connect?: ConnectStatus
 }

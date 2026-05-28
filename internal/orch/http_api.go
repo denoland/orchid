@@ -53,10 +53,11 @@ type apiVMEntry struct {
 }
 
 type apiStateResp struct {
-	Jobs  []apiJobEntry `json:"jobs"`
-	VMs   []apiVMEntry  `json:"vms"`
-	Inbox string        `json:"inbox"`
-	Quota *apiQuota     `json:"quota,omitempty"`
+	Jobs    []apiJobEntry  `json:"jobs"`
+	VMs     []apiVMEntry   `json:"vms"`
+	Inbox   string         `json:"inbox"`
+	Quota   *apiQuota      `json:"quota,omitempty"`
+	Connect *connectStatus `json:"connect,omitempty"`
 }
 
 type apiPaneUsage struct {
@@ -144,10 +145,12 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 			LastErr:  h.LastErr,
 		})
 	}
+	cs := buildConnectStatus(cfg)
 	resp := apiStateResp{
-		Jobs:  jobs,
-		VMs:   vms,
-		Inbox: cfg.GitHub.InboxRepo,
+		Jobs:    jobs,
+		VMs:     vms,
+		Inbox:   cfg.GitHub.InboxRepo,
+		Connect: &cs,
 	}
 	if five, seven, ok := latestQuota(); ok {
 		resp.Quota = &apiQuota{
@@ -694,6 +697,62 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 	if cfg.Orch.Capture != nil {
 		registerCaptureRoutes(mux, cfg)
 	}
+
+	mux.HandleFunc("/api/connect/status", auth(func(w http.ResponseWriter, r *http.Request) {
+		// Cheap to recompute on demand; the dashboard polls this while
+		// the device-flow modal is open.
+		if cfg.Orch.BotLogin == "" {
+			cfg.Orch.BotLogin = getConnectedLogin()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(buildConnectStatus(cfg))
+	}))
+
+	mux.HandleFunc("/api/connect/github/start", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		f, err := startGHDeviceFlow("repo,read:org,workflow")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"user_code":        f.UserCode,
+			"verification_uri": f.VerificationURL,
+			"expires_at":       f.ExpiresAt.Unix(),
+		})
+	}))
+
+	mux.HandleFunc("/api/connect/github/poll", auth(func(w http.ResponseWriter, r *http.Request) {
+		ghFlowMu.Lock()
+		f := ghFlow
+		ghFlowMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if f == nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "idle"})
+			return
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		resp := map[string]any{"user_code": f.UserCode, "verification_uri": f.VerificationURL}
+		switch {
+		case !f.done:
+			resp["state"] = "pending"
+		case f.err != "":
+			resp["state"] = "error"
+			resp["error"] = f.err
+		default:
+			resp["state"] = "connected"
+			resp["login"] = f.login
+			if cfg.Orch.BotLogin == "" {
+				cfg.Orch.BotLogin = f.login
+			}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
 
 	spaFS, _ := fs.Sub(wwwFS, "embed-dist")
 	fileServer := http.FileServerFS(spaFS)

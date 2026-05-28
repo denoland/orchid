@@ -207,6 +207,7 @@ cat <<EOF
 
 next:
   - open the dashboard URL above
+  - click Connect GitHub (Settings → Integrations) to enable session spawning
   - file an issue in $INBOX_REPO with a target label → orchid spawns a session
   - add a worker VM: on that VM run install.sh with WORKER=1, then
       sudo -u $ORCHID_USER orch join vm http://${IP:-this-host}:8000 $HTTP_SECRET

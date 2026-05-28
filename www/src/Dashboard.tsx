@@ -1061,6 +1061,9 @@ function DashboardInner({ state, relay }: Props) {
           onOpenCapture={() => setShowCapture(true)}
         />
       )}
+      {!showSettings && !showCapture && state.connect && !state.connect.github.connected && (
+        <ConnectBanner onOpen={() => setShowSettings(true)} />
+      )}
       {showSettings && <SettingsPage jobs={jobs} state={state} relay={relay} onClose={() => setShowSettings(false)} />}
       {showCapture && <CapturePage jobs={jobs} inbox={inbox} onClose={() => setShowCapture(false)} />}
       {view === 'canvas' && !showSettings && !showCapture && (
@@ -1384,6 +1387,100 @@ function DocsButton() {
   )
 }
 
+function ConnectBanner({ onOpen }: { onOpen: () => void }) {
+  return (
+    <div className="absolute top-16 left-1/2 -translate-x-1/2 z-20 mono text-[12px] px-3 py-1.5 rounded-md ring-1 ring-amber-300 dark:ring-amber-700/60 bg-amber-50 dark:bg-amber-900/30 text-amber-900 dark:text-amber-200 flex items-center gap-3 shadow-sm">
+      <span>GitHub not connected — sessions are paused.</span>
+      <button
+        onClick={onOpen}
+        className="px-2 py-0.5 rounded ring-1 ring-amber-300 dark:ring-amber-700 hover:bg-amber-100 dark:hover:bg-amber-900/50"
+      >Connect</button>
+    </div>
+  )
+}
+
+function GitHubIntegration({ state }: { state: State }) {
+  const connected = !!state.connect?.github.connected
+  const login = state.connect?.github.login
+  const [flow, setFlow] = useState<null | { user_code: string; verification_uri: string; expires_at: number }>(null)
+  const [polling, setPolling] = useState(false)
+  const [error, setError] = useState<string>('')
+
+  useEffect(() => {
+    if (!flow || !polling) return
+    let alive = true
+    const id = setInterval(async () => {
+      try {
+        const r = await fetch('/api/connect/github/poll', { method: 'POST', credentials: 'include' })
+        const j = await r.json()
+        if (!alive) return
+        if (j.state === 'connected') {
+          setPolling(false); setFlow(null)
+          // Bounce the page so /api/state refresh picks up the new login.
+          location.reload()
+        } else if (j.state === 'error') {
+          setError(j.error || 'failed'); setPolling(false)
+        }
+      } catch { /* keep polling */ }
+    }, 3000)
+    return () => { alive = false; clearInterval(id) }
+  }, [flow, polling])
+
+  const start = async () => {
+    setError('')
+    const r = await fetch('/api/connect/github/start', { method: 'POST', credentials: 'include' })
+    if (!r.ok) { setError(await r.text()); return }
+    const j = await r.json()
+    setFlow(j)
+    setPolling(true)
+  }
+
+  return (
+    <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
+      <div className="flex items-center gap-3 mb-3">
+        <span className="serif italic text-[18px] text-zinc-900 dark:text-zinc-100">GitHub</span>
+        {connected
+          ? <span className="mono text-[11px] px-2 py-0.5 rounded ring-1 ring-emerald-300 dark:ring-emerald-700/60 text-emerald-700 dark:text-emerald-300">connected as {login}</span>
+          : <span className="mono text-[11px] px-2 py-0.5 rounded ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-500">not connected</span>}
+      </div>
+      <div className="text-[13px] text-zinc-600 dark:text-zinc-400 mb-3">
+        Orchid uses gh to read inbox issues and push branches. Connecting opens a one-time GitHub device-flow code; the daemon stores the token in <code className="mono text-[11px]">/var/lib/orchid/.config/gh/hosts.yml</code> and uses it for every subsequent call.
+      </div>
+      {flow && polling && (
+        <div className="rounded-md ring-1 ring-zinc-200 dark:ring-zinc-800 p-4 mb-3 bg-zinc-50 dark:bg-zinc-900/40">
+          <div className="text-[12px] text-zinc-500 dark:text-zinc-400 mb-2">Go to:</div>
+          <a href={flow.verification_uri} target="_blank" rel="noreferrer"
+             className="mono text-[13px] text-blue-600 dark:text-blue-400 underline">{flow.verification_uri}</a>
+          <div className="text-[12px] text-zinc-500 dark:text-zinc-400 mt-3 mb-1">Enter code:</div>
+          <div className="mono text-[20px] tracking-widest text-zinc-900 dark:text-zinc-100 select-all">{flow.user_code}</div>
+          <div className="text-[11px] text-zinc-400 dark:text-zinc-500 mt-3">Waiting for approval…</div>
+        </div>
+      )}
+      {error && (
+        <div className="rounded-md ring-1 ring-rose-300 dark:ring-rose-700/60 bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-300 text-[12px] px-3 py-2 mb-3">{error}</div>
+      )}
+      {!flow && (
+        <button
+          onClick={start}
+          className="mono text-[12px] px-3 py-1.5 rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 hover:opacity-90"
+        >{connected ? 'Reconnect' : 'Connect GitHub'}</button>
+      )}
+    </div>
+  )
+}
+
+function ComingSoonIntegration({ name, blurb }: { name: string; blurb: string }) {
+  return (
+    <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5 opacity-60">
+      <div className="flex items-center gap-3 mb-2">
+        <span className="serif italic text-[18px] text-zinc-900 dark:text-zinc-100">{name}</span>
+        <span className="mono text-[11px] px-2 py-0.5 rounded ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-500">coming soon</span>
+      </div>
+      <div className="text-[13px] text-zinc-600 dark:text-zinc-400">{blurb}</div>
+    </div>
+  )
+}
+
 function SettingsButton({ onClick }: { onClick: () => void }) {
   return (
     <button
@@ -1633,7 +1730,7 @@ function timeAgo(iso?: string | null): string {
   return `${Math.floor(mo / 12)}y`
 }
 
-type SectionId = 'orch' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
+type SectionId = 'orch' | 'integrations' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
 
 function SettingsPage({ jobs, state, relay, onClose }: {
   jobs: Job[]
@@ -1750,13 +1847,14 @@ function SettingsPage({ jobs, state, relay, onClose }: {
   }, [jobs])
 
   const navItems: { id: SectionId; label: string }[] = [
-    { id: 'orch',    label: 'Orchestrator' },
-    { id: 'access',  label: 'Access' },
-    { id: 'capture', label: 'Capture' },
-    { id: 'vms',     label: 'VMs' },
-    { id: 'targets', label: 'Targets' },
-    { id: 'usage',   label: 'Usage' },
-    { id: 'danger',  label: 'Danger zone' },
+    { id: 'orch',         label: 'Orchestrator' },
+    { id: 'integrations', label: 'Integrations' },
+    { id: 'access',       label: 'Access' },
+    { id: 'capture',      label: 'Capture' },
+    { id: 'vms',          label: 'VMs' },
+    { id: 'targets',      label: 'Targets' },
+    { id: 'usage',        label: 'Usage' },
+    { id: 'danger',       label: 'Danger zone' },
   ]
 
   return (
@@ -1926,6 +2024,25 @@ function SettingsPage({ jobs, state, relay, onClose }: {
                 subtitle="Inbox labels → work repos. Add a repo and the label defaults to its name (override if you want)."
               >
                 <TargetsList targets={targets} setTargets={setTargets} repos={repos} reposError={reposError} />
+              </Section>
+            )}
+
+            {section === 'integrations' && (
+              <Section
+                title="Integrations"
+                subtitle="Connect orchid to the services the daemon and the spawned sessions talk to."
+              >
+                <div className="space-y-4">
+                  <GitHubIntegration state={state} />
+                  <ComingSoonIntegration
+                    name="Claude"
+                    blurb="Paste an Anthropic API key so spawned sessions can use claude without per-VM login."
+                  />
+                  <ComingSoonIntegration
+                    name="Codex"
+                    blurb="OpenAI codex agent — onboard once per orchid instance."
+                  />
+                </div>
               </Section>
             )}
 
