@@ -72,6 +72,27 @@ if [ "$IS_ROOT" -eq 0 ] && ! command -v sudo >/dev/null; then
   die "sudo not found — install sudo, or run as root inside a container"
 fi
 
+# Root-mode gating. Two reasons running as root is risky:
+#   1. claude refuses --dangerously-skip-permissions when its tmux
+#      session runs as root → central can never spawn work locally.
+#   2. The per-user systemd manager dies on shell exit without
+#      `loginctl enable-linger`, and lingering root is a footgun.
+#
+# Central mode (default): always refuse root. The daemon hosts the
+#   local VM, which would spawn claude tmux as root → broken.
+# Worker mode (WORKER=1): allow root only on a container host (no
+#   systemd). The "worker" is then a remote box central SSHes into;
+#   central uses whatever user --user=... pointed at, so a root-only
+#   container can be made to work for testing.
+if [ "$IS_ROOT" -eq 1 ]; then
+  if [ "${WORKER:-0}" != "1" ]; then
+    die "refusing to install central as root — create a non-root user (e.g. \`adduser orchid && usermod -aG sudo orchid\`), then re-run as that user. (claude refuses --dangerously-skip-permissions when running as root, so the local VM would never spawn a session.)"
+  fi
+  if [ "$HAS_SYSTEMD" -eq 1 ]; then
+    die "refusing to install worker as root on a systemd host — create a regular user and re-run as that user."
+  fi
+fi
+
 # as_root runs the given command with root privilege. When already
 # root, it execs directly; otherwise it goes through sudo.
 as_root() {
