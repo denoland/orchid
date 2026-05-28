@@ -15,6 +15,9 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 	workdir := fmt.Sprintf("%s/issue-%d", root, is.Number)
 	sharedDir := fmt.Sprintf("%s/repos/%s", root, strings.ReplaceAll(target.Repo, "/", "-"))
 	botLogin, botEmail := vmBotIdentity(cfg.Orch, *vm)
+	if botLogin == "" {
+		return fmt.Errorf("bot_login not set — connect GitHub from the dashboard before spawning sessions")
+	}
 	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, "", botLogin, botEmail); err != nil {
 		return err
 	}

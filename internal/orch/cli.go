@@ -817,9 +817,11 @@ func Main() {
 	if err != nil {
 		log.Fatalf("poll_interval: %v", err)
 	}
-	// Auto-detect bot_login from gh's logged-in user when the operator
-	// didn't pin one in swarm.hcl. Saves the install path from having
-	// to know what GitHub account orchid will commit as.
+	// Auto-detect bot_login from gh's logged-in user. Operators don't
+	// pin this in swarm.hcl any more — the install just starts the
+	// daemon, the dashboard nudges you to connect GitHub, and once
+	// gh's hosts.yml exists this resolves automatically on next boot
+	// (or via hot-reload after the connect flow finishes).
 	if cfg.Orch.BotLogin == "" {
 		if out, _, err := run("gh", "api", "user", "--jq", ".login"); err == nil {
 			cfg.Orch.BotLogin = strings.TrimSpace(out)
@@ -827,7 +829,7 @@ func Main() {
 	}
 	for _, vm := range cfg.VMs {
 		if login, _ := vmBotIdentity(cfg.Orch, vm); login == "" {
-			log.Fatalf("vm %q: bot_login not set and `gh api user` returned nothing. Either log gh in (`gh auth login` as the orchid user) or set orchestrator.bot_login in swarm.hcl.", vm.Name)
+			log.Printf("vm %q: bot_login not set — sessions on this VM are paused until GitHub is connected from the dashboard.", vm.Name)
 		}
 	}
 	tnames := make([]string, 0, len(cfg.Targets))
