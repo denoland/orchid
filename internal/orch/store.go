@@ -51,14 +51,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   cost_usd       REAL    NOT NULL DEFAULT 0,
   PRIMARY KEY (date, session_id, model)
 );
-CREATE INDEX IF NOT EXISTS usage_daily_date ON usage_daily(date);
-CREATE TABLE IF NOT EXISTS canvases (
-  id         TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  snap       BLOB,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);`); err != nil {
+CREATE INDEX IF NOT EXISTS usage_daily_date ON usage_daily(date);`); err != nil {
 			_ = db.Close()
 			return nil, err
 		}
@@ -383,108 +376,4 @@ func (s *Store) isEmpty() bool {
 		return false
 	}
 	return true
-}
-
-// CanvasRow is a list-row summary of a canvas — no snap payload, so
-// the dashboard's sidebar can fetch the full list cheaply.
-type CanvasRow struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	UpdatedAt int64  `json:"updated_at"`
-}
-
-func (s *Store) ListCanvases() ([]CanvasRow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query("SELECT id, name, updated_at FROM canvases ORDER BY updated_at DESC")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []CanvasRow
-	for rows.Next() {
-		var r CanvasRow
-		if err := rows.Scan(&r.ID, &r.Name, &r.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) CreateCanvas(id, name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().Unix()
-	_, err := s.db.Exec(
-		"INSERT INTO canvases (id, name, snap, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-		id, name, []byte("{}"), now, now,
-	)
-	return err
-}
-
-func (s *Store) RenameCanvas(id, name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := s.db.Exec(
-		"UPDATE canvases SET name=?, updated_at=? WHERE id=?",
-		name, time.Now().Unix(), id,
-	)
-	return err
-}
-
-func (s *Store) DeleteCanvas(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := s.db.Exec("DELETE FROM canvases WHERE id=?", id)
-	return err
-}
-
-func (s *Store) GetCanvasSnap(id string) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var b []byte
-	err := s.db.QueryRow("SELECT snap FROM canvases WHERE id=?", id).Scan(&b)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	return b, err
-}
-
-func (s *Store) PutCanvasSnap(id string, body []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := s.db.Exec(
-		"UPDATE canvases SET snap=?, updated_at=? WHERE id=?",
-		body, time.Now().Unix(), id,
-	)
-	return err
-}
-
-// EnsureDefaultCanvas materialises a "default" canvas on first boot,
-// pulling the snap from the legacy kv("snap") row when present so
-// existing dashboards keep their layout across the upgrade.
-func (s *Store) EnsureDefaultCanvas() error {
-	s.mu.Lock()
-	var n int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM canvases").Scan(&n); err != nil {
-		s.mu.Unlock()
-		return err
-	}
-	if n > 0 {
-		s.mu.Unlock()
-		return nil
-	}
-	var legacy []byte
-	_ = s.db.QueryRow("SELECT value FROM kv WHERE key='snap'").Scan(&legacy)
-	if len(legacy) == 0 {
-		legacy = []byte("{}")
-	}
-	now := time.Now().Unix()
-	_, err := s.db.Exec(
-		"INSERT INTO canvases (id, name, snap, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-		"default", "Home", legacy, now, now,
-	)
-	s.mu.Unlock()
-	return err
 }
