@@ -47,24 +47,11 @@ const COLS = 4
 const GAP = 18
 const HEADER_OFFSET = 220
 
-type Tool = 'select' | 'box' | 'note' | 'text' | 'frame'
-
-// A Frame is a labelled rectangle that lives behind the cards. Operators
-// drop one per topic/project; new session cards whose `target` matches
-// the frame's `tag` auto-place inside it, giving spatial recall without
-// re-arranging by hand on every spawn.
-interface Frame {
-  id: string
-  x: number; y: number; w: number; h: number
-  name: string
-  tag?: string   // matches against job.target
-  color?: string // tailwind palette key: amber / sky / emerald / rose / violet / zinc
-}
+type Tool = 'select' | 'box' | 'note' | 'text'
 
 interface Snap {
   cards: Record<string, { x: number; y: number }>
   user: UserNode[]
-  frames: Frame[]
   edges: Edge[]
   viewport?: { x: number; y: number; zoom: number }
   panes?: Record<string, { x: number; y: number; w: number; h: number }>
@@ -72,7 +59,7 @@ interface Snap {
 }
 
 function emptySnap(): Snap {
-  return { cards: {}, user: [], frames: [], edges: [], panes: {} }
+  return { cards: {}, user: [], edges: [], panes: {} }
 }
 function normalizeSnap(raw: any): Snap {
   if (!raw || typeof raw !== 'object') return emptySnap()
@@ -86,13 +73,9 @@ function normalizeSnap(raw: any): Snap {
       u.data.compact = true
     }
   }
-  const frames: Frame[] = Array.isArray(raw.frames)
-    ? raw.frames.filter((f: any) => f && typeof f.id === 'string')
-    : []
   return {
     cards: raw.cards ?? {},
     user: users,
-    frames,
     edges: raw.edges ?? [],
     viewport: raw.viewport,
     panes: raw.panes ?? {},
@@ -337,102 +320,7 @@ function PRIcon({ variant }: { variant: 'open' | 'closed' | 'pending' }) {
   )
 }
 
-// FRAME_COLORS maps the Frame.color enum to ring + tint utility classes.
-const FRAME_COLORS: Record<string, { ring: string; bg: string; label: string }> = {
-  zinc:    { ring: 'ring-zinc-300 dark:ring-zinc-700',         bg: 'bg-zinc-50/40 dark:bg-zinc-900/30',         label: 'text-zinc-700 dark:text-zinc-300' },
-  amber:   { ring: 'ring-amber-300 dark:ring-amber-700/60',    bg: 'bg-amber-50/40 dark:bg-amber-900/20',       label: 'text-amber-700 dark:text-amber-300' },
-  sky:     { ring: 'ring-sky-300 dark:ring-sky-700/60',        bg: 'bg-sky-50/40 dark:bg-sky-900/20',           label: 'text-sky-700 dark:text-sky-300' },
-  emerald: { ring: 'ring-emerald-300 dark:ring-emerald-700/60',bg: 'bg-emerald-50/40 dark:bg-emerald-900/20',   label: 'text-emerald-700 dark:text-emerald-300' },
-  rose:    { ring: 'ring-rose-300 dark:ring-rose-700/60',      bg: 'bg-rose-50/40 dark:bg-rose-900/20',         label: 'text-rose-700 dark:text-rose-300' },
-  violet:  { ring: 'ring-violet-300 dark:ring-violet-700/60',  bg: 'bg-violet-50/40 dark:bg-violet-900/20',     label: 'text-violet-700 dark:text-violet-300' },
-}
-
-type FrameNodeData = {
-  name: string
-  tag?: string
-  color?: string
-  targets: { name: string }[]
-  onPatch: (id: string, patch: Partial<Frame>) => void
-  onDelete: (id: string) => void
-}
-
-function FrameNode({ id, data, selected }: NodeProps<Node<FrameNodeData, 'frame'>>) {
-  const palette = FRAME_COLORS[data.color ?? 'zinc'] ?? FRAME_COLORS.zinc
-  const [editingName, setEditingName] = useState(false)
-  const [editingTag, setEditingTag] = useState(false)
-  return (
-    <div
-      className={`w-full h-full rounded-xl ring-1 ${palette.ring} ${palette.bg} ${selected ? 'ring-2' : ''} relative`}
-    >
-      <NodeResizer
-        isVisible={selected}
-        minWidth={220}
-        minHeight={140}
-        lineClassName="!border-violet-400"
-        handleClassName="!w-2 !h-2 !rounded-full !bg-violet-400 !border-white"
-      />
-      <div className="absolute top-1 left-2 right-2 flex items-center gap-2 pointer-events-auto">
-        {editingName ? (
-          <input
-            autoFocus
-            defaultValue={data.name}
-            onBlur={(e) => { data.onPatch(id, { name: e.target.value }); setEditingName(false) }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') { (e.target as HTMLInputElement).blur() }
-              if (e.key === 'Escape') setEditingName(false)
-              e.stopPropagation()
-            }}
-            onPointerDown={(e) => e.stopPropagation()}
-            className={`serif italic text-[15px] bg-transparent outline-none border-b border-dashed ${palette.label} flex-1 min-w-0`}
-          />
-        ) : (
-          <button
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={() => setEditingName(true)}
-            className={`serif italic text-[15px] ${palette.label} truncate flex-1 text-left hover:underline`}
-          >{data.name || 'untitled'}</button>
-        )}
-        {editingTag ? (
-          <select
-            autoFocus
-            defaultValue={data.tag ?? ''}
-            onBlur={(e) => { data.onPatch(id, { tag: e.target.value || undefined }); setEditingTag(false) }}
-            onPointerDown={(e) => e.stopPropagation()}
-            onChange={(e) => { data.onPatch(id, { tag: e.target.value || undefined }); setEditingTag(false) }}
-            className="mono text-[10px] px-1 py-0.5 rounded ring-1 ring-zinc-300 dark:ring-zinc-700 bg-white dark:bg-zinc-900"
-          >
-            <option value="">— no tag —</option>
-            {data.targets.map((t) => <option key={t.name} value={t.name}>{t.name}</option>)}
-          </select>
-        ) : (
-          <button
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={() => setEditingTag(true)}
-            className={`mono text-[10px] px-1.5 py-0.5 rounded ring-1 ring-inset ${palette.ring} ${palette.label} hover:bg-white/60 dark:hover:bg-zinc-900/60`}
-            title="Auto-place sessions matching this target inside this frame"
-          >{data.tag ? `tag: ${data.tag}` : '+ tag'}</button>
-        )}
-        <select
-          value={data.color ?? 'zinc'}
-          onPointerDown={(e) => e.stopPropagation()}
-          onChange={(e) => data.onPatch(id, { color: e.target.value })}
-          className="mono text-[10px] px-1 py-0.5 rounded ring-1 ring-zinc-300 dark:ring-zinc-700 bg-white dark:bg-zinc-900"
-          title="Color"
-        >
-          {Object.keys(FRAME_COLORS).map((c) => <option key={c} value={c}>{c}</option>)}
-        </select>
-        <button
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={() => data.onDelete(id)}
-          className={`text-zinc-400 hover:text-rose-500 text-[12px]`}
-          title="Delete frame (cards inside are not deleted)"
-        >×</button>
-      </div>
-    </div>
-  )
-}
-
-const nodeTypes: NodeTypes = { card: CardNode, note: NoteNode, link: LinkNode, text: TextNode, pane: PaneWindowNode, frame: FrameNode }
+const nodeTypes: NodeTypes = { card: CardNode, note: NoteNode, link: LinkNode, text: TextNode, pane: PaneWindowNode }
 
 function makeCardNode(
   job: Job,
@@ -525,67 +413,6 @@ function DashboardInner({ state, relay }: Props) {
     load()
     return () => { alive = false }
   }, [])
-
-  // Target names for the frame's `tag` dropdown. Cached once on mount;
-  // the dashboard's own Settings UI refetches /api/config when you
-  // edit targets, so this only goes stale across reloads.
-  const [targets, setTargets] = useState<{ name: string }[]>([])
-  useEffect(() => {
-    let alive = true
-    fetch('/api/config', { credentials: 'include', cache: 'no-store' })
-      .then((r) => r.ok ? r.json() : null)
-      .then((j) => {
-        if (!alive) return
-        if (Array.isArray(j?.targets)) {
-          setTargets(j.targets.map((t: any) => ({ name: String(t.name) })))
-        }
-      })
-      .catch(() => { /* leave empty */ })
-    return () => { alive = false }
-  }, [])
-
-  // ─── frames ───
-  const patchFrame = useCallback((id: string, patch: Partial<Frame>) => {
-    const idx = snapRef.current.frames.findIndex((f) => f.id === id)
-    if (idx < 0) return
-    const next = { ...snapRef.current.frames[idx], ...patch }
-    snapRef.current.frames = [
-      ...snapRef.current.frames.slice(0, idx),
-      next,
-      ...snapRef.current.frames.slice(idx + 1),
-    ]
-    persist()
-    setNodes((nds) => nds.map((n) => n.id === id
-      ? { ...n, data: { ...(n.data as FrameNodeData), name: next.name, tag: next.tag, color: next.color } }
-      : n))
-  }, [persist, setNodes])
-
-  const deleteFrame = useCallback((id: string) => {
-    snapRef.current.frames = snapRef.current.frames.filter((f) => f.id !== id)
-    persist()
-    setNodes((nds) => nds.filter((n) => n.id !== id))
-  }, [persist, setNodes])
-
-  const targetsRef = useRef(targets)
-  useEffect(() => { targetsRef.current = targets }, [targets])
-
-  const makeFrameNode = useCallback((f: Frame): Node<FrameNodeData, 'frame'> => ({
-    id: f.id,
-    type: 'frame',
-    position: { x: f.x, y: f.y },
-    style: { width: f.w, height: f.h },
-    data: {
-      name: f.name,
-      tag: f.tag,
-      color: f.color,
-      targets: targetsRef.current,
-      onPatch: patchFrame,
-      onDelete: deleteFrame,
-    },
-    draggable: true,
-    selectable: true,
-    zIndex: 0,
-  }), [patchFrame, deleteFrame])
 
   const makePaneNode = useCallback((tmux: string, x: number, y: number, w = 720, h = 480): Node<PaneNodeData, 'pane'> => ({
     id: 'pane:' + tmux,
@@ -765,31 +592,11 @@ function DashboardInner({ state, relay }: Props) {
       }
       const newCards: Node[] = []
       let col = 0, row = 0
-      // Track per-frame occupancy so two new cards in the same tick
-      // don't stack at the same in-frame slot.
-      const framePackers = new Map<string, { x: number; y: number }>()
       for (const j of jobs) {
         if (!j.tmux || haveCard.has(j.tmux)) continue
         const persisted = snap.cards[j.tmux]
         if (persisted) {
           newCards.push(makeCardNode(j, persisted, setExpanded))
-          continue
-        }
-        // Frame-tag match: pack into the first frame tagged with this
-        // job's target. Inner padding 14, cards flow left→right then wrap.
-        const frame = j.target ? snap.frames.find((f) => f.tag === j.target) : undefined
-        if (frame) {
-          const pad = 14, topPad = 36
-          const inFrame = framePackers.get(frame.id) ?? { x: frame.x + pad, y: frame.y + topPad }
-          let { x, y } = inFrame
-          if (x + CARD_W > frame.x + frame.w - pad) {
-            x = frame.x + pad
-            y += CARD_H + GAP
-          }
-          const pos = { x, y }
-          snap.cards[j.tmux] = pos
-          newCards.push(makeCardNode(j, pos, setExpanded))
-          framePackers.set(frame.id, { x: x + CARD_W + GAP, y })
           continue
         }
         while (used.has(`${col},${row}`)) {
@@ -835,10 +642,6 @@ function DashboardInner({ state, relay }: Props) {
           result.push(makePaneNode(tmux, p.x, p.y, p.w, p.h))
         }
       }
-      // Frames — rehydrate from snap if none present.
-      if (!current.some((n) => n.type === 'frame')) {
-        for (const f of snap.frames) result.push(makeFrameNode(f))
-      }
       result.push(...newCards)
       // Persist only when the rebuild actually mutated snap.cards (new
       // cards placed, dead ones pruned). Saving on every poll spams PUTs
@@ -846,7 +649,7 @@ function DashboardInner({ state, relay }: Props) {
       if (newCards.length > 0) saveSnap(snap)
       return result
     })
-  }, [jobs, snapLoaded, setNodes, setExpanded, makeNoteNode, makeLinkNode, makeTextNode, makePaneNode, makeFrameNode])
+  }, [jobs, snapLoaded, setNodes, setExpanded, makeNoteNode, makeLinkNode, makeTextNode, makePaneNode])
 
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
     setEdges((eds) => {
@@ -911,20 +714,9 @@ function DashboardInner({ state, relay }: Props) {
         } else {
           const u = snapRef.current.user.find((n) => n.id === id)
           if (u) { u.x = pos.x; u.y = pos.y }
-          const fr = snapRef.current.frames.find((f) => f.id === id)
-          if (fr) { fr.x = pos.x; fr.y = pos.y }
         }
         persist()
         sendRef.current({ type: 'node:move', id, x: pos.x, y: pos.y })
-      }
-      if (ch.type === 'dimensions' && ch.dimensions) {
-        const id = ch.id
-        const fr = snapRef.current.frames.find((f) => f.id === id)
-        if (fr) {
-          fr.w = ch.dimensions.width
-          fr.h = ch.dimensions.height
-          persist()
-        }
       }
       if (ch.type === 'dimensions' && ch.dimensions && (ch.id.startsWith('pane:'))) {
         const tmux = ch.id.slice(5)
@@ -959,19 +751,6 @@ function DashboardInner({ state, relay }: Props) {
     setTool('select')
     sendRef.current({ type: 'note:upsert', kind: 'text', id, x: pos.x, y: pos.y, text: '' })
   }, [rf, persist, setNodes, makeTextNode, setTool])
-
-  // ─── add frame ───
-  const addFrameAt = useCallback((screenX: number, screenY: number) => {
-    const pos = rf.screenToFlowPosition({ x: screenX, y: screenY })
-    const id = 'fr_' + newId()
-    const w = 480, h = 320
-    // Drop the frame centred on the click point.
-    const f: Frame = { id, x: pos.x - w / 2, y: pos.y - h / 2, w, h, name: 'Untitled', color: 'zinc' }
-    snapRef.current.frames = [...snapRef.current.frames, f]
-    persist()
-    setNodes((nds) => [...nds, makeFrameNode(f)])
-    setTool('select')
-  }, [rf, persist, setNodes, makeFrameNode, setTool])
 
   // ─── add note ───
   const addNote = useCallback(() => {
@@ -1171,7 +950,6 @@ function DashboardInner({ state, relay }: Props) {
       if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return
       if (e.key === 'v') setTool('select')
       if (e.key === 'r') setTool('box')
-      if (e.key === 'f') setTool('frame')
       if (e.key === 't') setTool('text')
       if (e.key === 'n') addNote()
     }
@@ -1232,10 +1010,6 @@ function DashboardInner({ state, relay }: Props) {
             addTextAt(e.clientX, e.clientY)
             return
           }
-          if (tool === 'frame') {
-            addFrameAt(e.clientX, e.clientY)
-            return
-          }
           if (tool !== 'select') return
           const now = Date.now()
           const isDouble = now - lastPaneClickRef.current < 400
@@ -1261,8 +1035,6 @@ function DashboardInner({ state, relay }: Props) {
           } else {
             const u = snapRef.current.user.find((n) => n.id === id)
             if (u) { u.x = pos.x; u.y = pos.y }
-            const fr = snapRef.current.frames.find((f) => f.id === id)
-            if (fr) { fr.x = pos.x; fr.y = pos.y }
           }
           persist()
           sendRef.current({ type: 'node:move', id, x: pos.x, y: pos.y })
@@ -3724,9 +3496,6 @@ function FloatingToolbar({
         <ToolBtn active={tool === 'box'} onClick={() => setTool('box')} title="Box select (R)" hint="R">
           <IconBox />
         </ToolBtn>
-        <ToolBtn active={tool === 'frame'} onClick={() => setTool('frame')} title="Frame (F)" hint="F">
-          <IconFrame />
-        </ToolBtn>
         <div className="w-px h-5 bg-zinc-200 dark:bg-zinc-700 mx-1" />
         <ToolBtn active={tool === 'text'} onClick={() => setTool('text')} title="Text (T)" hint="T">
           <IconText />
@@ -3782,14 +3551,6 @@ function IconBox() {
   return (
     <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeDasharray="3 2">
       <rect x="3" y="3" width="18" height="18" rx="2" />
-    </svg>
-  )
-}
-function IconFrame() {
-  return (
-    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
-      <rect x="3" y="6" width="18" height="14" rx="2" />
-      <path d="M3 10h18" />
     </svg>
   )
 }
