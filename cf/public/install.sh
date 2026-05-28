@@ -54,7 +54,7 @@ INVOKER=${SUDO_USER:-$USER}
 
 say "checking prerequisites"
 missing=()
-for cmd in git tmux ssh ssh-keyscan openssl curl jq gh claude; do
+for cmd in git tmux ssh ssh-keyscan openssl curl jq gh; do
   command -v "$cmd" >/dev/null || missing+=("$cmd")
 done
 if [ ${#missing[@]} -gt 0 ]; then
@@ -64,7 +64,6 @@ if [ ${#missing[@]} -gt 0 ]; then
 orchid needs these installed and on PATH before this script runs:
   git tmux ssh ssh-keyscan openssl curl jq
   gh      — https://cli.github.com (must be 2.x+, auth'd as your bot account)
-  claude  — https://docs.anthropic.com/claude-code (the agent orch spawns)
 
 Install them via your package manager, then re-run this script.
 EOF
