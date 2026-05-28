@@ -23,7 +23,7 @@ jobs:
       - name: Build dashboard SPA
         working-directory: www
         run: |
-          bun install --frozen-lockfile
+          bun install
           bun run build
 
       - name: Build orch binaries
