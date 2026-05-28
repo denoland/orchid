@@ -27,6 +27,7 @@ import type { Job, State } from './types'
 import { attention, ciStatus, LEVEL_COLOR, type AttentionLevel } from './attention'
 import { Pane } from './Pane'
 import { Composer } from './Composer'
+import { mockJobs, mockVMs } from './mock'
 import {
   NoteNode, LinkNode, TextNode,
   CollabLayer, useCollabSocket,
@@ -348,19 +349,32 @@ export function Dashboard({ state, relay }: Props) {
   )
 }
 
-function DashboardInner({ state, relay }: Props) {
-  const { jobs = [], inbox = '' } = state
+// ?mock=<n> in the URL prepends N fake sessions to the live jobs list
+// so the views can be previewed at scale without spawning real work.
+const MOCK_COUNT = (() => {
+  try {
+    const n = parseInt(new URLSearchParams(location.search).get('mock') ?? '', 10)
+    return Number.isFinite(n) && n > 0 ? Math.min(500, n) : 0
+  } catch { return 0 }
+})()
+
+function DashboardInner({ state: rawState, relay }: Props) {
+  const liveJobs = rawState.jobs ?? []
+  const jobs = useMemo(
+    () => MOCK_COUNT > 0 ? [...mockJobs(MOCK_COUNT), ...liveJobs] : liveJobs,
+    [liveJobs],
+  )
+  const state = useMemo(() => {
+    if (MOCK_COUNT === 0) return rawState
+    return { ...rawState, jobs, vms: [...mockVMs(), ...(rawState.vms ?? [])] }
+  }, [rawState, jobs])
+  const inbox = state.inbox ?? ''
   const snapRef = useRef<Snap>(emptySnap())
   const [snapLoaded, setSnapLoaded] = useState(false)
   const jobsByTmuxRef = useRef<Map<string, Job>>(new Map())
   const [nodes, setNodes] = useNodesState<Node>([])
   const [edges, setEdges] = useEdgesState<Edge>(snapRef.current.edges)
   const [tool, setTool] = useState<Tool>('select')
-  const [composerAt, setComposerAt] = useState<{ x: number; y: number } | null>(null)
-  // Only auto-show the header composer on the empty-canvas first run.
-  // Once there are any cards, dismiss permanently — clicking/dragging/moving
-  // also dismisses.
-  const [headerComposerDismissed, setHeaderComposerDismissed] = useState(false)
   const lastPaneClickRef = useRef(0)
   const containerRef = useRef<HTMLDivElement>(null)
   const sendRef = useRef<(msg: any) => void>(() => {})
@@ -413,6 +427,31 @@ function DashboardInner({ state, relay }: Props) {
     load()
     return () => { alive = false }
   }, [])
+
+  // pinToCanvas adds a card to the canvas. If posOverride is provided,
+  // place there (used by the canvas-side palette to drop at viewport
+  // centre). Otherwise pack into the next free grid slot.
+  const pinToCanvas = useCallback((tmux: string, posOverride?: { x: number; y: number }) => {
+    if (snapRef.current.cards[tmux]) return
+    let pos = posOverride
+    if (!pos) {
+      const used = new Set<string>()
+      for (const c of Object.values(snapRef.current.cards)) {
+        const col = Math.round(c.x / (CARD_W + GAP))
+        const row = Math.round((c.y - HEADER_OFFSET) / (CARD_H + GAP))
+        used.add(`${col},${row}`)
+      }
+      let col = 0, row = 0
+      while (used.has(`${col},${row}`)) {
+        col++
+        if (col >= COLS) { col = 0; row++ }
+      }
+      pos = { x: col * (CARD_W + GAP), y: HEADER_OFFSET + row * (CARD_H + GAP) }
+    }
+    snapRef.current.cards[tmux] = pos
+    persist()
+    setNodes((nds) => [...nds])
+  }, [persist, setNodes])
 
   const makePaneNode = useCallback((tmux: string, x: number, y: number, w = 720, h = 480): Node<PaneNodeData, 'pane'> => ({
     id: 'pane:' + tmux,
@@ -583,32 +622,16 @@ function DashboardInner({ state, relay }: Props) {
           data: { ...(n.data as CardData), job, setExpanded },
         })
       }
-      // Restore / place new card nodes.
-      const used = new Set<string>()
-      for (const c of Object.values(snap.cards)) {
-        const col = Math.round(c.x / (CARD_W + GAP))
-        const row = Math.round((c.y - HEADER_OFFSET) / (CARD_H + GAP))
-        used.add(`${col},${row}`)
-      }
+      // Restore card nodes for sessions the operator has already placed.
+      // We deliberately do NOT auto-grid new cards onto the canvas —
+      // spawns land in the list view; the canvas only shows what the
+      // operator explicitly dragged or pinned there.
       const newCards: Node[] = []
-      let col = 0, row = 0
       for (const j of jobs) {
         if (!j.tmux || haveCard.has(j.tmux)) continue
         const persisted = snap.cards[j.tmux]
-        if (persisted) {
-          newCards.push(makeCardNode(j, persisted, setExpanded))
-          continue
-        }
-        while (used.has(`${col},${row}`)) {
-          col++
-          if (col >= COLS) { col = 0; row++ }
-        }
-        used.add(`${col},${row}`)
-        const pos = { x: col * (CARD_W + GAP), y: HEADER_OFFSET + row * (CARD_H + GAP) }
-        snap.cards[j.tmux] = pos
-        newCards.push(makeCardNode(j, pos, setExpanded))
-        col++
-        if (col >= COLS) { col = 0; row++ }
+        if (!persisted) continue
+        newCards.push(makeCardNode(j, persisted, setExpanded))
       }
       // Prune cards whose sessions are gone — but only when we actually
       // have a live jobs list. An empty jobs prop is the normal initial
@@ -965,7 +988,6 @@ function DashboardInner({ state, relay }: Props) {
           inbox={inbox}
           count={jobs.length}
           quota={state.quota}
-          showComposer={!headerComposerDismissed && jobs.length === 0}
           view={view}
           setView={(v) => {
             setView(v)
@@ -978,6 +1000,7 @@ function DashboardInner({ state, relay }: Props) {
       )}
       {!showSettings && !showCapture && (
         <WarningStack
+          stateLoaded={state.connect !== undefined}
           githubConnected={!!state.connect?.github.connected}
           inbox={state.inbox}
           openSettings={(s) => setShowSettings(s)}
@@ -989,10 +1012,32 @@ function DashboardInner({ state, relay }: Props) {
         <FloatingToolbar tool={tool} setTool={setTool} addNote={addNote} />
       )}
       {view === 'canvas' && !showSettings && !showCapture && (
+        <SessionPalette
+          jobs={jobs}
+          pinned={snapRef.current.cards}
+          onPin={(tmux) => {
+            // Convert the viewport's screen-space centre into flow
+            // coords, then subtract half the card size in flow space
+            // (subtracting in screen space picks up the zoom factor
+            // and the card lands off-camera).
+            const r = containerRef.current?.getBoundingClientRect()
+            let pos: { x: number; y: number } | undefined
+            if (r) {
+              const c = rf.screenToFlowPosition({
+                x: r.left + r.width / 2,
+                y: r.top + r.height / 2,
+              })
+              pos = { x: c.x - CARD_W / 2, y: c.y - CARD_H / 2 }
+            }
+            pinToCanvas(tmux, pos)
+          }}
+        />
+      )}
+      {view === 'canvas' && !showSettings && !showCapture && (
         <CollabLayer cursors={cursors} sendCursor={sendCursor} containerRef={containerRef} />
       )}
       {view === 'list' && (
-        <ListView jobs={jobs} onOpen={(t) => setListExpanded(t)} />
+        <ListView jobs={jobs} onOpen={(t) => setListExpanded(t)} onPin={pinToCanvas} pinned={snapRef.current.cards} />
       )}
       {view === 'list' && listExpanded && (
         <PaneModal tmux={listExpanded} jobsByTmuxRef={jobsByTmuxRef} onClose={() => setListExpanded(null)} />
@@ -1005,21 +1050,22 @@ function DashboardInner({ state, relay }: Props) {
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onPaneClick={(e) => {
-          setHeaderComposerDismissed(true)
           if (tool === 'text') {
             addTextAt(e.clientX, e.clientY)
             return
           }
-          if (tool !== 'select') return
-          const now = Date.now()
-          const isDouble = now - lastPaneClickRef.current < 400
-          lastPaneClickRef.current = now
-          if (!isDouble) return
-          setComposerAt({ x: e.clientX, y: e.clientY })
+          // Double-click on empty canvas opens the Capture modal —
+          // primary entry point for filing a new issue. Single-click is
+          // a no-op so panning still feels natural.
+          if (tool === 'select') {
+            const now = Date.now()
+            const isDouble = now - lastPaneClickRef.current < 400
+            lastPaneClickRef.current = now
+            if (isDouble) setShowCapture(true)
+          }
         }}
         onNodeDragStart={() => {
           draggingRef.current = true
-          setHeaderComposerDismissed(true)
         }}
         onNodeDragStop={(_e, node) => {
           draggingRef.current = false
@@ -1039,7 +1085,6 @@ function DashboardInner({ state, relay }: Props) {
           persist()
           sendRef.current({ type: 'node:move', id, x: pos.x, y: pos.y })
         }}
-        onMove={() => setHeaderComposerDismissed(true)}
         selectionOnDrag={tool === 'box'}
         selectionMode={'partial' as any}
         onMoveEnd={(_e, viewport) => {
@@ -1065,21 +1110,15 @@ function DashboardInner({ state, relay }: Props) {
       >
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="#d4d4d8" />
       </ReactFlow>}
-      {composerAt && (
-        <FloatingComposer
-          at={composerAt}
-          onDismiss={() => setComposerAt(null)}
-        />
-      )}
     </div>
     </ActivityContext.Provider>
   )
 }
 
 function Header({
-  count, quota, showComposer, view, setView, onOpenSettings, onOpenCapture,
+  count, quota, view, setView, onOpenSettings, onOpenCapture,
 }: {
-  inbox: string; count: number; showComposer: boolean
+  inbox: string; count: number
   quota?: State['quota']
   view: 'canvas' | 'list'; setView: (v: 'canvas' | 'list') => void
   onOpenSettings: () => void
@@ -1112,15 +1151,6 @@ function Header({
             <LogoutButton />
           </HeaderBtnBar>
         </div>
-        {showComposer && (
-          <div
-            className="pointer-events-auto max-w-[820px] mx-auto w-full"
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <Composer />
-          </div>
-        )}
       </div>
     </div>
   )
@@ -1185,12 +1215,13 @@ function CaptureButton({ onClick }: { onClick: () => void }) {
   return (
     <button
       onClick={onClick}
-      title="Capture (file a new issue)"
+      title="Capture — file a new issue"
       className="w-9 h-9 rounded-lg flex items-center justify-center transition-colors text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
     >
+      {/* feather-style paper-plane: "send a thought into the inbox" */}
       <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-        <line x1="12" y1="5" x2="12" y2="19" />
-        <line x1="5" y1="12" x2="19" y2="12" />
+        <line x1="22" y1="2" x2="11" y2="13" />
+        <polygon points="22 2 15 22 11 13 2 9 22 2" />
       </svg>
     </button>
   )
@@ -1212,36 +1243,46 @@ function CapturePage({ jobs, inbox, onClose }: { jobs: Job[]; inbox: string; onC
   )
 
   return (
-    <div className="absolute inset-0 z-30 bg-white dark:bg-zinc-950 flex flex-col">
-      <div className="px-8 h-14 flex items-center gap-3 border-b border-zinc-200 dark:border-zinc-800 flex-shrink-0">
-        <button
-          onClick={onClose}
-          className="text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 flex items-center gap-1 text-[13px]"
-          title="Back (esc)"
-        >
-          <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="15 18 9 12 15 6" />
-          </svg>
-        </button>
-        <span className="serif italic text-[24px] text-zinc-900 dark:text-zinc-100 ml-2">Capture</span>
-        <span className="mono text-[12px] text-zinc-400 dark:text-zinc-500">spawn an idea</span>
-      </div>
+    <div
+      className="fixed inset-0 z-40 grid place-items-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm p-4 sm:p-8"
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="bg-white dark:bg-zinc-950 rounded-2xl ring-1 ring-zinc-200 dark:ring-zinc-700 shadow-2xl w-full max-w-[680px] max-h-[80vh] flex flex-col"
+      >
+        <div className="px-6 h-12 flex items-center gap-3 border-b border-zinc-200 dark:border-zinc-800 flex-shrink-0">
+          <span className="serif italic text-[20px] text-zinc-900 dark:text-zinc-100">Capture</span>
+          <span className="mono text-[12px] text-zinc-400 dark:text-zinc-500">spawn an idea</span>
+          <div className="flex-1" />
+          <button
+            onClick={onClose}
+            className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 rounded p-1"
+            title="Close (esc)"
+          >
+            <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
 
-      <div className="flex-1 min-h-0 overflow-auto">
-        <div className="max-w-[720px] mx-auto px-4 sm:px-8 py-8 sm:py-12 space-y-10">
-          <Composer autoFocus />
+        <div className="flex-1 min-h-0 overflow-auto">
+          <div className="px-6 py-6 space-y-8">
+            <Composer autoFocus onSent={() => onClose()} onCancel={onClose} />
 
-          <div>
-            <div className="serif italic text-[18px] text-zinc-900 dark:text-zinc-100 mb-3 px-1">Recent</div>
-            {recent.length === 0 && (
-              <p className="text-[13px] text-zinc-500 dark:text-zinc-400 px-1">
-                Nothing here yet. Type above to file your first capture.
-              </p>
-            )}
-            <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
-              {recent.map((j) => (
-                <RecentCaptureRow key={j.issue} job={j} inbox={inbox} />
-              ))}
+            <div>
+              <div className="serif italic text-[16px] text-zinc-900 dark:text-zinc-100 mb-2">Recent</div>
+              {recent.length === 0 && (
+                <p className="text-[13px] text-zinc-500 dark:text-zinc-400">
+                  Nothing here yet. Type above to file your first capture.
+                </p>
+              )}
+              <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+                {recent.map((j) => (
+                  <RecentCaptureRow key={j.issue} job={j} inbox={inbox} />
+                ))}
+              </div>
             </div>
           </div>
         </div>
@@ -1302,13 +1343,15 @@ function DocsButton() {
 // by a close button — keeps the dashboard honest about whether orchid
 // can actually do anything.
 function WarningStack({
-  githubConnected, inbox, openSettings,
+  stateLoaded, githubConnected, inbox, openSettings,
 }: {
+  stateLoaded: boolean
   githubConnected: boolean
   inbox?: string
   openSettings: (section: SectionId) => void
 }) {
   const [targetsOK, setTargetsOK] = useState<boolean | null>(null)
+  const [dismissed, setDismissed] = useState(false)
   useEffect(() => {
     let alive = true
     fetch('/api/config', { credentials: 'include', cache: 'no-store' })
@@ -1317,6 +1360,12 @@ function WarningStack({
       .catch(() => { if (alive) setTargetsOK(true) /* don't nag if probe fails */ })
     return () => { alive = false }
   }, [])
+  useEffect(() => {
+    if (dismissed) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setDismissed(true) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [dismissed])
 
   const rows: { label: string; cta: string; onClick: () => void }[] = []
   if (!githubConnected) {
@@ -1340,22 +1389,46 @@ function WarningStack({
       onClick: () => openSettings('orch'),
     })
   }
-  if (rows.length === 0) return null
+  // Wait until both /api/state and /api/config have come back at least
+  // once. Otherwise the initial empty-stub state flashes a "GitHub not
+  // connected" warning before the real data lands.
+  if (!stateLoaded || targetsOK === null) return null
+  if (rows.length === 0 || dismissed) return null
 
   return (
-    <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-2 items-center pointer-events-none">
-      {rows.map((r) => (
-        <div
-          key={r.label}
-          className="mono text-[12px] px-3 py-1.5 rounded-md ring-1 ring-amber-300 dark:ring-amber-700/60 bg-amber-50 dark:bg-amber-900/30 text-amber-900 dark:text-amber-200 flex items-center gap-3 shadow-sm pointer-events-auto"
-        >
-          <span>{r.label}</span>
+    <div className="fixed inset-0 z-50 grid place-items-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm p-6"
+         onClick={() => setDismissed(true)}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="bg-white dark:bg-zinc-900 rounded-2xl ring-1 ring-zinc-200 dark:ring-zinc-700 shadow-2xl p-7 max-w-md w-full"
+      >
+        <div className="flex items-center gap-2 mb-4">
+          <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+          <h2 className="serif italic text-[20px] text-zinc-900 dark:text-zinc-50">Heads up</h2>
+          <div className="flex-1" />
           <button
-            onClick={r.onClick}
-            className="px-2 py-0.5 rounded ring-1 ring-amber-300 dark:ring-amber-700 hover:bg-amber-100 dark:hover:bg-amber-900/50"
-          >{r.cta}</button>
+            onClick={() => setDismissed(true)}
+            className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 rounded p-1"
+            title="Close (esc)"
+          >
+            <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
         </div>
-      ))}
+        <div className="space-y-2.5">
+          {rows.map((r) => (
+            <div key={r.label} className="flex items-center gap-3 rounded-lg ring-1 ring-amber-200 dark:ring-amber-800/60 bg-amber-50/70 dark:bg-amber-950/30 px-3 py-2">
+              <span className="text-[13px] text-amber-900 dark:text-amber-100 flex-1">{r.label}</span>
+              <button
+                onClick={() => { r.onClick(); setDismissed(true) }}
+                className="mono text-[11px] px-2 py-0.5 rounded ring-1 ring-amber-300 dark:ring-amber-700 text-amber-800 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-900/50 flex-shrink-0"
+              >{r.cta}</button>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   )
 }
@@ -3229,7 +3302,12 @@ function ViewToggle({ view, setView }: { view: 'canvas' | 'list'; setView: (v: '
   )
 }
 
-function ListView({ jobs, onOpen }: { jobs: Job[]; onOpen: (tmux: string) => void }) {
+function ListView({ jobs, onOpen, onPin, pinned }: {
+  jobs: Job[]
+  onOpen: (tmux: string) => void
+  onPin?: (tmux: string) => void
+  pinned?: Record<string, { x: number; y: number }>
+}) {
   const activity = React.useContext(ActivityContext)
   // Group by attention level so the highest-signal cards rise to the top
   // without losing their visual category. Inside a group, sort by score
@@ -3275,6 +3353,8 @@ function ListView({ jobs, onOpen }: { jobs: Job[]; onOpen: (tmux: string) => voi
                   key={job.tmux || String(job.issue)}
                   job={job}
                   onOpen={onOpen}
+                  onPin={onPin}
+                  isPinned={!!(job.tmux && pinned && pinned[job.tmux])}
                   activityAt={activity.at.get(job.tmux ?? '')}
                 />
               ))}
@@ -3293,7 +3373,13 @@ const GROUP_LABEL: Record<AttentionLevel, string> = {
   'quiet':     'Quiet',
 }
 
-function ListRow({ job, onOpen, activityAt }: { job: Job; onOpen: (tmux: string) => void; activityAt?: number }) {
+function ListRow({ job, onOpen, onPin, isPinned, activityAt }: {
+  job: Job
+  onOpen: (tmux: string) => void
+  onPin?: (tmux: string) => void
+  isPinned?: boolean
+  activityAt?: number
+}) {
   let attn = attention(job)
   if (activityAt && Date.now() - activityAt < ACTIVITY_HOLD_MS && !job.needs_input) {
     attn = { ...attn, level: 'working', reason: 'active' }
@@ -3332,6 +3418,27 @@ function ListRow({ job, onOpen, activityAt }: { job: Job; onOpen: (tmux: string)
           ) : null}
         </div>
       </div>
+      {onPin && job.tmux && (
+        <span
+          role="button"
+          tabIndex={0}
+          onClick={(e) => { e.stopPropagation(); if (!isPinned) onPin(job.tmux) }}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); if (!isPinned) onPin(job.tmux) } }}
+          title={isPinned ? 'Already on canvas' : 'Pin to canvas'}
+          className={
+            'opacity-0 group-hover:opacity-100 transition-opacity rounded p-1 ' +
+            (isPinned
+              ? 'text-violet-500 cursor-default'
+              : 'text-zinc-400 hover:text-violet-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer')
+          }
+        >
+          <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+            {/* pin icon */}
+            <path d="M12 17v5" />
+            <path d="M9 10.76V6a3 3 0 0 1 3-3v0a3 3 0 0 1 3 3v4.76l2 2.24v2H7v-2z" />
+          </svg>
+        </span>
+      )}
       <span className="text-zinc-300 dark:text-zinc-600 opacity-0 group-hover:opacity-100 transition-opacity">
         <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
           <polyline points="9 18 15 12 9 6" />
@@ -3484,6 +3591,119 @@ function ThemeToggle() {
 
 // Bottom-center floating toolbar in the tldraw style: a pill of icon
 // buttons with the active tool highlighted.
+// Floating session palette pinned to the bottom-right on canvas view.
+// Click the "+" to open a searchable picker of unpinned sessions; click
+// one to drop its card at the current viewport centre. Closes on Esc
+// or click outside.
+function SessionPalette({
+  jobs, pinned, onPin,
+}: {
+  jobs: Job[]
+  pinned: Record<string, { x: number; y: number }>
+  onPin: (tmux: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [filter, setFilter] = useState('')
+  const rootRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    const onDown = (e: PointerEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as globalThis.Node)) setOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('pointerdown', onDown)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('pointerdown', onDown)
+    }
+  }, [open])
+
+  const candidates = useMemo(() => {
+    const q = filter.trim().toLowerCase()
+    return jobs
+      .filter((j) => j.tmux && !pinned[j.tmux])
+      .filter((j) => {
+        if (!q) return true
+        return (j.issue_title?.toLowerCase().includes(q)
+          || j.tmux?.toLowerCase().includes(q)
+          || j.target_repo?.toLowerCase().includes(q)
+          || j.target?.toLowerCase().includes(q))
+      })
+      .sort((a, b) => attention(b).score - attention(a).score)
+      .slice(0, 60)
+  }, [jobs, pinned, filter])
+
+  return (
+    <div ref={rootRef} className="fixed bottom-5 right-5 z-40">
+      {open && (
+        <div className="mb-2 w-[320px] rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-700 bg-white dark:bg-zinc-900 shadow-2xl overflow-hidden flex flex-col">
+          <div className="flex items-center gap-2 px-3 py-2 border-b border-zinc-100 dark:border-zinc-800">
+            <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} className="text-zinc-400">
+              <circle cx="11" cy="11" r="7" />
+              <line x1="20" y1="20" x2="16.5" y2="16.5" />
+            </svg>
+            <input
+              autoFocus
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="add session to canvas…"
+              className="flex-1 text-[13px] bg-transparent outline-none text-zinc-900 dark:text-zinc-100"
+            />
+            <span className="mono text-[10px] text-zinc-400 tabular-nums">{candidates.length}</span>
+          </div>
+          <div className="max-h-[320px] overflow-auto">
+            {candidates.length === 0 ? (
+              <div className="px-3 py-4 text-[12px] text-zinc-400 dark:text-zinc-500 text-center">
+                {jobs.length === 0 ? 'no sessions yet' : 'everything pinned'}
+              </div>
+            ) : candidates.map((j) => {
+              const attn = attention(j)
+              const color = LEVEL_COLOR[attn.level]
+              const repo = j.target_repo?.split('/')[1] || j.target || '—'
+              return (
+                <button
+                  key={j.tmux}
+                  onClick={() => { onPin(j.tmux); setOpen(false); setFilter('') }}
+                  className="w-full text-left flex items-center gap-2 px-3 py-2 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
+                >
+                  <span className={`w-2 h-2 rounded-full ${color.bar} flex-shrink-0`} />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[12.5px] text-zinc-900 dark:text-zinc-100 truncate">
+                      {j.issue_title || j.tmux}
+                    </div>
+                    <div className="mono text-[10.5px] text-zinc-400 dark:text-zinc-500 truncate">
+                      {repo}{j.pr ? ` · PR #${j.pr}` : ''}
+                    </div>
+                  </div>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
+      <button
+        onClick={() => setOpen((v) => !v)}
+        title="Add session to canvas"
+        className={
+          'w-12 h-12 rounded-full shadow-lg shadow-zinc-300/40 dark:shadow-black/40 flex items-center justify-center transition-colors ' +
+          (open
+            ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-200'
+            : 'bg-violet-600 text-white hover:bg-violet-700')
+        }
+      >
+        <svg width={18} height={18} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round">
+          {open ? (
+            <><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></>
+          ) : (
+            <><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></>
+          )}
+        </svg>
+      </button>
+    </div>
+  )
+}
+
 function FloatingToolbar({
   tool, setTool, addNote,
 }: { tool: Tool; setTool: (t: Tool) => void; addNote: () => void }) {
