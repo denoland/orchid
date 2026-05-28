@@ -52,32 +52,23 @@ fi
 
 INVOKER=${SUDO_USER:-$USER}
 
-say "installing prerequisites"
-if command -v apt-get >/dev/null; then
-  $SUDO apt-get update -qq
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    git tmux openssh-client openssh-server openssl curl jq ca-certificates >/dev/null
-elif command -v dnf >/dev/null; then
-  $SUDO dnf install -y -q git tmux openssh-clients openssh-server openssl curl jq >/dev/null
-else
-  die "no apt-get or dnf — install git tmux openssh openssl curl jq manually"
-fi
+say "checking prerequisites"
+missing=()
+for cmd in git tmux ssh ssh-keyscan openssl curl jq gh claude; do
+  command -v "$cmd" >/dev/null || missing+=("$cmd")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+  cat >&2 <<EOF
+✗ missing required commands: ${missing[*]}
 
-# Always install gh from cli.github.com — distro packages lag and break
-# `gh auth setup-git` on older Ubuntu.
-if ! command -v gh >/dev/null; then
-  if command -v apt-get >/dev/null; then
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
-      $SUDO dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg status=none
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
-      $SUDO tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-    $SUDO apt-get update -qq
-    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh >/dev/null
-  else
-    $SUDO dnf install -y -q 'dnf-command(config-manager)' >/dev/null
-    $SUDO dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo >/dev/null
-    $SUDO dnf install -y -q gh >/dev/null
-  fi
+orchid needs these installed and on PATH before this script runs:
+  git tmux ssh ssh-keyscan openssl curl jq
+  gh      — https://cli.github.com (must be 2.x+, auth'd as your bot account)
+  claude  — https://docs.anthropic.com/claude-code (the agent orch spawns)
+
+Install them via your package manager, then re-run this script.
+EOF
+  exit 1
 fi
 
 say "creating orchid system user"
