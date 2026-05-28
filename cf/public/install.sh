@@ -116,6 +116,10 @@ CAPTURE_TOKEN=${CAPTURE_TOKEN:-$(openssl rand -hex 16)}
 
 $SUDO mkdir -p "$ORCHID_ETC" "$ORCHID_HOME/captures" "$ORCHID_HOME/vm-keys" "$ORCHID_HOME/orch-work"
 $SUDO chown -R "$ORCHID_USER:$ORCHID_USER" "$ORCHID_HOME"
+# /etc/orchid needs to be writable by the orchid daemon — both the
+# dashboard's Settings save and `orch join vm` rewrite swarm.hcl in
+# place. Without this, /api/config PUT fails with EACCES.
+$SUDO chown -R "$ORCHID_USER:$ORCHID_USER" "$ORCHID_ETC"
 $SUDO chmod 700 "$ORCHID_HOME/vm-keys"
 
 if [ ! -f "$ORCHID_ETC/swarm.hcl" ]; then
