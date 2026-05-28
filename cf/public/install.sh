@@ -85,16 +85,6 @@ trap 'rm -rf "$TMPDIR"' EXIT
 curl -fsSL "$TARBALL_URL" | tar -xz -C "$TMPDIR"
 $SUDO install -m 0755 "$TMPDIR/orch" "$ORCHID_BIN"
 
-# Trust github.com SSH host keys in orchid's known_hosts so the first
-# `git clone` of a target repo doesn't die.
-$SUDO -u "$ORCHID_USER" mkdir -p "$ORCHID_HOME/.ssh"
-$SUDO -u "$ORCHID_USER" touch "$ORCHID_HOME/.ssh/known_hosts"
-$SUDO -u "$ORCHID_USER" chmod 600 "$ORCHID_HOME/.ssh/known_hosts"
-if ! $SUDO -u "$ORCHID_USER" ssh-keygen -F github.com -f "$ORCHID_HOME/.ssh/known_hosts" >/dev/null 2>&1; then
-  ssh-keyscan -t rsa,ed25519 github.com 2>/dev/null | \
-    $SUDO -u "$ORCHID_USER" tee -a "$ORCHID_HOME/.ssh/known_hosts" >/dev/null
-fi
-
 if [ "$WORKER" = "1" ]; then
   $SUDO systemctl enable --now ssh 2>/dev/null || $SUDO systemctl enable --now sshd 2>/dev/null || true
   cat <<EOF
