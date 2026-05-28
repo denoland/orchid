@@ -1012,10 +1012,6 @@ func loadState(dbPath string) (*State, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	if err := store.EnsureDefaultCanvas(); err != nil {
-		_ = store.Close()
-		return nil, err
-	}
 	jobs, cursor, maint, err := store.LoadState()
 	if err != nil {
 		_ = store.Close()

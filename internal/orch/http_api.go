@@ -4,10 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
-	cryptoRand "crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -18,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -53,18 +50,6 @@ type apiVMEntry struct {
 	Agent    string `json:"agent"`
 	Online   bool   `json:"online"`
 	LastErr  string `json:"last_err,omitempty"`
-}
-
-var canvasIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,40}$`)
-
-func validCanvasID(id string) bool { return canvasIDPattern.MatchString(id) }
-
-// newCanvasID returns an 8-byte hex string. Short enough for URLs,
-// long enough not to collide in practice (16 hex chars).
-func newCanvasID() string {
-	var b [8]byte
-	_, _ = cryptoRand.Read(b[:])
-	return hex.EncodeToString(b[:])
 }
 
 type apiStateResp struct {
@@ -591,121 +576,11 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		})
 	}))
 
-	// Multi-canvas API. /api/snap stays as a shim for the "default"
-	// canvas so older clients (and capture/CLI tools) keep working.
-	mux.HandleFunc("/api/canvases", auth(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			rows, err := st.store.ListCanvases()
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if rows == nil {
-				rows = []CanvasRow{}
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(rows)
-		case http.MethodPost:
-			var in struct {
-				Name string `json:"name"`
-			}
-			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&in); err != nil {
-				http.Error(w, "bad json", http.StatusBadRequest)
-				return
-			}
-			name := strings.TrimSpace(in.Name)
-			if name == "" {
-				name = "Untitled"
-			}
-			id := newCanvasID()
-			if err := st.store.CreateCanvas(id, name); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]string{"id": id, "name": name})
-		default:
-			http.Error(w, "GET/POST only", http.StatusMethodNotAllowed)
-		}
-	}))
-
-	mux.HandleFunc("/api/canvases/", auth(func(w http.ResponseWriter, r *http.Request) {
-		rest := strings.TrimPrefix(r.URL.Path, "/api/canvases/")
-		parts := strings.SplitN(rest, "/", 2)
-		id := parts[0]
-		if id == "" || !validCanvasID(id) {
-			http.Error(w, "bad canvas id", http.StatusBadRequest)
-			return
-		}
-		sub := ""
-		if len(parts) == 2 {
-			sub = parts[1]
-		}
-		switch {
-		case sub == "snap" && r.Method == http.MethodGet:
-			b, err := st.store.GetCanvasSnap(id)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if b == nil {
-				http.NotFound(w, r)
-				return
-			}
-			w.Header().Set("Cache-Control", "no-store")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write(b)
-		case sub == "snap" && (r.Method == http.MethodPut || r.Method == http.MethodPost):
-			body, err := io.ReadAll(io.LimitReader(r.Body, 4*1024*1024))
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			if !json.Valid(body) {
-				http.Error(w, "invalid json", http.StatusBadRequest)
-				return
-			}
-			if err := st.store.PutCanvasSnap(id, body); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
-		case sub == "" && r.Method == http.MethodPatch:
-			var in struct {
-				Name string `json:"name"`
-			}
-			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&in); err != nil {
-				http.Error(w, "bad json", http.StatusBadRequest)
-				return
-			}
-			if err := st.store.RenameCanvas(id, strings.TrimSpace(in.Name)); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
-		case sub == "" && r.Method == http.MethodDelete:
-			if id == "default" {
-				http.Error(w, "cannot delete the default canvas", http.StatusBadRequest)
-				return
-			}
-			if err := st.store.DeleteCanvas(id); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	}))
-
-	// Legacy single-canvas endpoint. Reads/writes the "default" canvas
-	// so older clients (capture, scripted tools) keep working unchanged.
 	mux.HandleFunc("/api/snap", auth(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			w.Header().Set("Cache-Control", "no-store")
-			b, err := st.store.GetCanvasSnap("default")
+			b, err := st.store.GetSnap()
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -725,7 +600,7 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				http.Error(w, "invalid json", http.StatusBadRequest)
 				return
 			}
-			if err := st.store.PutCanvasSnap("default", body); err != nil {
+			if err := st.store.PutSnap(body); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
