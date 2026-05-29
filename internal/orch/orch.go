@@ -126,6 +126,15 @@ type Job struct {
 	Priority int       `json:"priority,omitempty"`
 	Paused   bool      `json:"paused,omitempty"`
 	PausedAt time.Time `json:"paused_at,omitempty"`
+
+	// Token-saving bookkeeping (see tick.go). SpawnedAt anchors the session-age
+	// cap (zero is grandfathered to now on first sighting so existing sessions
+	// aren't all cycled at once). LastPokeAt debounces review/CI pokes.
+	// LastClearAt is the cooldown so a freshly /clear'd session isn't cycled
+	// again immediately.
+	SpawnedAt   time.Time `json:"spawned_at,omitempty"`
+	LastPokeAt  time.Time `json:"last_poke_at,omitempty"`
+	LastClearAt time.Time `json:"last_clear_at,omitempty"`
 }
 
 type State struct {

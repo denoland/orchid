@@ -74,6 +74,7 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 		Branch: branch, Lifecycle: "oneshot",
 		IssueTitle:           is.Title,
 		LastCheckConclusions: map[string]string{},
+		SpawnedAt:            time.Now(),
 	}
 	log.Printf("issue #%d: spawned on %s/%s, target=%s (%s), branch=%s",
 		is.Number, vm.Name, sessionName(is.Number, vmAgent(*vm).name), target.Name, target.Repo, branch)
@@ -226,6 +227,78 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 	j.NextFireAt = fireDoneAt.Add(cron.Schedule)
 	j.FireStartedAt = fireDoneAt
 	saveStateLogged(st)
+}
+
+// cycleBloatedSession resets a long-lived session's context when it has grown
+// past the configured ceiling (or the session is too old) — the dominant token
+// sink, since every turn re-reads the whole conversation as cache_read, so a
+// session whose context climbed toward the 1M window re-reads ~1M tokens per
+// turn. It /clears the conversation (ONLY when idle, so no in-flight work is
+// lost) and re-orients claude with a concise PR-state report, dropping per-turn
+// cache_read back to near-zero. Returns true if it cycled (caller skips the rest
+// of this tick for the job). No-op when no throttle block is configured. Must
+// be called with j.PR already known. Caller holds st.mu.
+func cycleBloatedSession(cfg *Config, st *State, vm *VMBlock, n int, j *Job) bool {
+	tb := cfg.Orch.Throttle
+	if tb == nil {
+		return false
+	}
+	c := tb.withDefaults()
+	now := time.Now()
+	// Grandfather sessions tracked before SpawnedAt existed so they aren't all
+	// flagged "too old" at once on the first tick after upgrade.
+	if j.SpawnedAt.IsZero() {
+		j.SpawnedAt = now
+		return false
+	}
+	maxCtx := c.maxCtxTokens()
+	ctx := contextTokensForIssue(n)
+	overCtx := maxCtx > 0 && ctx > maxCtx
+	overAge := now.Sub(j.SpawnedAt) > c.maxSessionAgeDur()
+	if !overCtx && !overAge {
+		return false
+	}
+	// Cooldown so a just-cleared session isn't cycled again immediately.
+	if !j.LastClearAt.IsZero() && now.Sub(j.LastClearAt) < 30*time.Minute {
+		return false
+	}
+	// Only clear when idle — never drop in-flight reasoning mid-turn.
+	if idle, _, err := tmuxIdle(*vm, j.Tmux); err != nil || !idle {
+		return false
+	}
+	reason := fmt.Sprintf("context %dk > %dk", ctx/1000, maxCtx/1000)
+	if overAge {
+		reason = fmt.Sprintf("age %s > %s", now.Sub(j.SpawnedAt).Round(time.Minute), c.maxSessionAgeDur())
+	}
+	if err := tmuxPaste(*vm, j.Tmux, "/clear"); err != nil {
+		log.Printf("issue #%d: context-cycle /clear failed: %v", n, err)
+		return false
+	}
+	time.Sleep(2 * time.Second)
+	ci := ""
+	for name, status := range j.LastCheckConclusions {
+		ci += fmt.Sprintf("  %s: %s\n", name, status)
+	}
+	if ci == "" {
+		ci = "  (no CI results yet)\n"
+	}
+	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
+	msg := fmt.Sprintf(`Your context was reset to save tokens (it had grown large). You are still on the same task.
+
+PR: #%d (%s)
+Branch: %s
+Last known CI:
+%s
+Re-read the PR and its diff, check what's implemented, address any open review comments or CI failures, push fixes if needed. If everything is already addressed and CI is green, stop and wait.`,
+		j.PR, prURL, j.Branch, ci)
+	if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
+		log.Printf("issue #%d: context-cycle re-orient paste failed: %v", n, err)
+	}
+	j.LastClearAt = now
+	j.SpawnedAt = now // age clock restarts with the fresh context
+	saveStateLogged(st)
+	log.Printf("issue #%d: cycled session (%s) — /clear + re-orient to save tokens", n, reason)
+	return true
 }
 
 // Mention is one @-mention of a configured bot found in a comment on an
@@ -582,6 +655,13 @@ func tick(cfg *Config, st *State) {
 				prURL)
 			saveStateLogged(st)
 		}
+		// Token-saving: if this session's context has grown too large (or it's
+		// too old), reset it (/clear + re-orient) instead of poking a 1M-token
+		// context every turn. Runs every tick once a PR is known; only fires
+		// when idle + over threshold.
+		if cycleBloatedSession(cfg, st, vm, n, j) {
+			continue
+		}
 		v, err := ghPRView(j.TargetRepo, j.PR)
 		viewedAt := time.Now()
 		if err != nil {
@@ -668,6 +748,18 @@ func tick(cfg *Config, st *State) {
 			log.Printf("issue #%d: weekly throttle active (%s), deferring poke", n, thr.Mode)
 			continue
 		}
+		// Poke debounce: each poke is a turn that re-reads the whole context, so
+		// don't poke the same session more than once per poke_min_interval.
+		// Skip WITHOUT marking reviews/comments Seen, so the accumulated update
+		// re-fires on the next eligible tick.
+		pokeMin := defaultPokeMinInterval
+		if cfg.Orch.Throttle != nil {
+			pokeMin = cfg.Orch.Throttle.withDefaults().pokeMinDur()
+		}
+		if !j.LastPokeAt.IsZero() && time.Since(j.LastPokeAt) < pokeMin {
+			log.Printf("issue #%d: poke debounced (last %s ago < %s)", n, time.Since(j.LastPokeAt).Round(time.Second), pokeMin)
+			continue
+		}
 		msg := summarize(v, vr, vt, vi, pushed, checks, mergeable)
 		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
 			log.Printf("issue #%d: poke failed: %v", n, err)
@@ -679,6 +771,7 @@ func tick(cfg *Config, st *State) {
 		j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, st_...)
 		j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, vi...)
 		j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, si...)
+		j.LastPokeAt = time.Now()
 		j.LastHeadOID = v.HeadRefOid
 		if v.Mergeable != "" && v.Mergeable != "UNKNOWN" {
 			j.LastMergeable = v.Mergeable
