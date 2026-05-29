@@ -370,12 +370,29 @@ func tick(cfg *Config, st *State) {
 	// Admission. The throttle gate (BlocksNewWork) is the hard floor and still
 	// applies first; the governor only further restricts via EffectiveCap.
 	//
-	// When the governor is disabled (EffectiveCap == MaxInt) we preserve the
-	// original behavior: try to admit every candidate (map-order iteration,
-	// freeVM is the only limit) — byte-for-byte today. When enabled we sort by
-	// priority DESC (FIFO tiebreak via jobsByPriority's issue-number order) and
-	// admit at most EffectiveCap - active this tick; deferred low-priority
-	// issues are the implicit admission queue (re-evaluated next tick).
+	// Order candidates by priority ALWAYS (high first, issue-number FIFO
+	// tiebreak), whether or not the governor's adaptive cap is active. Priority
+	// must work even when the governor is dormant (e.g. no quota signal yet),
+	// otherwise admission falls back to issue-number order and a high-priority
+	// new issue (high number) loses to every older queued issue. Per-issue
+	// priority comes from the issue body's toml frontmatter (priority = N),
+	// defaulting to cfg.DefaultPriority.
+	prio := map[int]int{}
+	for _, n := range candidates {
+		p := parsePriorityFrontmatter(open[n].is.Body)
+		if p == 0 {
+			p = defaultPriority(cfg)
+		}
+		prio[n] = p
+	}
+	sort.SliceStable(candidates, func(a, b int) bool {
+		if prio[candidates[a]] != prio[candidates[b]] {
+			return prio[candidates[a]] > prio[candidates[b]]
+		}
+		return candidates[a] < candidates[b]
+	})
+	// The governor's adaptive cap only bounds admission when it's enabled and
+	// has a reading; otherwise freeVM (per-VM capacity) is the only limit.
 	admitSlots := math.MaxInt
 	if gov.Enabled && gov.EffectiveCap != math.MaxInt {
 		// Count TOTAL governable (running + paused), not just running: a paused
@@ -385,24 +402,6 @@ func tick(cfg *Config, st *State) {
 		if admitSlots < 0 {
 			admitSlots = 0
 		}
-		// Sort candidates by priority DESC, parsing per-issue priority.
-		prio := map[int]int{}
-		for _, n := range candidates {
-			p := parsePriorityFrontmatter(open[n].is.Body)
-			if p == 0 {
-				p = defaultPriority(cfg)
-			}
-			prio[n] = p
-		}
-		sort.SliceStable(candidates, func(a, b int) bool {
-			if prio[candidates[a]] != prio[candidates[b]] {
-				return prio[candidates[a]] > prio[candidates[b]]
-			}
-			return candidates[a] < candidates[b]
-		})
-	} else {
-		// Disabled path: keep deterministic by issue number, but no cap.
-		sort.Ints(candidates)
 	}
 
 	admitted := 0
