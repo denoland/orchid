@@ -50,6 +50,16 @@ type ThrottleBlock struct {
 	FiveRateWindow   string  `hcl:"five_rate_window,optional"   json:"five_rate_window,omitempty"`   // 5h burn-rate lookback; default 45m
 	MaxPauseDur      string  `hcl:"max_pause_dur,optional"      json:"max_pause_dur,omitempty"`      // force-resume after this; default 20m
 	DefaultPriority  int     `hcl:"default_priority,optional"   json:"default_priority,omitempty"`   // priority for issues with no frontmatter; default 0
+
+	// Token-saving knobs (see tick.go). The dominant token sink is cache_read:
+	// every turn re-reads the whole conversation context, so a long-lived
+	// session whose context has grown re-reads a huge context on every turn.
+	// These cap that. Defaults applied lazily; a session is cycled (/clear +
+	// re-orient) when idle and over either limit. PokeMinInterval debounces the
+	// review/CI pokes (each poke is a turn = a full context re-read).
+	PokeMinInterval  string `hcl:"poke_min_interval,optional"   json:"poke_min_interval,omitempty"`  // min gap between pokes; default 5m
+	MaxContextTokens int    `hcl:"max_context_tokens,optional"  json:"max_context_tokens,omitempty"` // /clear when ctx exceeds this; default 500000 (0=off)
+	MaxSessionAge    string `hcl:"max_session_age,optional"     json:"max_session_age,omitempty"`    // /clear when session older than this; default 12h
 }
 
 // Governor default durations + numeric defaults. Kept next to the throttle
@@ -61,7 +71,29 @@ const (
 	defaultGovRateWindow     = 3 * time.Hour
 	defaultGovFiveRateWindow = 45 * time.Minute
 	defaultGovMaxPauseDur    = 20 * time.Minute
+	defaultPokeMinInterval   = 5 * time.Minute
+	defaultMaxContextTokens  = 500000
+	defaultMaxSessionAge     = 12 * time.Hour
 )
+
+func (t ThrottleBlock) pokeMinDur() time.Duration {
+	return durOr(t.PokeMinInterval, defaultPokeMinInterval)
+}
+func (t ThrottleBlock) maxSessionAgeDur() time.Duration {
+	return durOr(t.MaxSessionAge, defaultMaxSessionAge)
+}
+
+// maxCtxTokens returns the context-size ceiling above which a session is
+// cycled. Default 500000; a negative value disables context-based cycling.
+func (t ThrottleBlock) maxCtxTokens() int {
+	if t.MaxContextTokens < 0 {
+		return 0 // disabled
+	}
+	if t.MaxContextTokens == 0 {
+		return defaultMaxContextTokens
+	}
+	return t.MaxContextTokens
+}
 
 // targetCeiling returns the used% the governor paces toward (lands ~here at
 // reset). Defaults to WeeklyCeilingPct so the governor and the hard gate share

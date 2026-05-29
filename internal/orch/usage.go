@@ -49,10 +49,10 @@ type StatusLineEvent struct {
 		DisplayName string `json:"display_name"`
 	} `json:"model"`
 	Cost struct {
-		TotalCostUSD     float64 `json:"total_cost_usd"`
-		TotalDurationMs  int64   `json:"total_duration_ms"`
-		TotalLinesAdded  int     `json:"total_lines_added"`
-		TotalLinesRemoved int    `json:"total_lines_removed"`
+		TotalCostUSD      float64 `json:"total_cost_usd"`
+		TotalDurationMs   int64   `json:"total_duration_ms"`
+		TotalLinesAdded   int     `json:"total_lines_added"`
+		TotalLinesRemoved int     `json:"total_lines_removed"`
 	} `json:"cost"`
 	ContextWindow struct {
 		TotalInputTokens  int      `json:"total_input_tokens"`
@@ -111,6 +111,19 @@ func usageForIssue(n int) *usageState {
 	usageMu.RLock()
 	defer usageMu.RUnlock()
 	return usageByIssue[n]
+}
+
+// contextTokensForIssue returns the latest known conversation-context size
+// (total input tokens) for issue n's session, from its statusline. 0 when no
+// statusline has been seen. The token-saving logic uses this to cycle a session
+// whose context has grown large (every turn re-reads it as cache_read).
+func contextTokensForIssue(n int) int {
+	usageMu.RLock()
+	defer usageMu.RUnlock()
+	if s := usageByIssue[n]; s != nil {
+		return s.ContextWindow.TotalInputTokens
+	}
+	return 0
 }
 
 func latestQuota() (RateLimit, RateLimit, bool) {
