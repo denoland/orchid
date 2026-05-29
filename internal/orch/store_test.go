@@ -134,3 +134,88 @@ func TestStoreMigrateLegacyJSON(t *testing.T) {
 	}
 	store.Close()
 }
+
+func TestQuotaSamplesRoundTrip(t *testing.T) {
+	tmp, err := os.MkdirTemp("", "orch-quota-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	path := tmp + "/state.db"
+
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// Empty load.
+	got, err := store.LoadQuotaSamples(0)
+	if err != nil {
+		t.Fatalf("load empty: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected no samples, got %d", len(got))
+	}
+
+	// Three samples at increasing ts. Out-of-order insert to verify ORDER BY ts.
+	samples := []QuotaSample{
+		{Ts: 1000, FivePct: 10, FiveReset: 5000, SevenPct: 20, SevenReset: 9000},
+		{Ts: 3000, FivePct: 30, FiveReset: 5000, SevenPct: 40, SevenReset: 9000},
+		{Ts: 2000, FivePct: 20, FiveReset: 5000, SevenPct: 30, SevenReset: 9000},
+	}
+	for _, q := range samples {
+		if err := store.InsertQuotaSample(q); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	// Load all, oldest first.
+	got, err = store.LoadQuotaSamples(0)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	want := []QuotaSample{
+		{Ts: 1000, FivePct: 10, FiveReset: 5000, SevenPct: 20, SevenReset: 9000},
+		{Ts: 2000, FivePct: 20, FiveReset: 5000, SevenPct: 30, SevenReset: 9000},
+		{Ts: 3000, FivePct: 30, FiveReset: 5000, SevenPct: 40, SevenReset: 9000},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("load all mismatch:\n got=%v\nwant=%v", got, want)
+	}
+
+	// sinceTs filter returns only the recent subset.
+	got, err = store.LoadQuotaSamples(2000)
+	if err != nil {
+		t.Fatalf("load since: %v", err)
+	}
+	if len(got) != 2 || got[0].Ts != 2000 || got[1].Ts != 3000 {
+		t.Fatalf("sinceTs filter wrong: %v", got)
+	}
+
+	// Prune drops samples older than 2500.
+	if err := store.PruneQuotaSamples(2500); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	got, err = store.LoadQuotaSamples(0)
+	if err != nil {
+		t.Fatalf("load after prune: %v", err)
+	}
+	if len(got) != 1 || got[0].Ts != 3000 {
+		t.Fatalf("expected only ts=3000 after prune, got %v", got)
+	}
+	store.Close()
+
+	// Reopen: persisted across DB close/open.
+	store2, err := openStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer store2.Close()
+	got, err = store2.LoadQuotaSamples(0)
+	if err != nil {
+		t.Fatalf("load after reopen: %v", err)
+	}
+	if len(got) != 1 || got[0].Ts != 3000 || got[0].SevenPct != 40 {
+		t.Fatalf("reopen persistence wrong: %v", got)
+	}
+}

@@ -51,13 +51,29 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   cost_usd       REAL    NOT NULL DEFAULT 0,
   PRIMARY KEY (date, session_id, model)
 );
-CREATE INDEX IF NOT EXISTS usage_daily_date ON usage_daily(date);`); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-		_, _ = db.Exec(`ALTER TABLE usage_daily ADD COLUMN issue INTEGER NOT NULL DEFAULT 0`)
-		return &Store{db: db}, nil
+CREATE INDEX IF NOT EXISTS usage_daily_date ON usage_daily(date);
+CREATE TABLE IF NOT EXISTS closed_jobs (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  issue     INTEGER NOT NULL,
+  state     TEXT NOT NULL,
+  data      BLOB NOT NULL,
+  closed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS closed_jobs_closed_at ON closed_jobs(closed_at);
+CREATE TABLE IF NOT EXISTS quota_samples (
+  ts          INTEGER NOT NULL,
+  five_pct    REAL    NOT NULL DEFAULT 0,
+  five_reset  INTEGER NOT NULL DEFAULT 0,
+  seven_pct   REAL    NOT NULL DEFAULT 0,
+  seven_reset INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS quota_samples_ts ON quota_samples(ts);`); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
+	_, _ = db.Exec(`ALTER TABLE usage_daily ADD COLUMN issue INTEGER NOT NULL DEFAULT 0`)
+	return &Store{db: db}, nil
+}
 
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
@@ -292,6 +308,49 @@ func (s *Store) LoadUsageHistory(sinceDate string) ([]UsageDailyRow, error) {
 	return out, rows.Err()
 }
 
+// InsertQuotaSample appends one quota reading (append-only timeseries). The
+// QuotaSample type is defined in governor.go — it is the governor's input. The
+// quota-sampling loop calls this every ~90s; the governor's burn-rate
+// estimator reads windows back out via LoadQuotaSamples.
+func (s *Store) InsertQuotaSample(q QuotaSample) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO quota_samples (ts, five_pct, five_reset, seven_pct, seven_reset)
+		VALUES (?,?,?,?,?)`,
+		q.Ts, q.FivePct, q.FiveReset, q.SevenPct, q.SevenReset)
+	return err
+}
+
+// LoadQuotaSamples returns all samples with ts >= sinceTs, oldest first.
+func (s *Store) LoadQuotaSamples(sinceTs int64) ([]QuotaSample, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT ts, five_pct, five_reset, seven_pct, seven_reset
+		FROM quota_samples WHERE ts >= ? ORDER BY ts ASC`, sinceTs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []QuotaSample
+	for rows.Next() {
+		var q QuotaSample
+		if err := rows.Scan(&q.Ts, &q.FivePct, &q.FiveReset, &q.SevenPct, &q.SevenReset); err != nil {
+			return nil, err
+		}
+		out = append(out, q)
+	}
+	return out, rows.Err()
+}
+
+// PruneQuotaSamples deletes samples older than beforeTs. Called periodically
+// from the sampling loop to keep ~14 days of history.
+func (s *Store) PruneQuotaSamples(beforeTs int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM quota_samples WHERE ts < ?`, beforeTs)
+	return err
+}
+
 func (s *Store) GetSnap() ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -376,4 +435,62 @@ func (s *Store) isEmpty() bool {
 		return false
 	}
 	return true
+}
+
+// ClosedJobRow is one record from the closed_jobs table. The dashboard
+// renders these as ghost cards with a "merged" / "closed" badge.
+type ClosedJobRow struct {
+	Issue    int    `json:"issue"`
+	State    string `json:"state"` // "merged" | "closed"
+	ClosedAt int64  `json:"closed_at"`
+	Job      *Job   `json:"job"`
+}
+
+// PutClosedJob writes one row to closed_jobs. Called from the tick loop
+// just before tearDown when a PR is detected as merged or closed.
+func (s *Store) PutClosedJob(issue int, state string, j *Job) error {
+	if j == nil {
+		return nil
+	}
+	b, err := json.Marshal(j)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err = s.db.Exec(
+		"INSERT INTO closed_jobs (issue, state, data, closed_at) VALUES (?,?,?,?)",
+		issue, state, b, time.Now().Unix(),
+	)
+	return err
+}
+
+// RecentClosedJobs returns closed-job rows whose closed_at is no older
+// than maxAgeSecs ago, newest first. Limit caps the result count.
+func (s *Store) RecentClosedJobs(maxAgeSecs int64, limit int) ([]ClosedJobRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := time.Now().Unix() - maxAgeSecs
+	rows, err := s.db.Query(
+		"SELECT issue, state, data, closed_at FROM closed_jobs WHERE closed_at >= ? ORDER BY closed_at DESC LIMIT ?",
+		cutoff, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ClosedJobRow
+	for rows.Next() {
+		var r ClosedJobRow
+		var data []byte
+		if err := rows.Scan(&r.Issue, &r.State, &data, &r.ClosedAt); err != nil {
+			return nil, err
+		}
+		var j Job
+		if err := json.Unmarshal(data, &j); err == nil {
+			r.Job = &j
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

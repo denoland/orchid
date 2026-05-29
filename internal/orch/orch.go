@@ -52,6 +52,7 @@ type OrchBlock struct {
 	BotGithubKey  string         `hcl:"bot_github_key,optional" json:"bot_github_key,omitempty"`
 	Mentions      *MentionsBlock `hcl:"mentions,block" json:"mentions,omitempty"`
 	Capture       *CaptureBlock  `hcl:"capture,block" json:"capture,omitempty"`
+	Throttle      *ThrottleBlock `hcl:"throttle,block" json:"throttle,omitempty"`
 }
 
 type CaptureBlock struct {
@@ -114,6 +115,17 @@ type Job struct {
 	LastHeadOID          string            `json:"last_head_oid,omitempty"`
 	LastCheckConclusions map[string]string `json:"last_check_conclusions,omitempty"`
 	LastMergeable        string            `json:"last_mergeable,omitempty"`
+
+	// Proactive pacing governor fields (see governor.go). All persist for free
+	// via SaveState's json blob. Priority is parsed from the issue body's toml
+	// frontmatter ("priority = N", higher = more important; default 0 / the
+	// configured DefaultPriority). Paused/PausedAt track a duty-cycle SIGSTOP:
+	// when the governor freezes a session's token burn it sets Paused=true and
+	// stamps PausedAt; the reconcile pass clears them on resume or when the
+	// pane is gone, so a stopped session is never stranded across a restart.
+	Priority int       `json:"priority,omitempty"`
+	Paused   bool      `json:"paused,omitempty"`
+	PausedAt time.Time `json:"paused_at,omitempty"`
 }
 
 type State struct {
@@ -136,13 +148,36 @@ type State struct {
 	// fills in within one probe interval.
 	healthMu sync.RWMutex
 	health   map[string]VMHealth
+
+	// lastThrottleMode is the throttle mode observed on the previous tick,
+	// used to log only on mode transitions (not every tick). Guarded by
+	// st.mu (only read/written inside tick()). Not persisted — defaults to
+	// ModeAllow on a fresh process.
+	lastThrottleMode ThrottleMode
+
+	// Proactive pacing governor in-memory state (see governor.go). Guarded by
+	// st.mu (read/written inside tick(), snapshotted under st.mu for /api/state).
+	// Not persisted in the json blob — govCap is mirrored to the kv table
+	// ("gov_cap") so the slew anchor survives a restart; lastGovDecision is
+	// re-derived every tick. On a fresh process govCap is 0 (=> GovernorDecide
+	// treats it as "start at maxActive") and lastGovDecision is the zero
+	// (fail-open) value.
+	govCap int
+	// lastGovDecision is surfaced on /api/state from the HTTP goroutine, so it
+	// is guarded by its OWN mutex (govMu), NEVER st.mu — tick() holds st.mu for
+	// a full multi-second scheduler pass and /api/state must not block on it.
+	govMu           sync.RWMutex
+	lastGovDecision GovernorDecision
+	// lastGovBinding/lastGovCap let tick() log only on governor transitions.
+	lastGovBinding string
+	lastGovCap     int
 }
 
 // VMHealth is the in-memory liveness record for one configured VM.
 type VMHealth struct {
-	Online   bool
-	LastOK   time.Time
-	LastErr  string
+	Online  bool
+	LastOK  time.Time
+	LastErr string
 }
 
 func (s *State) SetVMHealth(name string, h VMHealth) {
@@ -158,6 +193,28 @@ func (s *State) VMHealth(name string) VMHealth {
 	s.healthMu.RLock()
 	defer s.healthMu.RUnlock()
 	return s.health[name]
+}
+
+// GovernorState returns a copy of the last governor decision under st.mu, for
+// the lock-free /api/state builder (which otherwise reads only httpSnap). Mirror
+// of VMHealth: the HTTP goroutine never touches govCap/lastGovDecision directly.
+// SetGovernorState records the latest governor verdict for /api/state. Called
+// from tick() (which already holds st.mu); takes only govMu, so the HTTP reader
+// never contends with the scheduler pass. Lock order is always st.mu → govMu
+// (never the reverse), so no deadlock.
+func (s *State) SetGovernorState(d GovernorDecision) {
+	s.govMu.Lock()
+	s.lastGovDecision = d
+	s.govMu.Unlock()
+}
+
+// GovernorState returns a copy of the last governor decision for the lock-free
+// /api/state builder. Guarded by govMu (NOT st.mu) so it never blocks behind a
+// long tick().
+func (s *State) GovernorState() GovernorDecision {
+	s.govMu.RLock()
+	defer s.govMu.RUnlock()
+	return s.lastGovDecision
 }
 
 // MaintainerCache caches the configured org's member logins. Refreshed
@@ -324,6 +381,7 @@ type CronConfig struct {
 	ScheduleStr string
 	Timeout     time.Duration
 	TimeoutStr  string
+	Priority    int // governor priority parsed in the same toml pass; 0 if absent
 }
 
 func parseCronFrontmatter(body string) *CronConfig {
@@ -360,6 +418,10 @@ func parseCronFrontmatter(body string) *CronConfig {
 			if err == nil {
 				cfg.Timeout, cfg.TimeoutStr = d, val
 			}
+		case "priority":
+			if n, err := strconv.Atoi(val); err == nil {
+				cfg.Priority = n
+			}
 		}
 	}
 	if cfg.Schedule == 0 {
@@ -370,6 +432,45 @@ func parseCronFrontmatter(body string) *CronConfig {
 		cfg.TimeoutStr = cfg.Timeout.String()
 	}
 	return cfg
+}
+
+// parsePriorityFrontmatter scans the issue body's leading ```toml block for a
+// "priority = N" line and returns N. It is a standalone sibling of
+// parseCronFrontmatter so non-cron oneshots (which never go through the full
+// cron parser) still pick up a priority. Returns 0 when the frontmatter is
+// absent, has no priority key, or the value is malformed — never fatal,
+// mirroring parseCronFrontmatter's tolerance. The caller substitutes the
+// configured DefaultPriority when this returns 0.
+func parsePriorityFrontmatter(body string) int {
+	lines := strings.Split(body, "\n")
+	i := 0
+	for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
+		i++
+	}
+	if i >= len(lines) || strings.TrimSpace(lines[i]) != "```toml" {
+		return 0
+	}
+	i++
+	for ; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "```" {
+			break
+		}
+		eq := strings.Index(line, "=")
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		if key != "priority" {
+			continue
+		}
+		val := strings.Trim(strings.TrimSpace(line[eq+1:]), "\"'")
+		if n, err := strconv.Atoi(val); err == nil {
+			return n
+		}
+		return 0
+	}
+	return 0
 }
 
 func tmuxHasSession(vm VMBlock, session string) (bool, error) {
@@ -538,8 +639,13 @@ git -C "$WORKDIR" config user.email "$BOT_EMAIL"
 
 # 3b) if session runs as a different user, chown worktree + shared clone to them
 if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ]; then
-  SESSION_USER=$(stat -c '%%U' "$SESSION_HOME")
-  chown -R "$SESSION_USER:$SESSION_USER" "$WORKDIR" "$SHARED" 2>/dev/null || true
+  if [ "$(uname)" = "Darwin" ]; then
+    SESSION_USER=$(stat -f '%%Su' "$SESSION_HOME")
+  else
+    SESSION_USER=$(stat -c '%%U' "$SESSION_HOME")
+  fi
+  chown -R "$SESSION_USER:staff" "$WORKDIR" "$SHARED" 2>/dev/null || \
+    chown -R "$SESSION_USER:$SESSION_USER" "$WORKDIR" "$SHARED" 2>/dev/null || true
 fi
 
 # 4) agent-specific pre-warm. Claude needs its per-folder trust dialog
@@ -576,6 +682,24 @@ tmux new-session -d -c "$WORKDIR" -s "$SESSION" "$SESSION_CMD"
 func tmuxKill(vm VMBlock, session string) {
 	_, _, _ = sshExec(vm, fmt.Sprintf("tmux kill-session -t %s 2>/dev/null", session))
 }
+
+// tmuxSignalGroup sends sig (STOP/CONT) to the ENTIRE process group of the
+// pane's foreground tree (sh -c -> clawpatrol -> claude), not just the pane
+// pid's direct children. tmux launches "$SESSION_CMD" via /bin/sh -c, so the
+// pane pid is the sh wrapper and clawpatrol/claude are deeper descendants;
+// SIGSTOP does NOT cascade into a stopped process's children, so signalling one
+// level (pkill -P) would freeze only the wrapper and leave claude burning
+// tokens. tmux puts each pane in its own session/process-group, so we resolve
+// the pane pid's pgid and signal the whole group (-pgid). The tmux SERVER is a
+// separate process, so has-session / capture-pane keep working while the group
+// is stopped, and CONT later thaws the whole tree. Idempotent; a failed signal
+// just means that session keeps running (fail-open). Errors are returned for
+// the caller to log.
+// Duty-cycle pause = kill the session (process gone, RAM freed) while KEEPING
+// its worktree, so the governor can later respawn it with --resume. The kill is
+// tmuxKill (best-effort) and the respawn reuses the scheduler's normal
+// dead-session-with-PR → spawnResume path (governor_loop.go). No process freeze
+// (host SIGSTOP can't freeze the clawpatrol tree; cgroup.freeze is Linux-only).
 
 func tmuxIdle(vm VMBlock, session string) (idle bool, detected string, err error) {
 	out, _, e := sshExec(vm, fmt.Sprintf("tmux capture-pane -p -t %s", session))
@@ -741,7 +865,7 @@ func tmuxPaste(vm VMBlock, session, msg string) error {
 	if _, errStr, err := sshExecIn(vm, msg, fmt.Sprintf("tmux load-buffer -b %s -", buf)); err != nil {
 		return fmt.Errorf("load-buffer: %v: %s", err, errStr)
 	}
-	cmd := fmt.Sprintf("tmux paste-buffer -b %s -t %s -d; status=$?; tmux delete-buffer -b %s 2>/dev/null || true; [ $status -eq 0 ] || exit $status; sleep 1; tmux send-keys -t %s C-m", buf, session, buf, session)
+	cmd := fmt.Sprintf("tmux paste-buffer -b %s -t %s -d; rc=$?; tmux delete-buffer -b %s 2>/dev/null || true; [ $rc -eq 0 ] || exit $rc; sleep 1; tmux send-keys -t %s C-m", buf, session, buf, session)
 	if _, errStr, err := sshExec(vm, cmd); err != nil {
 		return fmt.Errorf("paste-buffer+enter: %v: %s", err, errStr)
 	}
@@ -1070,6 +1194,9 @@ func tearDown(cfg *Config, st *State, issue int) {
 	}
 	vm := vmByName(cfg, j.VM)
 	if vm != nil {
+		// A duty-cycle-paused job is already killed (no live pane); tmuxKill is a
+		// harmless no-op then. pruneWorkdir cleans the worktree we kept for
+		// --resume, since this is a real teardown (issue closed / PR merged).
 		tmuxKill(*vm, j.Tmux)
 		pruneWorkdir(*vm, vmWorkdirRoot(cfg.Orch, *vm), issue)
 	}

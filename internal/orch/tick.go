@@ -4,6 +4,9 @@ import (
 	"embed"
 	"fmt"
 	"log"
+	"math"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -161,7 +164,7 @@ func fireCron(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock,
 	return nil
 }
 
-func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBlock) {
+func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBlock, thr ThrottleDecision) {
 	cron := parseCronFrontmatter(is.Body)
 	if cron == nil {
 		log.Printf("issue #%d: cron schedule no longer parseable, skipping tick", n)
@@ -202,6 +205,14 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 	if now.Before(j.NextFireAt) {
 		return
 	}
+	// Throttle gate sits AFTER the NextFireAt check and BEFORE the
+	// NextFireAt advance below: a throttled fire is deferred, not recorded
+	// as fired, so it fires on the first tick after release. In-flight cron
+	// sessions (handled above) are untouched.
+	if thr.BlocksNewWork() {
+		log.Printf("issue #%d: cron tick due but weekly throttle active (%s), deferring fire", n, thr.Mode)
+		return
+	}
 	vm := freeVM(cfg, st)
 	if vm == nil {
 		log.Printf("issue #%d: cron tick due but no free VM", n)
@@ -228,6 +239,74 @@ func tick(cfg *Config, st *State) {
 		snap[n] = *j
 	}
 	st.httpSnap.Store(snap)
+
+	// Weekly throttle: one decision per tick, shared by every gate below so
+	// they never disagree within a pass. Pure function of live quota + wall
+	// clock; fails open (ModeAllow) when throttle is disabled or quota is
+	// unreadable, in which case BlocksNewWork()==false and every gate is a
+	// no-op (identical to today). Log only on mode transitions to avoid
+	// per-tick noise.
+	thr := currentThrottle(cfg, time.Now())
+	if thr.Mode != st.lastThrottleMode {
+		if thr.Mode == ModeAllow {
+			log.Printf("weekly throttle cleared (now %s)", thr.Mode)
+		} else {
+			log.Printf("weekly throttle active: %s (%s)", thr.Mode, thr.Reason)
+		}
+		st.lastThrottleMode = thr.Mode
+	}
+
+	// Proactive pacing governor: one decision per tick from live quota + the
+	// persisted sample window, layered ON TOP of the throttle gate (it can only
+	// further restrict, never admit work the gate blocked). Fails open
+	// (EffectiveCap=MaxInt, PausedTarget=0) when disabled / quota unreadable /
+	// thin data, in which case the admission loop and duty-cycle pass below are
+	// byte-for-byte today's behavior. govCap is the slew anchor for the cap; it
+	// is restored from the kv table on a fresh process so the cap doesn't snap
+	// across a restart.
+	now := time.Now()
+	if st.govCap == 0 {
+		if b, err := st.store.GetKV("gov_cap"); err == nil && len(b) > 0 {
+			if v, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+				st.govCap = v
+			}
+		}
+	}
+	five, seven, qok := latestQuota()
+	var samples []QuotaSample
+	if cfg.Orch.Throttle != nil && cfg.Orch.Throttle.GovernorEnabled {
+		window := cfg.Orch.Throttle.withDefaults().rateWindowDur()
+		samples, _ = st.store.LoadQuotaSamples(now.Add(-window).Unix())
+	}
+	active := countRunning(st)
+	gov := GovernorDecide(now, five, seven, qok, samples, active, st.govCap, cfg.Orch.Throttle)
+	st.SetGovernorState(gov)
+	if gov.EffectiveCap != math.MaxInt {
+		st.govCap = gov.EffectiveCap
+		_ = st.store.PutKV("gov_cap", []byte(strconv.Itoa(gov.EffectiveCap)))
+	}
+	// Log only on cap/binding transitions to avoid per-tick noise.
+	if gov.EffectiveCap != st.lastGovCap || gov.Binding != st.lastGovBinding {
+		if gov.Enabled {
+			log.Printf("governor: cap=%s active=%d paused-target=%d binding=%s burn(weekly=%.2f/h target=%.2f/h) projected-eow=%.1f%%",
+				capLabel(gov.EffectiveCap), active, gov.PausedTarget, gov.Binding,
+				gov.BurnWeekly, gov.TargetWeekly, gov.ProjectedEndPct)
+		} else if st.lastGovCap != 0 && st.lastGovCap != math.MaxInt {
+			log.Printf("governor: disabled/fail-open (uncapped)")
+		}
+		st.lastGovCap = gov.EffectiveCap
+		st.lastGovBinding = gov.Binding
+	}
+
+	// Never-strand reconcile pass: runs BEFORE ghIssueList so a list error
+	// can't skip it. Clears paused flags for dead panes and resumes everything
+	// when duty-cycle is not actively managing. Resume gates on dutyOn (not just
+	// gov.Enabled): if duty_cycle is flipped off while governor_enabled stays
+	// true, persisted paused jobs must still be resumed or they'd stay SIGSTOP'd
+	// forever.
+	dutyOn := gov.Enabled && cfg.Orch.Throttle != nil && cfg.Orch.Throttle.DutyCycle
+	reconcilePaused(cfg, st, dutyOn)
+
 	type routed struct {
 		is     Issue
 		target TargetBlock
@@ -249,6 +328,10 @@ func tick(cfg *Config, st *State) {
 		}
 	}
 
+	// First pass: register cron jobs (governor cap does not gate cron — cron
+	// fires are gated by thr.BlocksNewWork in tickCron). Collect the un-admitted
+	// oneshot candidates for priority-ordered admission below.
+	var candidates []int
 	for n, r := range open {
 		if _, exists := st.Jobs[n]; exists {
 			continue
@@ -263,6 +346,10 @@ func tick(cfg *Config, st *State) {
 				log.Printf("issue #%d: cron label present but cron_bootstrap_prompt unset in config, skipping", n)
 				continue
 			}
+			prio := parsePriorityFrontmatter(r.is.Body)
+			if prio == 0 {
+				prio = defaultPriority(cfg)
+			}
 			st.Jobs[n] = &Job{
 				Target: r.target.Name, TargetRepo: r.target.Repo,
 				Branch:     cfg.Orch.BranchPrefix + fmt.Sprint(n),
@@ -270,10 +357,64 @@ func tick(cfg *Config, st *State) {
 				Schedule:   cron.ScheduleStr,
 				Timeout:    cron.TimeoutStr,
 				IssueTitle: r.is.Title,
+				Priority:   prio,
 			}
-			log.Printf("issue #%d: registered cron job (target=%s, schedule=%s, timeout=%s)",
-				n, r.target.Name, cron.ScheduleStr, cron.TimeoutStr)
+			log.Printf("issue #%d: registered cron job (target=%s, schedule=%s, timeout=%s, priority=%d)",
+				n, r.target.Name, cron.ScheduleStr, cron.TimeoutStr, prio)
 			saveStateLogged(st)
+			continue
+		}
+		candidates = append(candidates, n)
+	}
+
+	// Admission. The throttle gate (BlocksNewWork) is the hard floor and still
+	// applies first; the governor only further restricts via EffectiveCap.
+	//
+	// When the governor is disabled (EffectiveCap == MaxInt) we preserve the
+	// original behavior: try to admit every candidate (map-order iteration,
+	// freeVM is the only limit) — byte-for-byte today. When enabled we sort by
+	// priority DESC (FIFO tiebreak via jobsByPriority's issue-number order) and
+	// admit at most EffectiveCap - active this tick; deferred low-priority
+	// issues are the implicit admission queue (re-evaluated next tick).
+	admitSlots := math.MaxInt
+	if gov.Enabled && gov.EffectiveCap != math.MaxInt {
+		// Count TOTAL governable (running + paused), not just running: a paused
+		// session still occupies a slot (it resumes and burns later), so the cap
+		// must include it or pausing one would free a slot for fresh work.
+		admitSlots = gov.EffectiveCap - countGovernable(st)
+		if admitSlots < 0 {
+			admitSlots = 0
+		}
+		// Sort candidates by priority DESC, parsing per-issue priority.
+		prio := map[int]int{}
+		for _, n := range candidates {
+			p := parsePriorityFrontmatter(open[n].is.Body)
+			if p == 0 {
+				p = defaultPriority(cfg)
+			}
+			prio[n] = p
+		}
+		sort.SliceStable(candidates, func(a, b int) bool {
+			if prio[candidates[a]] != prio[candidates[b]] {
+				return prio[candidates[a]] > prio[candidates[b]]
+			}
+			return candidates[a] < candidates[b]
+		})
+	} else {
+		// Disabled path: keep deterministic by issue number, but no cap.
+		sort.Ints(candidates)
+	}
+
+	admitted := 0
+	for _, n := range candidates {
+		r := open[n]
+		if thr.BlocksNewWork() {
+			log.Printf("issue #%d: weekly throttle active (%s: %s), deferring spawn", n, thr.Mode, thr.Reason)
+			continue
+		}
+		if admitted >= admitSlots {
+			log.Printf("issue #%d: governor cap reached (cap=%s active=%d), deferring spawn",
+				n, capLabel(gov.EffectiveCap), active)
 			continue
 		}
 		vm := freeVM(cfg, st)
@@ -285,6 +426,15 @@ func tick(cfg *Config, st *State) {
 			log.Printf("issue #%d: spawn failed on %s: %v", n, vm.Name, err)
 			continue
 		}
+		// Stamp priority on the freshly-created job.
+		if j := st.Jobs[n]; j != nil {
+			p := parsePriorityFrontmatter(r.is.Body)
+			if p == 0 {
+				p = defaultPriority(cfg)
+			}
+			j.Priority = p
+		}
+		admitted++
 		saveStateLogged(st)
 	}
 
@@ -317,6 +467,17 @@ func tick(cfg *Config, st *State) {
 		}
 		if r, routedOpen := open[n]; routedOpen {
 			j.IssueTitle = r.is.Title
+			// Re-sync priority live so editing the issue frontmatter retunes
+			// the governor's ordering without a restart.
+			if p := parsePriorityFrontmatter(r.is.Body); p != 0 || cfg.Orch.Throttle != nil {
+				if p == 0 {
+					p = defaultPriority(cfg)
+				}
+				if p != j.Priority {
+					j.Priority = p
+					saveStateLogged(st)
+				}
+			}
 			wantCron := r.is.hasLabel("cron")
 			isCron := j.Lifecycle == "cron"
 			if wantCron != isCron {
@@ -339,7 +500,15 @@ func tick(cfg *Config, st *State) {
 				saveStateLogged(st)
 				continue
 			}
-			tickCron(cfg, st, n, j, r.is, r.target)
+			tickCron(cfg, st, n, j, r.is, r.target, thr)
+			continue
+		}
+		// Duty-cycle-paused sessions are frozen (SIGSTOP'd): skip the poke/PR
+		// pipeline so we never paste into a frozen pane or mark reviews "seen"
+		// while it can't respond. reconcilePaused (dead-pane cleanup + resume on
+		// duty-off) and applyDutyCycle (resume / force-resume after maxPauseDur)
+		// own the paused lifecycle.
+		if j.Paused {
 			continue
 		}
 		vm := vmByName(cfg, j.VM)
@@ -428,6 +597,13 @@ func tick(cfg *Config, st *State) {
 					fmt.Sprintf("%s/pull/%d merged ✓", j.TargetRepo, j.PR),
 					prURL)
 			}
+			closedState := "merged"
+			if v.State == "CLOSED" {
+				closedState = "closed"
+			}
+			if err := st.store.PutClosedJob(n, closedState, j); err != nil {
+				log.Printf("issue #%d: put closed_jobs: %v", n, err)
+			}
 			tearDown(cfg, st, n)
 			saveStateLogged(st)
 			continue
@@ -473,10 +649,25 @@ func tick(cfg *Config, st *State) {
 				log.Printf("issue #%d: pre-poke pr re-check failed: %v", n, ferr)
 			} else if fresh.State == "MERGED" || fresh.State == "CLOSED" {
 				log.Printf("issue #%d: PR %s between view and poke — skipping poke and tearing down", n, fresh.State)
+				closedState := "merged"
+				if fresh.State == "CLOSED" {
+					closedState = "closed"
+				}
+				if err := st.store.PutClosedJob(n, closedState, j); err != nil {
+					log.Printf("issue #%d: put closed_jobs: %v", n, err)
+				}
 				tearDown(cfg, st, n)
 				saveStateLogged(st)
 				continue
 			}
+		}
+		// PR-poke gate (opt-in, off by default): only the two hard Pause
+		// modes can gate pokes, and only when throttle_pokes=true. We skip
+		// without marking reviews/comments Seen, so the poke re-fires after
+		// release. Default config => never gates => zero behavior change.
+		if thr.BlocksPokes(cfg.Orch.Throttle) {
+			log.Printf("issue #%d: weekly throttle active (%s), deferring poke", n, thr.Mode)
+			continue
 		}
 		msg := summarize(v, vr, vt, vi, pushed, checks, mergeable)
 		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
@@ -505,6 +696,15 @@ func tick(cfg *Config, st *State) {
 		}
 		saveStateLogged(st)
 		log.Printf("issue #%d: poked PR #%d", n, j.PR)
+	}
+
+	// Duty-cycle pass: when the governor is enabled with duty_cycle on, SIGSTOP
+	// the lowest-priority running sessions / SIGCONT the highest-priority paused
+	// ones so the paused set matches gov.PausedTarget. Resume-before-pause,
+	// bounded ops/tick. Disabled / fail-open => PausedTarget==0 and the
+	// reconcile pass already resumed everything, so this is a no-op.
+	if gov.Enabled && cfg.Orch.Throttle != nil && cfg.Orch.Throttle.DutyCycle {
+		applyDutyCycle(cfg, st, gov, cfg.Orch.Throttle.withDefaults().maxPauseDur())
 	}
 }
 

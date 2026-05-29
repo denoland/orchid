@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -74,6 +75,13 @@ type apiJobEntry struct {
 	Usage      *apiPaneUsage `json:"usage,omitempty"`
 	NeedsInput bool          `json:"needs_input,omitempty"`
 	VMOnline   bool          `json:"vm_online"`
+	// PausedState surfaces the duty-cycle pause flag without omitempty so the
+	// dashboard can render the frozen indicator deterministically (the embedded
+	// Job.Paused is omitempty for the persisted blob). Priority flows through
+	// the embedded Job (omitempty: hidden when 0).
+	PausedState bool   `json:"paused_state"`
+	ClosedState string `json:"closed_state,omitempty"`
+	ClosedAt    int64  `json:"closed_at,omitempty"`
 }
 
 type apiVMEntry struct {
@@ -88,11 +96,12 @@ type apiVMEntry struct {
 }
 
 type apiStateResp struct {
-	Jobs    []apiJobEntry  `json:"jobs"`
-	VMs     []apiVMEntry   `json:"vms"`
-	Inbox   string         `json:"inbox"`
-	Quota   *apiQuota      `json:"quota,omitempty"`
-	Connect *connectStatus `json:"connect,omitempty"`
+	Jobs     []apiJobEntry  `json:"jobs"`
+	VMs      []apiVMEntry   `json:"vms"`
+	Inbox    string         `json:"inbox"`
+	Quota    *apiQuota      `json:"quota,omitempty"`
+	Connect  *connectStatus `json:"connect,omitempty"`
+	Governor *apiGovernor   `json:"governor,omitempty"`
 }
 
 type apiPaneUsage struct {
@@ -102,10 +111,42 @@ type apiPaneUsage struct {
 }
 
 type apiQuota struct {
-	FiveHourPct      float64 `json:"five_hour_pct"`
-	FiveHourResetsAt int64   `json:"five_hour_resets_at"`
-	SevenDayPct      float64 `json:"seven_day_pct"`
-	SevenDayResetsAt int64   `json:"seven_day_resets_at"`
+	FiveHourPct      float64      `json:"five_hour_pct"`
+	FiveHourResetsAt int64        `json:"five_hour_resets_at"`
+	SevenDayPct      float64      `json:"seven_day_pct"`
+	SevenDayResetsAt int64        `json:"seven_day_resets_at"`
+	Throttle         *apiThrottle `json:"throttle,omitempty"`
+}
+
+// apiThrottle surfaces the weekly-throttle decision so the dashboard can
+// show why new work is (or isn't) being paced. Computed from the same
+// latestQuota() reading the daemon's scheduler uses, so the two never
+// disagree. Omitted entirely when there is no quota reading.
+type apiThrottle struct {
+	Mode             string  `json:"mode"`                           // "allow" | "throttle" | "pause_5h" | "pause_week"
+	Reason           string  `json:"reason,omitempty"`               // short human string for the tooltip
+	Until            int64   `json:"until,omitempty"`                // unix secs; 0 unless a pause mode
+	TargetPct        float64 `json:"target_pct,omitempty"`           // linear pace target for the 7d bar marker
+	ProjectedExhaust int64   `json:"projected_exhaust_at,omitempty"` // unix secs ETA the 7d bucket hits 100%; 0 when used==0/allow
+}
+
+// apiGovernor surfaces the proactive pacing governor's per-tick verdict so the
+// dashboard can show the adaptive admission cap, how many sessions are running
+// vs. duty-cycle paused, the measured-vs-target burn rate of the binding bucket,
+// and the projected end-of-week usage against the 92% line. Built from the last
+// GovernorDecision (snapshotted under st.mu) plus live active/paused counts from
+// the job snapshot. Omitted entirely when the governor is disabled/fail-open.
+type apiGovernor struct {
+	Enabled         bool    `json:"enabled"`
+	EffectiveCap    int     `json:"effective_cap"`     // -1 == uncapped (math.MaxInt fail-open)
+	Active          int     `json:"active"`            // running, non-paused governable sessions
+	Paused          int     `json:"paused"`            // duty-cycle SIGSTOP'd sessions
+	BurnWeekly      float64 `json:"burn_weekly"`       // %/h measured, weekly bucket
+	TargetWeekly    float64 `json:"target_weekly"`     // %/h target to land at ceiling by reset
+	BurnFive        float64 `json:"burn_five"`         // %/h measured, 5h bucket
+	TargetFive      float64 `json:"target_five"`       // %/h target, 5h bucket
+	ProjectedEndPct float64 `json:"projected_end_pct"` // used_now + burnWeekly*hoursRemaining
+	Binding         string  `json:"binding"`           // "weekly" | "5h" | ""
 }
 
 // lookupPaneVM resolves a tmux session id to the VM it's running on.
@@ -147,11 +188,12 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 	jobs := make([]apiJobEntry, 0, len(snap))
 	for issue, j := range snap {
 		entry := apiJobEntry{
-			Issue:      issue,
-			Job:        j,
-			Activity:   paneActivitySnapshot(j.Tmux),
-			NeedsInput: paneNeedsInputSnapshot(j.Tmux),
-			VMOnline:   vmOnline[j.VM],
+			Issue:       issue,
+			Job:         j,
+			Activity:    paneActivitySnapshot(j.Tmux),
+			NeedsInput:  paneNeedsInputSnapshot(j.Tmux),
+			VMOnline:    vmOnline[j.VM],
+			PausedState: j.Paused,
 		}
 		if u := usageForIssue(issue); u != nil {
 			entry.Usage = &apiPaneUsage{
@@ -162,6 +204,32 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 		}
 		jobs = append(jobs, entry)
 		load[j.VM]++
+	}
+	// Merge in recently-closed jobs so the dashboard can render them
+	// as ghost cards with a "merged" / "closed" badge instead of just
+	// disappearing. Skip any whose issue is still live (re-spawn).
+	if st.store != nil {
+		const closedJobsMaxAge = int64(7 * 24 * 60 * 60)
+		const closedJobsLimit = 200
+		closed, err := st.store.RecentClosedJobs(closedJobsMaxAge, closedJobsLimit)
+		if err != nil {
+			log.Printf("recent closed jobs: %v", err)
+		}
+		for _, r := range closed {
+			if _, live := snap[r.Issue]; live {
+				continue
+			}
+			if r.Job == nil {
+				continue
+			}
+			jobs = append(jobs, apiJobEntry{
+				Issue:       r.Issue,
+				Job:         *r.Job,
+				VMOnline:    vmOnline[r.Job.VM],
+				ClosedState: r.State,
+				ClosedAt:    r.ClosedAt,
+			})
+		}
 	}
 	sort.Slice(jobs, func(a, b int) bool { return jobs[a].Tmux < jobs[b].Tmux })
 
@@ -188,11 +256,68 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 		Connect: &cs,
 	}
 	if five, seven, ok := latestQuota(); ok {
-		resp.Quota = &apiQuota{
+		q := &apiQuota{
 			FiveHourPct:      five.UsedPct,
 			FiveHourResetsAt: five.ResetsAt,
 			SevenDayPct:      seven.UsedPct,
 			SevenDayResetsAt: seven.ResetsAt,
+		}
+		// Mirror the daemon's exact decision: reuse the already-fetched
+		// readings via ThrottleDecide (not currentThrottle) so we don't
+		// re-acquire the quota lock, and this snapshot path stays free of
+		// st.mu / len(st.Jobs) — the decision is a pure function of quota +
+		// wall clock.
+		d := ThrottleDecide(time.Now(), five, seven, ok, cfg.Orch.Throttle)
+		at := &apiThrottle{
+			Mode:      d.Mode.String(),
+			Reason:    d.Reason,
+			TargetPct: d.TargetPct,
+		}
+		if !d.Until.IsZero() {
+			at.Until = d.Until.Unix()
+		}
+		if !d.ProjectedExhaust.IsZero() {
+			at.ProjectedExhaust = d.ProjectedExhaust.Unix()
+		}
+		q.Throttle = at
+		resp.Quota = q
+	}
+	// Governor telemetry. Only surfaced when the last tick's decision was
+	// enabled (fail-open => omitted, dashboard shows nothing special). Active /
+	// paused are recounted from the same snapshot the rest of /api/state uses so
+	// the numbers match the cards exactly. EffectiveCap of math.MaxInt encodes
+	// as -1 ("uncapped").
+	if gov := st.GovernorState(); gov.Enabled {
+		var active, paused int
+		for _, j := range snap {
+			switch j.Lifecycle {
+			case "cron", "adhoc":
+				continue
+			}
+			if j.Tmux == "" {
+				continue
+			}
+			if j.Paused {
+				paused++
+			} else {
+				active++
+			}
+		}
+		cap := gov.EffectiveCap
+		if cap == math.MaxInt {
+			cap = -1
+		}
+		resp.Governor = &apiGovernor{
+			Enabled:         true,
+			EffectiveCap:    cap,
+			Active:          active,
+			Paused:          paused,
+			BurnWeekly:      gov.BurnWeekly,
+			TargetWeekly:    gov.TargetWeekly,
+			BurnFive:        gov.BurnFive,
+			TargetFive:      gov.TargetFive,
+			ProjectedEndPct: gov.ProjectedEndPct,
+			Binding:         gov.Binding,
 		}
 	}
 	body, _ := json.Marshal(resp)
