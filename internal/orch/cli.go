@@ -112,8 +112,8 @@ type vmJoinRequest struct {
 // vmJoinResponse is central's reply with the SSH material the worker
 // installs into the orchid user's ~/.ssh.
 type vmJoinResponse struct {
-	Name string `json:"name"`
-	AccessPublicKey string `json:"access_public_key"`
+	Name                string `json:"name"`
+	AccessPublicKey     string `json:"access_public_key"`
 	BotGithubPrivateKey string `json:"bot_github_private_key,omitempty"`
 	BotGithubPublicKey  string `json:"bot_github_public_key,omitempty"`
 }
@@ -786,10 +786,37 @@ func Main() {
 	if err := hclsimple.DecodeFile(*cfgPath, nil, &cfg); err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	st, err := loadState(cfg.Orch.StateDB)
-	if err != nil {
-		log.Fatalf("state: %v", err)
+	// loadState opens the sqlite store. This is the only blocking I/O on the
+	// main goroutine BEFORE the HTTP server + tick loop start, so if it hangs
+	// the daemon serves nothing and (pre-this-guard) logged nothing — a silent
+	// wedge. The usual cause is a stale prior instance still holding the WAL
+	// lock across a fast restart. Bracket it with progress logs + a hard timeout
+	// so the failure is loud and fast: fatal → systemd restarts cleanly instead
+	// of spinning for minutes with an empty log.
+	log.Printf("orch: loading state from %s", cfg.Orch.StateDB)
+	var st *State
+	{
+		type loadRes struct {
+			st  *State
+			err error
+		}
+		ch := make(chan loadRes, 1)
+		go func() {
+			s, e := loadState(cfg.Orch.StateDB)
+			ch <- loadRes{s, e}
+		}()
+		const loadTimeout = 20 * time.Second
+		select {
+		case r := <-ch:
+			if r.err != nil {
+				log.Fatalf("state: %v", r.err)
+			}
+			st = r.st
+		case <-time.After(loadTimeout):
+			log.Fatalf("state: loadState timed out after %s on %s — another orch instance likely still holding the sqlite lock. Confirm the previous process exited (systemctl status orchid; ps aux | grep '[o]rch -config') before restart.", loadTimeout, cfg.Orch.StateDB)
+		}
 	}
+	log.Printf("orch: state loaded, %d jobs tracked", len(st.Jobs))
 	if *captureOnly {
 		if cfg.Orch.Capture == nil {
 			log.Fatalf("-capture-only requires a `capture { ... }` block in the config")
@@ -944,6 +971,13 @@ func Main() {
 		}
 		go runUsageScanLoop(context.Background(), projectsRootFor(vm), st.store, 5*time.Minute)
 	}
+
+	// Quota sampler: persist a reading of both rate-limit buckets every
+	// SampleInterval into quota_samples so the governor's burn-rate estimator
+	// has a time-series. Runs unconditionally (the sample is cheap and the
+	// estimator only consumes it when the governor is enabled) so enabling the
+	// governor later has immediate history to work from.
+	go runQuotaSampleLoop(context.Background(), st.store, cfg.Orch.Throttle)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

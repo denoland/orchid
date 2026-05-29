@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -352,21 +353,20 @@ type assignedIssue struct {
 func searchAssignments(repo, bot string) ([]assignedIssue, error) {
 	out, errStr, err := run("gh", "api",
 		"-H", "Accept: application/vnd.github+json",
-		"--paginate",
-		fmt.Sprintf("/search/issues?q=repo:%s+assignee:%s+is:issue+is:open&per_page=50", repo, bot),
+		fmt.Sprintf("/search/issues?q=repo:%s+assignee:%s+is:issue+is:open&per_page=100", repo, bot),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(errStr))
 	}
 	var resp struct {
 		Items []struct {
-			NodeID    string    `json:"node_id"`
-			Number    int       `json:"number"`
-			Title     string    `json:"title"`
-			Body      string    `json:"body"`
-			HTMLURL   string    `json:"html_url"`
+			NodeID    string                 `json:"node_id"`
+			Number    int                    `json:"number"`
+			Title     string                 `json:"title"`
+			Body      string                 `json:"body"`
+			HTMLURL   string                 `json:"html_url"`
 			User      struct{ Login string } `json:"user"`
-			UpdatedAt time.Time `json:"updated_at"`
+			UpdatedAt time.Time              `json:"updated_at"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(out), &resp); err != nil {
@@ -388,6 +388,42 @@ func searchAssignments(repo, bot string) ([]assignedIssue, error) {
 	return res, nil
 }
 
+func assignmentInboxIssueExists(inboxRepo string, it assignedIssue) (bool, error) {
+	query := fmt.Sprintf(`repo:%s is:issue "%s#%d"`, inboxRepo, it.Repo, it.Number)
+	out, errStr, err := run("gh", "api",
+		"-H", "Accept: application/vnd.github+json",
+		fmt.Sprintf("/search/issues?q=%s&per_page=1", url.QueryEscape(query)),
+	)
+	if err != nil {
+		return false, fmt.Errorf("%w: %s", err, strings.TrimSpace(errStr))
+	}
+	var resp struct {
+		TotalCount int `json:"total_count"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		return false, err
+	}
+	return resp.TotalCount > 0, nil
+}
+
+func saveAssignmentSeen(store *Store, seen map[string]bool) {
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	if len(ids) > 5000 {
+		ids = ids[len(ids)-5000:]
+	}
+	b, err := json.Marshal(ids)
+	if err != nil {
+		log.Printf("assignments: marshal seen set failed: %v", err)
+		return
+	}
+	if err := store.PutKV("assignments_seen", b); err != nil {
+		log.Printf("assignments: save seen set failed: %v", err)
+	}
+}
+
 func assignmentTick(cfg *Config, st *State) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -403,7 +439,6 @@ func assignmentTick(cfg *Config, st *State) {
 	}
 
 	bots := botLogins(cfg)
-	added := false
 	for _, t := range cfg.Targets {
 		if t.Repo == cfg.GitHub.InboxRepo {
 			continue
@@ -422,6 +457,19 @@ func assignmentTick(cfg *Config, st *State) {
 				if seen[it.NodeID] {
 					continue
 				}
+				exists, err := assignmentInboxIssueExists(cfg.GitHub.InboxRepo, it)
+				if err != nil {
+					log.Printf("assignments: dedupe search for %s#%d failed; skipping create to avoid duplicates: %v",
+						it.Repo, it.Number, err)
+					continue
+				}
+				if exists {
+					seen[it.NodeID] = true
+					saveAssignmentSeen(st.store, seen)
+					log.Printf("assignments: existing inbox issue found for %s#%d; marking seen",
+						it.Repo, it.Number)
+					continue
+				}
 				title := fmt.Sprintf("[%s#%d] %s", it.Repo, it.Number, it.Title)
 				body := fmt.Sprintf(
 					"Triggered by assignment of [%s#%d](%s) to @%s.\n\nOpened by @%s.\n\n---\n\n%s",
@@ -438,25 +486,13 @@ func assignmentTick(cfg *Config, st *State) {
 					continue
 				}
 				seen[it.NodeID] = true
-				added = true
+				saveAssignmentSeen(st.store, seen)
 				log.Printf("assignments: opened inbox issue for %s#%d (assignee=%s) → %s",
 					it.Repo, it.Number, bot, strings.TrimSpace(out))
 			}
 		}
 	}
 
-	if added {
-		ids := make([]string, 0, len(seen))
-		for id := range seen {
-			ids = append(ids, id)
-		}
-		if len(ids) > 5000 {
-			ids = ids[len(ids)-5000:]
-		}
-		if b, err := json.Marshal(ids); err == nil {
-			_ = st.store.PutKV("assignments_seen", b)
-		}
-	}
 }
 
 // mentionTick runs one polling cycle: refresh the cache if stale, then

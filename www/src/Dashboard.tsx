@@ -193,6 +193,13 @@ function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
     : ''
   )
   const vmOffline = job.vm_online === false
+  const closed = job.closed_state === 'merged' || job.closed_state === 'closed'
+  const merged = job.closed_state === 'merged'
+  // Governor surface: priority badge (hidden at the default 0) and a frozen
+  // indicator when the session is duty-cycle SIGSTOP'd. paused_state is the
+  // always-present flag from /api/state; paused is the omitempty blob mirror.
+  const priority = job.priority ?? 0
+  const paused = (job.paused_state ?? job.paused) === true && !closed
   return (
     <div
       onClick={(e) => {
@@ -203,10 +210,11 @@ function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
       className={
         'relative bg-white/95 dark:bg-zinc-900/95 backdrop-blur rounded-xl ring-1 shadow-sm hover:shadow-md cursor-pointer ' +
         ringClass +
-        (vmOffline ? ' card-vm-offline' : '')
+        (vmOffline ? ' card-vm-offline' : '') +
+        (closed ? ' card-closed' : '')
       }
-      style={{ width: CARD_W, height: CARD_H, opacity: vmOffline ? 0.55 : 1 }}
-      title={vmOffline ? `${job.vm} is offline — session paused` : undefined}
+      style={{ width: CARD_W, height: CARD_H, opacity: closed ? 0.6 : (vmOffline ? 0.55 : 1) }}
+      title={closed ? `PR ${job.closed_state}` : (vmOffline ? `${job.vm} is offline — session paused` : undefined)}
     >
       <Handle
         type="target"
@@ -219,7 +227,35 @@ function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
         style={{ background: '#a78bfa', width: 8, height: 8, border: '1.5px solid white' }}
       />
       <CardCompact job={job} />
-      {vmOffline && (
+      {priority !== 0 && !closed && (
+        <div
+          className="absolute bottom-1.5 left-2 text-[10px] mono px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300"
+          title={`priority ${priority}`}
+        >
+          P{priority}
+        </div>
+      )}
+      {paused && (
+        <div
+          className="absolute bottom-1.5 right-2 inline-flex items-center gap-1 text-[10px] mono px-1.5 py-0.5 rounded-full bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300"
+          title="paused by the pacing governor (duty-cycle SIGSTOP) — token burn frozen, context preserved"
+        >
+          ❄ paused
+        </div>
+      )}
+      {closed && (
+        <div
+          className={
+            'absolute top-1.5 right-2 text-[10px] mono px-1.5 py-0.5 rounded-full ' +
+            (merged
+              ? 'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300'
+              : 'bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400')
+          }
+        >
+          {merged ? 'merged' : 'closed'}
+        </div>
+      )}
+      {!closed && vmOffline && (
         <div className="absolute top-1.5 right-2 text-[10px] mono text-zinc-400 dark:text-zinc-500">
           {job.vm} offline
         </div>
@@ -988,6 +1024,7 @@ function DashboardInner({ state: rawState, relay }: Props) {
           inbox={inbox}
           count={jobs.length}
           quota={state.quota}
+          governor={state.governor}
           view={view}
           setView={(v) => {
             setView(v)
@@ -1116,10 +1153,11 @@ function DashboardInner({ state: rawState, relay }: Props) {
 }
 
 function Header({
-  count, quota, view, setView, onOpenSettings, onOpenCapture,
+  count, quota, governor, view, setView, onOpenSettings, onOpenCapture,
 }: {
   inbox: string; count: number
   quota?: State['quota']
+  governor?: State['governor']
   view: 'canvas' | 'list'; setView: (v: 'canvas' | 'list') => void
   onOpenSettings: () => void
   onOpenCapture: () => void
@@ -1140,7 +1178,7 @@ function Header({
           <span className="mono text-[12px] text-zinc-400 dark:text-zinc-500">{count}</span>
           {quota && (
             <div className="hidden sm:block">
-              <QuotaStrip quota={quota} />
+              <QuotaStrip quota={quota} governor={governor} />
             </div>
           )}
           <div className="flex-1" />
@@ -1161,8 +1199,14 @@ function Header({
 /// trailing label is the time to reset (4h12m / 2d3h). When usage
 /// outpaces elapsed-time we tint amber to flag burn faster than
 /// sustainable. Hidden entirely until the agent has reported once.
-function QuotaStrip({ quota }: { quota: NonNullable<State['quota']> }) {
+///
+/// When the daemon's weekly throttle is active (quota.throttle), the 7d
+/// bar gets a pace-target marker (where usage *should* be by now) and
+/// the strip drives its coloring + a status chip off the authoritative
+/// server mode rather than the local elapsed-time heuristic.
+function QuotaStrip({ quota, governor }: { quota: NonNullable<State['quota']>; governor?: State['governor'] }) {
   const now = Math.floor(Date.now() / 1000)
+  const thr = quota.throttle
   const fmt = (secs: number) => {
     if (secs <= 0) return 'now'
     const h = Math.floor(secs / 3600)
@@ -1172,31 +1216,128 @@ function QuotaStrip({ quota }: { quota: NonNullable<State['quota']> }) {
     if (h > 0) return `${h}h${m}m`
     return `${m}m`
   }
-  const bar = (label: string, pct: number, resets: number, window: number) => {
+  // `hot` accent: amber = brake engaged / over pace, red = hard pause.
+  type Hot = false | 'amber' | 'red'
+  const bar = (label: string, pct: number, resets: number, window: number, opts?: { hot?: Hot; targetPct?: number }) => {
     const elapsedPct = Math.min(100, Math.max(0, (1 - Math.max(0, resets - now) / window) * 100))
-    const hot = pct > elapsedPct + 5
-    const trackColor = hot ? 'bg-amber-200/60 dark:bg-amber-900/40' : 'bg-zinc-200 dark:bg-zinc-800'
-    const fillColor = hot ? 'bg-amber-500' : 'bg-emerald-500/80 dark:bg-emerald-400/80'
+    // Authoritative server signal wins; fall back to the local elapsed
+    // heuristic for older daemons that don't report a throttle decision.
+    const hot: Hot = opts?.hot !== undefined ? opts.hot : pct > elapsedPct + 5 ? 'amber' : false
+    // Prefer the server-computed pace target; fall back to the local guess.
+    const targetPct = opts?.targetPct !== undefined ? opts.targetPct : undefined
+    const trackColor =
+      hot === 'red'
+        ? 'bg-rose-200/60 dark:bg-rose-900/40'
+        : hot === 'amber'
+          ? 'bg-amber-200/60 dark:bg-amber-900/40'
+          : 'bg-zinc-200 dark:bg-zinc-800'
+    const fillColor =
+      hot === 'red' ? 'bg-rose-500' : hot === 'amber' ? 'bg-amber-500' : 'bg-emerald-500/80 dark:bg-emerald-400/80'
     return (
       <div className="flex items-center gap-1.5">
         <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500 w-[18px]">{label}</span>
         <div className={'relative h-1.5 w-20 rounded-full overflow-hidden ' + trackColor}>
           <div className={'absolute inset-y-0 left-0 ' + fillColor} style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} />
+          {targetPct !== undefined && (
+            <div
+              className="absolute inset-y-0 w-px bg-zinc-500/70 dark:bg-zinc-300/70"
+              style={{ left: `${Math.min(100, Math.max(0, targetPct))}%` }}
+              title={`pace target ${Math.round(targetPct)}%`}
+            />
+          )}
         </div>
         <span className="mono text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">{Math.round(pct)}%</span>
         <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500">{fmt(resets - now)}</span>
       </div>
     )
   }
+  // Map the server throttle mode onto the 7d bar accent + status chip.
+  const sevenHot: Hot | undefined = thr
+    ? thr.mode === 'pause_5h' || thr.mode === 'pause_week'
+      ? 'red'
+      : thr.mode === 'throttle'
+        ? 'amber'
+        : false
+    : undefined
+  let chip: { text: string; cls: string } | null = null
+  if (thr && thr.mode !== 'allow') {
+    if (thr.mode === 'throttle') {
+      chip = { text: 'pacing', cls: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300' }
+    } else if (thr.mode === 'pause_5h') {
+      const u = thr.until ? ` · ${fmt(thr.until - now)}` : ''
+      chip = { text: `paused 5h${u}`, cls: 'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300' }
+    } else if (thr.mode === 'pause_week') {
+      const u = thr.until ? ` · resets ${fmt(thr.until - now)}` : ''
+      chip = { text: `paused${u}`, cls: 'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300' }
+    }
+  }
+  let title =
+    'Claude subscription usage: 5-hour session window and 7-day cap. Amber = burning faster than elapsed time would sustain.'
+  if (thr) {
+    if (thr.reason) title += `\n${thr.reason}`
+    if (thr.projected_exhaust_at) title += `\nexhausts in ${fmt(thr.projected_exhaust_at - now)} at current burn`
+  }
   return (
     <div
       className="pointer-events-auto ml-3 flex items-center gap-3 bg-white/80 dark:bg-zinc-900/80 backdrop-blur ring-1 ring-zinc-200 dark:ring-zinc-700 rounded-md px-2.5 py-1"
       onPointerDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
-      title="Claude subscription usage: 5-hour session window and 7-day cap. Amber = burning faster than elapsed time would sustain."
+      title={title}
     >
       {bar('5h', quota.five_hour_pct, quota.five_hour_resets_at, 5 * 3600)}
-      {bar('7d', quota.seven_day_pct, quota.seven_day_resets_at, 7 * 24 * 3600)}
+      {bar('7d', quota.seven_day_pct, quota.seven_day_resets_at, 7 * 24 * 3600, {
+        hot: sevenHot,
+        targetPct: thr?.target_pct,
+      })}
+      {chip && (
+        <span className={'mono text-[10px] px-1.5 py-0.5 rounded-full whitespace-nowrap ' + chip.cls}>{chip.text}</span>
+      )}
+      {governor?.enabled && <GovernorStrip gov={governor} />}
+    </div>
+  )
+}
+
+/// Proactive pacing governor telemetry: the adaptive admission cap with live
+/// active/paused counts, the measured-vs-target burn rate of the binding bucket,
+/// and the projected end-of-week usage against the 92% ceiling. Amber when over
+/// pace (burn > target). Only rendered when the daemon reports governor.enabled.
+function GovernorStrip({ gov }: { gov: NonNullable<State['governor']> }) {
+  // The binding bucket drives the burn-vs-target readout; default to weekly.
+  const onFive = gov.binding === '5h'
+  const burn = onFive ? gov.burn_five : gov.burn_weekly
+  const target = onFive ? gov.target_five : gov.target_weekly
+  const over = burn > target + 0.05 // small deadband to avoid flicker at parity
+  const capLabel = gov.effective_cap < 0 ? '∞' : String(gov.effective_cap)
+  const burnCls = over
+    ? 'text-amber-700 dark:text-amber-300'
+    : 'text-zinc-500 dark:text-zinc-400'
+  const projOver = gov.projected_end_pct > 92
+  const title =
+    `Pacing governor: adaptive concurrency cap + duty-cycle to land at ~92% by reset.\n` +
+    `cap ${capLabel}, active ${gov.active}, paused ${gov.paused}\n` +
+    `burn ${burn.toFixed(1)}%/h ${over ? '>' : '≤'} target ${target.toFixed(1)}%/h (binding ${gov.binding || 'weekly'})\n` +
+    `projected end-of-week ${gov.projected_end_pct.toFixed(0)}% vs 92% ceiling`
+  return (
+    <div className="flex items-center gap-1.5 pl-2 border-l border-zinc-200 dark:border-zinc-700" title={title}>
+      <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500">gov</span>
+      <span className="mono text-[10px] text-zinc-600 dark:text-zinc-300 tabular-nums">
+        cap {capLabel}
+        <span className="text-zinc-400 dark:text-zinc-500">
+          {' '}({gov.active}
+          {gov.paused > 0 && <span className="text-sky-600 dark:text-sky-400">/{gov.paused}❄</span>})
+        </span>
+      </span>
+      <span className={'mono text-[10px] tabular-nums ' + burnCls}>
+        {burn.toFixed(1)}{over ? '>' : '≤'}{target.toFixed(1)}%/h
+      </span>
+      <span
+        className={
+          'mono text-[10px] tabular-nums ' +
+          (projOver ? 'text-amber-700 dark:text-amber-300' : 'text-zinc-400 dark:text-zinc-500')
+        }
+      >
+        →{gov.projected_end_pct.toFixed(0)}%
+      </span>
     </div>
   )
 }
@@ -2086,7 +2227,7 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
                 title="Usage"
                 subtitle="Per-session Claude spend + context, pulled from each pane's statusline feed. Updates in near-real-time."
               >
-                <UsageTable jobs={jobs} quota={state.quota} />
+                <UsageTable jobs={jobs} quota={state.quota} governor={state.governor} />
               </Section>
             )}
 
@@ -2808,7 +2949,7 @@ function UsageRollups({ rows }: { rows: UsageHistoryRow[] }) {
 // sessions float to the top. Quota strip up top mirrors the
 // (hidden-on-some-accounts) header chip so operators can see the
 // 5h / 7d numbers when their plan exposes them.
-function UsageTable({ jobs, quota }: { jobs: Job[]; quota?: State['quota'] }) {
+function UsageTable({ jobs, quota, governor }: { jobs: Job[]; quota?: State['quota']; governor?: State['governor'] }) {
   const rows = useMemo(() => {
     return jobs
       .filter((j) => j.usage)
@@ -2868,7 +3009,7 @@ function UsageTable({ jobs, quota }: { jobs: Job[]; quota?: State['quota'] }) {
           <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">
             Subscription quota
           </div>
-          <QuotaStrip quota={quota} />
+          <QuotaStrip quota={quota} governor={governor} />
         </div>
       ) : (
         <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
