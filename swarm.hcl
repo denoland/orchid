@@ -11,6 +11,18 @@ orchestrator {
   http_secret   = "123"
   bot_login     = "divybot"
   ntfy_topic    = "orchid-divy-7f3k9"
+
+  # Git-backed shared memory. Agents' auto-memory is redirected per target repo
+  # into a clone of this repo (memory/<owner>/<repo>/*.md); orch commits + pushes
+  # on sync_interval, so the swarm's accumulated knowledge is durable, versioned,
+  # browsable on GitHub, and shared across boxes. Dashboard "Memory" tab reads it.
+  memory {
+    enabled       = true
+    repo          = "denoland/orchid" # default: inbox_repo
+    branch        = "main"
+    dir           = "memory"
+    sync_interval = "5m"
+  }
 }
 
 # Each target maps an issue label (in the inbox repo) to a work repo.

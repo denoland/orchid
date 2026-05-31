@@ -572,6 +572,42 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		_, _ = w.Write(body)
 	}))
 
+	// Shared swarm memory (read-only). GET /api/memory -> parsed MEMORY.md index;
+	// GET /api/memory?note=<file.md> -> raw markdown of one topic note.
+	mux.HandleFunc("/api/memory", auth(func(w http.ResponseWriter, r *http.Request) {
+		if note := r.URL.Query().Get("note"); note != "" {
+			vm, dir := memoryStore(cfg)
+			if dir == "" {
+				http.Error(w, "no memory store configured", http.StatusNotFound)
+				return
+			}
+			b, err := readStoreFile(vm, dir, note)
+			if err != nil {
+				http.Error(w, "note not found", http.StatusNotFound)
+				return
+			}
+			// Return the raw file (frontmatter included); the dashboard parses
+			// and renders the frontmatter as a metadata header, then the body.
+			w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+			_, _ = w.Write(b)
+			return
+		}
+		notes, dir, err := memoryGraph(cfg)
+		if err != nil {
+			http.Error(w, "read memory: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-cache")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"notes":  notes,
+			"dir":    dir,
+			"repo":   memRepo(cfg),   // GitHub repo backing the store
+			"branch": memBranch(cfg), // for building github.com blob/tree links
+			"subdir": memDir(cfg),    // memory subtree inside the repo
+		})
+	}))
+
 	paneVM := func(session string) *VMBlock { return lookupPaneVM(cfg, st, session) }
 
 	mux.HandleFunc("/api/pane", auth(func(w http.ResponseWriter, r *http.Request) {
@@ -1029,10 +1065,17 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		path := strings.TrimPrefix(r.URL.Path, "/")
 		if path != "" {
 			if _, err := fs.Stat(spaFS, path); err == nil {
+				// Asset filenames are content-hashed (e.g. _a/index-<hash>.js), so
+				// they're safe to cache hard — a new build = a new name.
 				fileServer.ServeHTTP(w, r)
 				return
 			}
 		}
+		// index.html is the SPA shell and is NOT hashed: it names the current
+		// asset bundle. Without no-cache the browser heuristically caches it and
+		// keeps loading a stale bundle after a deploy (the "I don't see the new
+		// tab" trap), so force revalidation on every load.
+		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFileFS(w, r, spaFS, "index.html")
 	}))
 

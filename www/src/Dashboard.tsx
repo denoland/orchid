@@ -1,5 +1,6 @@
 
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { marked } from 'marked'
 import type { Job, State } from './types'
 import { attention, ciStatus, LEVEL_COLOR, type AttentionLevel } from './attention'
 import { Pane } from './Pane'
@@ -142,21 +143,25 @@ function DashboardInner({ state: rawState, relay }: Props) {
         onToggleStats={() => setShowStats((v) => !v)}
       />
       <div className="flex items-start">
-        {tab !== 'sessions' ? (
+        {tab === 'memory' ? (
+          <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)] bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
+            <MemoryPage />
+          </div>
+        ) : tab !== 'sessions' ? (
           <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)]">
-            <SettingsPage key={tab} jobs={jobs} state={state} relay={relay} initialSection={TAB_SECTION[tab]} onClose={() => setTab('sessions')} />
+            <SettingsPage key={tab} jobs={jobs} state={state} relay={relay} initialSection={TAB_SECTION[tab as Exclude<Tab, 'sessions' | 'memory'>]} onClose={() => setTab('sessions')} />
           </div>
         ) : (
           <>
-            <div className="flex-1 min-w-0 flex flex-col p-3 sm:p-6 lg:px-[4em] lg:py-[2.5em]">
+            <div className="flex-1 min-w-0 flex flex-col">
               <WarningStack
                 stateLoaded={state.connect !== undefined}
                 githubConnected={!!state.connect?.github.connected}
                 inbox={state.inbox}
                 openSettings={openSettings}
               />
-              {/* L/R 4em gutters (no top/bottom); bordered container, sidebar bg, no radius. */}
-              <div className="rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-800 bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
+              {/* full-bleed: no padding, no radius; bordered container, sidebar bg. */}
+              <div className="border border-zinc-200 dark:border-zinc-800 bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
                 <ListView jobs={jobs} q={q} onOpen={(t) => setListExpanded(t)} />
               </div>
             </div>
@@ -282,6 +287,7 @@ function TopBar({
     { id: 'sessions', label: 'Sessions', count },
     { id: 'machines', label: 'Machines', count: vmCount },
     { id: 'analytics', label: 'Analytics' },
+    { id: 'memory', label: 'Memory' },
     { id: 'integrations', label: 'Integrations', count: intgCount },
     { id: 'settings', label: 'Settings' },
   ]
@@ -1099,11 +1105,287 @@ function timeAgo(iso?: string | null): string {
 
 type SectionId = 'orch' | 'integrations' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
 
+interface MemNote { name: string; file: string; target: string; summary: string; links: string[]; backlinks: string[] }
+interface MemTreeNode { name: string; path: string; note?: MemNote; children: MemTreeNode[] }
+
+// buildMemTree turns note paths (memory/<owner>/<repo>/note.md) into a real
+// nested directory tree — a cgit-style file browser. Dirs sort before files,
+// alphabetically.
+function buildMemTree(notes: MemNote[]): MemTreeNode {
+  const root: MemTreeNode = { name: '', path: '', children: [] }
+  const dirs = new Map<string, MemTreeNode>([['', root]])
+  const ensureDir = (path: string): MemTreeNode => {
+    let node = dirs.get(path)
+    if (node) return node
+    const slash = path.lastIndexOf('/')
+    const parent = ensureDir(slash < 0 ? '' : path.slice(0, slash))
+    node = { name: path.slice(slash + 1), path, children: [] }
+    dirs.set(path, node)
+    parent.children.push(node)
+    return node
+  }
+  for (const n of notes) {
+    const slash = n.file.lastIndexOf('/')
+    const parent = ensureDir(slash < 0 ? '' : n.file.slice(0, slash))
+    parent.children.push({ name: n.file.slice(slash + 1), path: n.file, note: n, children: [] })
+  }
+  const sort = (node: MemTreeNode) => {
+    node.children.sort((a, b) => {
+      const ad = a.note === undefined, bd = b.note === undefined
+      if (ad !== bd) return ad ? -1 : 1
+      return a.name.localeCompare(b.name)
+    })
+    node.children.forEach(sort)
+  }
+  sort(root)
+  return root
+}
+
+// parseFm splits a note's YAML-ish frontmatter from its body and flattens it to
+// key/value pairs (picks up nested keys like metadata.type by their indented
+// `key: value` line). Block scalars (`desc: |`) and value-less keys are skipped.
+function parseFm(text: string): { meta: [string, string][]; body: string } {
+  if (!text.startsWith('---')) return { meta: [], body: text }
+  const end = text.indexOf('\n---', 3)
+  if (end < 0) return { meta: [], body: text }
+  const meta: [string, string][] = []
+  for (const line of text.slice(3, end).split('\n')) {
+    const m = line.match(/^\s*([A-Za-z0-9_-]+):\s*(.*)$/)
+    if (m) { const v = m[2].trim(); if (v && v !== '|') meta.push([m[1], v]) }
+  }
+  return { meta, body: text.slice(end + 4).replace(/^\n+/, '') }
+}
+
+// MemoryPage is a compact directory-tree browser over the swarm's git-backed
+// memory store: nested folders (owner/repo/...), markdown render on click,
+// search across notes, and a small backlinks/links footer. No graph — a tree.
+function MemoryPage() {
+  const [notes, setNotes] = useState<MemNote[]>([])
+  const [gh, setGh] = useState<{ repo: string; branch: string; subdir: string } | null>(null)
+  const [sel, setSel] = useState<MemNote | null>(null)
+  const [dirSel, setDirSel] = useState('') // selected folder ('' = root); shown when no file selected
+  const [raw, setRaw] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [q, setQ] = useState('')
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+
+  useEffect(() => {
+    fetch('/api/memory', { credentials: 'include', cache: 'no-store' })
+      .then((r) => r.json())
+      .then((d) => { setNotes(d.notes || []); setGh({ repo: d.repo, branch: d.branch, subdir: d.subdir }) })
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [])
+
+  // Fetch the open file, or the selected folder's README (its MEMORY.md index).
+  // A folder without a MEMORY.md leaves raw empty → an auto-generated TOC shows.
+  useEffect(() => {
+    const path = sel ? sel.file : (dirSel ? dirSel + '/' : '') + 'MEMORY.md'
+    let live = true
+    fetch('/api/memory?note=' + encodeURIComponent(path), { credentials: 'include', cache: 'no-store' })
+      .then((r) => (r.ok ? r.text() : Promise.reject()))
+      .then((t) => { if (live) setRaw(t) })
+      .catch(() => { if (live) setRaw('') })
+    return () => { live = false }
+  }, [sel, dirSel])
+
+  const parsed = useMemo(() => parseFm(raw), [raw])
+  const html = useMemo(() => (parsed.body ? (marked.parse(parsed.body) as string) : ''), [parsed])
+  const ghBlob = (file: string) => gh ? `https://github.com/${gh.repo}/blob/${gh.branch}/${gh.subdir}/${file}` : ''
+  const ghTree = gh ? `https://github.com/${gh.repo}/tree/${gh.branch}/${gh.subdir}` : ''
+
+  const byFile = useMemo(() => new Map(notes.map((n) => [n.file, n])), [notes])
+  const searching = q.trim() !== ''
+  // Client-side filter is fine at current scale; if the store grows to many
+  // thousands, move search server-side (the API already reads every note).
+  const filtered = useMemo(() => {
+    const needle = q.trim().toLowerCase()
+    if (!needle) return notes
+    return notes.filter((n) =>
+      n.file.toLowerCase().includes(needle) ||
+      n.name.toLowerCase().includes(needle) ||
+      n.summary.toLowerCase().includes(needle))
+  }, [notes, q])
+  const tree = useMemo(() => buildMemTree(filtered), [filtered])
+
+  const toggle = (path: string) =>
+    setCollapsed((s) => { const n = new Set(s); n.has(path) ? n.delete(path) : n.add(path); return n })
+
+  // Recursive cgit-style rows. Dirs collapse/expand (force-open while searching);
+  // files select + render. Indent by depth.
+  const renderNode = (node: MemTreeNode, depth: number): React.ReactNode => {
+    const pad = { paddingLeft: depth * 13 + 4 }
+    if (node.note === undefined) {
+      const open = searching || !collapsed.has(node.path)
+      const onDir = !sel && dirSel === node.path
+      return (
+        <div key={node.path || '/'}>
+          {node.name && (
+            <div style={pad}
+              className={'w-full flex items-center gap-1 py-[3px] pr-1 text-[12.5px] rounded ' + (onDir
+                ? 'bg-violet-100 text-violet-800 dark:bg-violet-500/15 dark:text-violet-200'
+                : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900')}>
+              <span onClick={() => toggle(node.path)} className={'text-zinc-400 w-3 inline-block cursor-pointer transition-transform ' + (open ? 'rotate-90' : '')}>›</span>
+              <span onClick={() => { setSel(null); setDirSel(node.path); if (collapsed.has(node.path)) toggle(node.path) }} className="truncate font-medium cursor-pointer flex-1">{node.name}</span>
+            </div>
+          )}
+          {open && node.children.map((c) => renderNode(c, node.name ? depth + 1 : depth))}
+        </div>
+      )
+    }
+    const on = sel?.file === node.note.file
+    return (
+      <button key={node.path} onClick={() => setSel(node.note!)} style={pad}
+        className={'w-full flex items-center gap-1 py-[3px] pr-1 text-left text-[12.5px] rounded ' + (on
+          ? 'bg-violet-100 text-violet-800 dark:bg-violet-500/15 dark:text-violet-200'
+          : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900')}>
+        <span className="w-3 inline-block text-zinc-300 dark:text-zinc-600">·</span>
+        <span className="truncate">{node.name.replace(/\.md$/, '')}</span>
+      </button>
+    )
+  }
+
+  const linkChips = (files: string[]) => (
+    <div className="flex flex-wrap gap-1.5">
+      {files.map((f) => {
+        const t = byFile.get(f)
+        const cross = t && sel && t.target && t.target !== sel.target
+        return (
+          <button key={f} onClick={() => t && setSel(t)} disabled={!t}
+            className="mono text-[11px] px-2 py-0.5 rounded border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 disabled:opacity-50">
+            {cross && <span className="text-zinc-400">{t!.target}/</span>}{t ? t.name : f}
+          </button>
+        )
+      })}
+    </div>
+  )
+
+  return (
+    <div className="flex-1 min-w-0 p-4 sm:p-6">
+      <div className="flex items-center gap-3 mb-3">
+        <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Memory</h1>
+        <span className="mono text-[11px] px-1.5 py-0.5 rounded-full bg-zinc-200/80 dark:bg-zinc-700/70 text-zinc-600 dark:text-zinc-300 tabular-nums">{notes.length}</span>
+        {ghTree && <a href={ghTree} target="_blank" rel="noreferrer" className="mono text-[11px] text-zinc-400 hover:text-violet-500 truncate">{gh!.repo}/{gh!.subdir} ↗</a>}
+      </div>
+      {loading ? (
+        <div className="text-sm text-zinc-400">Loading…</div>
+      ) : notes.length === 0 ? (
+        <div className="text-sm text-zinc-400">No memories yet — the store is empty. Notes appear here as sessions learn.</div>
+      ) : (
+        <div className="flex flex-col md:flex-row gap-5 items-start">
+          {/* Left: search + directory tree */}
+          <div className="w-full md:w-72 flex-shrink-0">
+            <input
+              value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…"
+              className="w-full mb-2 rounded-md border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:ring-1 focus:ring-violet-400"
+            />
+            {filtered.length === 0
+              ? <div className="text-[13px] text-zinc-400 px-1">No matches.</div>
+              : <div className="flex flex-col">{tree.children.map((c) => renderNode(c, 0))}</div>}
+          </div>
+
+          {/* Right: rendered note + backlinks/links */}
+          <div className="flex-1 min-w-0 w-full">
+            {sel ? (
+              <div className="flex flex-col gap-4">
+                {/* Frontmatter, rendered as a metadata card */}
+                <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/50 px-4 py-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="text-base font-semibold text-zinc-900 dark:text-zinc-100 truncate">
+                      {parsed.meta.find(([k]) => k === 'name')?.[1] || sel.name}
+                    </div>
+                    <a href={ghBlob(sel.file)} target="_blank" rel="noreferrer"
+                      className="mono text-[11px] text-zinc-400 hover:text-violet-500 flex-shrink-0 mt-1">{sel.file} ↗</a>
+                  </div>
+                  {parsed.meta.find(([k]) => k === 'description') && (
+                    <p className="text-[13px] text-zinc-500 dark:text-zinc-400 mt-1">{parsed.meta.find(([k]) => k === 'description')![1]}</p>
+                  )}
+                  {parsed.meta.filter(([k]) => k !== 'name' && k !== 'description').length > 0 && (
+                    <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2">
+                      {parsed.meta.filter(([k]) => k !== 'name' && k !== 'description').map(([k, v]) => (
+                        <span key={k} className="text-[12px]"><span className="text-zinc-400">{k}:</span> <span className="mono text-zinc-600 dark:text-zinc-300">{v}</span></span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <article className="docs-prose rounded-lg border border-zinc-200 dark:border-zinc-800 p-4 sm:p-6 bg-white dark:bg-zinc-950" dangerouslySetInnerHTML={{ __html: html }} />
+                {(sel.backlinks?.length > 0 || sel.links?.length > 0) && (
+                  <div className="flex flex-col gap-3 rounded-lg border border-zinc-200 dark:border-zinc-800 p-4">
+                    {sel.backlinks?.length > 0 && (
+                      <div>
+                        <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1.5">← Backlinks ({sel.backlinks.length})</div>
+                        {linkChips(sel.backlinks)}
+                      </div>
+                    )}
+                    {sel.links?.length > 0 && (
+                      <div>
+                        <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1.5">→ Links ({sel.links.length})</div>
+                        {linkChips(sel.links)}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : (() => {
+              // Folder view: breadcrumb + README (the dir's MEMORY.md, if any) +
+              // an auto-generated table of contents of its direct children.
+              const prefix = dirSel ? dirSel + '/' : ''
+              const childDirs = new Set<string>()
+              const childFiles: MemNote[] = []
+              for (const n of notes) {
+                if (!n.file.startsWith(prefix)) continue
+                const rest = n.file.slice(prefix.length)
+                const slash = rest.indexOf('/')
+                if (slash >= 0) childDirs.add(rest.slice(0, slash))
+                else childFiles.push(n)
+              }
+              const segs = dirSel ? dirSel.split('/') : []
+              return (
+                <div className="flex flex-col gap-4">
+                  <div className="flex items-center gap-1.5 text-[13px] flex-wrap">
+                    <button onClick={() => setDirSel('')} className={!dirSel ? 'font-semibold text-zinc-800 dark:text-zinc-100' : 'text-zinc-500 hover:text-violet-500'}>{gh?.subdir || 'memory'}</button>
+                    {segs.map((s, i) => (
+                      <span key={i} className="flex items-center gap-1.5">
+                        <span className="text-zinc-300 dark:text-zinc-600">/</span>
+                        <button onClick={() => setDirSel(segs.slice(0, i + 1).join('/'))} className={i === segs.length - 1 ? 'font-semibold text-zinc-800 dark:text-zinc-100' : 'text-zinc-500 hover:text-violet-500'}>{s}</button>
+                      </span>
+                    ))}
+                    {gh && <a href={ghTree + (dirSel ? '/' + dirSel : '')} target="_blank" rel="noreferrer" className="mono text-[11px] text-zinc-400 hover:text-violet-500 ml-1">↗</a>}
+                  </div>
+                  {html && <article className="docs-prose rounded-lg border border-zinc-200 dark:border-zinc-800 p-4 sm:p-6 bg-white dark:bg-zinc-950" dangerouslySetInnerHTML={{ __html: html }} />}
+                  {(childDirs.size > 0 || childFiles.length > 0) && (
+                    <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800/60">
+                      {[...childDirs].sort().map((d) => (
+                        <button key={d} onClick={() => setDirSel(prefix + d)} className="w-full flex items-center gap-2 px-4 py-2 text-left text-[13px] hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
+                          <span className="text-zinc-400">▸</span><span className="font-medium text-zinc-700 dark:text-zinc-200">{d}/</span>
+                        </button>
+                      ))}
+                      {childFiles.sort((a, b) => a.name.localeCompare(b.name)).map((n) => (
+                        <button key={n.file} onClick={() => setSel(n)} className="w-full flex flex-col items-start px-4 py-2 text-left hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
+                          <span className="text-[13px] font-medium text-zinc-800 dark:text-zinc-100">{n.name}</span>
+                          {n.summary && <span className="text-[12px] text-zinc-500 dark:text-zinc-400 line-clamp-1">{n.summary}</span>}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {!html && childDirs.size === 0 && childFiles.length === 0 && (
+                    <div className="text-sm text-zinc-400 px-1 pt-2">Empty.</div>
+                  )}
+                </div>
+              )
+            })()}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // Top-level tabs. Sessions is the list; the rest open SettingsPage focused on a
 // section — Machines (VMs), Analytics (usage), Integrations get their own tab;
 // Settings holds the rest (orch/access/capture/targets/danger) via its own nav.
-type Tab = 'sessions' | 'machines' | 'analytics' | 'integrations' | 'settings'
-const TAB_SECTION: Record<Exclude<Tab, 'sessions'>, SectionId> = {
+type Tab = 'sessions' | 'machines' | 'analytics' | 'memory' | 'integrations' | 'settings'
+const TAB_SECTION: Record<Exclude<Tab, 'sessions' | 'memory'>, SectionId> = {
   machines: 'vms', analytics: 'usage', integrations: 'integrations', settings: 'orch',
 }
 function sectionToTab(s: SectionId): Tab {

@@ -1058,6 +1058,18 @@ func Main() {
 
 	go runVMHealthLoop(ctx, &cfg, st)
 
+	// Memory store (git-backed): clone synchronously before the first tick so the
+	// per-target dirs exist before any session writes into them, then keep it
+	// committed + pushed on a timer.
+	if memoryOn(&cfg) {
+		if head, err := memorySyncOnce(&cfg); err != nil {
+			log.Printf("memory: initial clone/sync failed (will retry): %v", err)
+		} else {
+			log.Printf("memory: store ready (%s@%s %s, every %s)", memRepo(&cfg), memBranch(&cfg), head, memInterval(&cfg))
+		}
+		go runMemorySyncLoop(ctx, &cfg)
+	}
+
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	tick(&cfg, st)

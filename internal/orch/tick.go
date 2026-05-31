@@ -32,7 +32,7 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 			sessionCmdOverride = vm.SessionCmd + flags
 		}
 	}
-	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, sessionCmdOverride, botLogin, botEmail); err != nil {
+	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, sessionCmdOverride, botLogin, botEmail, memoryStoreArg(cfg, vm)); err != nil {
 		return err
 	}
 	time.Sleep(3 * time.Second)
@@ -117,7 +117,7 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 	resumeCmd := vmAgent(*vm).resumeXform(base)
 
 	botLogin, botEmail := vmBotIdentity(cfg.Orch, *vm)
-	if err := tmuxStart(*vm, session, workdir, sharedDir, j.TargetRepo, j.Branch, resumeCmd, botLogin, botEmail); err != nil {
+	if err := tmuxStart(*vm, session, workdir, sharedDir, j.TargetRepo, j.Branch, resumeCmd, botLogin, botEmail, memoryStoreArg(cfg, vm)); err != nil {
 		return err
 	}
 	time.Sleep(3 * time.Second)
