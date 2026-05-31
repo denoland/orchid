@@ -881,7 +881,11 @@ func Main() {
 	}
 
 	go func() {
-		t := time.NewTicker(1 * time.Second)
+		// 4s (was 1s): this loop ssh-captures every live pane to detect the
+		// needs-input prompt. The sparkline that wanted per-second resolution is
+		// gone, so 4s cuts the ssh round-trips ~4x while keeping needs-input
+		// detection responsive enough.
+		t := time.NewTicker(4 * time.Second)
 		defer t.Stop()
 		for range t.C {
 			var snap map[int]Job
@@ -903,6 +907,7 @@ func Main() {
 					continue
 				}
 				paneActivityRecordTick(j.Tmux, fnv64(out))
+				paneActionSet(j.Tmux, extractPaneAction(out))
 				needs := panePrompted(out, vmAgent(*vm))
 				if paneNeedsInputSet(j.Tmux, needs) {
 					if st.Bcast != nil {
@@ -914,6 +919,7 @@ func Main() {
 				}
 			}
 			paneActivityPrune(live)
+			glancePrune(live)
 			paneNeedsInputPrune(live)
 		}
 	}()
@@ -961,7 +967,17 @@ func Main() {
 
 	for i := range cfg.VMs {
 		vm := cfg.VMs[i]
-		go tailStatusLine(context.Background(), vm, st.Bcast)
+		// Each VM streams its agent's usage: claude via the statusline.jsonl
+		// hook, codex via its rotating session rollouts. Both feed the per-agent
+		// quota buckets the governor paces against.
+		if vmAgent(vm).name == "codex" {
+			go tailCodexUsage(context.Background(), vm, st.Bcast)
+		} else {
+			go tailStatusLine(context.Background(), vm, st.Bcast)
+			// Reliable needs-input detection from claude's Notification /
+			// UserPromptSubmit hooks (notify.jsonl), + ntfy on the rising edge.
+			go tailNotify(context.Background(), vm, cfg.Orch.NtfyTopic, st.Bcast)
+		}
 	}
 
 	for i := range cfg.VMs {
@@ -977,7 +993,9 @@ func Main() {
 	// has a time-series. Runs unconditionally (the sample is cheap and the
 	// estimator only consumes it when the governor is enabled) so enabling the
 	// governor later has immediate history to work from.
-	go runQuotaSampleLoop(context.Background(), st.store, cfg.Orch.Throttle)
+	go runQuotaSampleLoop(context.Background(), st.store, &cfg)
+	// At-a-glance list signal: per-session git WIP stats (branch diff vs base).
+	go runWipLoop(context.Background(), &cfg, st)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

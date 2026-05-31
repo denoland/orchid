@@ -298,7 +298,7 @@ func ThrottleDecide(now time.Time, five, seven RateLimit, ok bool, cfg *Throttle
 // (and reused by the /api/state builder via ThrottleDecide directly). It
 // reads the most-recent live quota and fails open via latestQuota's ok
 // flag — when no statusline has been seen the decision is ModeAllow.
-func currentThrottle(cfg *Config, now time.Time) ThrottleDecision {
-	five, seven, ok := latestQuota()
+func currentThrottle(cfg *Config, agent string, now time.Time) ThrottleDecision {
+	five, seven, ok := latestQuota(agent)
 	return ThrottleDecide(now, five, seven, ok, cfg.Orch.Throttle)
 }

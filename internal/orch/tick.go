@@ -21,7 +21,18 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 	if botLogin == "" {
 		return fmt.Errorf("bot_login not set — connect GitHub from the dashboard before spawning sessions")
 	}
-	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, "", botLogin, botEmail); err != nil {
+	// Per-issue cost control: an issue's toml frontmatter may request a cheaper
+	// model / lower reasoning effort (model = "sonnet", effort = "medium"),
+	// appended as claude CLI flags. Claude VMs only; "" falls back to the VM's
+	// session_cmd inside tmuxStart, so only override when the VM has an explicit
+	// session_cmd to append to and the frontmatter actually asks for something.
+	sessionCmdOverride := ""
+	if vmAgent(*vm).name == "claude" && vm.SessionCmd != "" {
+		if flags := claudeFlagsFromFrontmatter(is.Body); flags != "" {
+			sessionCmdOverride = vm.SessionCmd + flags
+		}
+	}
+	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, sessionCmdOverride, botLogin, botEmail); err != nil {
 		return err
 	}
 	time.Sleep(3 * time.Second)
@@ -313,72 +324,88 @@ func tick(cfg *Config, st *State) {
 	}
 	st.httpSnap.Store(snap)
 
-	// Weekly throttle: one decision per tick, shared by every gate below so
-	// they never disagree within a pass. Pure function of live quota + wall
-	// clock; fails open (ModeAllow) when throttle is disabled or quota is
-	// unreadable, in which case BlocksNewWork()==false and every gate is a
-	// no-op (identical to today). Log only on mode transitions to avoid
-	// per-tick noise.
-	thr := currentThrottle(cfg, time.Now())
-	if thr.Mode != st.lastThrottleMode {
-		if thr.Mode == ModeAllow {
-			log.Printf("weekly throttle cleared (now %s)", thr.Mode)
-		} else {
-			log.Printf("weekly throttle active: %s (%s)", thr.Mode, thr.Reason)
-		}
-		st.lastThrottleMode = thr.Mode
-	}
-
-	// Proactive pacing governor: one decision per tick from live quota + the
-	// persisted sample window, layered ON TOP of the throttle gate (it can only
-	// further restrict, never admit work the gate blocked). Fails open
-	// (EffectiveCap=MaxInt, PausedTarget=0) when disabled / quota unreadable /
-	// thin data, in which case the admission loop and duty-cycle pass below are
-	// byte-for-byte today's behavior. govCap is the slew anchor for the cap; it
-	// is restored from the kv table on a fresh process so the cap doesn't snap
-	// across a restart.
+	// Per-agent weekly throttle + proactive pacing governor. Each configured
+	// agent (claude/codex) paces INDEPENDENTLY against its own account quota:
+	// the throttle is the hard binary gate, the governor an adaptive cap +
+	// duty-cycle layer on top (only ever further-restricting). Both fail open
+	// per agent (ModeAllow / EffectiveCap=MaxInt) when that agent has no quota
+	// reading / thin data — identical to today's single-agent behavior. govCap
+	// is the per-agent slew anchor, restored from kv ("gov_cap_<agent>") so it
+	// survives a restart. Log only on transitions to avoid per-tick noise.
 	now := time.Now()
-	if st.govCap == 0 {
-		if b, err := st.store.GetKV("gov_cap"); err == nil && len(b) > 0 {
-			if v, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
-				st.govCap = v
+	agents := configuredAccounts(cfg)
+	thrByAgent := map[string]ThrottleDecision{}
+	govByAgent := map[string]GovernorDecision{}
+	dutyByAgent := map[string]bool{}
+	if st.govCapByAgent == nil {
+		st.govCapByAgent = map[string]int{}
+	}
+	if st.lastThrottleModeByAgent == nil {
+		st.lastThrottleModeByAgent = map[string]ThrottleMode{}
+	}
+	if st.lastGovBindingByAgent == nil {
+		st.lastGovBindingByAgent = map[string]string{}
+		st.lastGovCapByAgent = map[string]int{}
+	}
+	for _, agent := range agents {
+		five, seven, qok := latestQuota(agent)
+
+		thr := ThrottleDecide(now, five, seven, qok, cfg.Orch.Throttle)
+		thrByAgent[agent] = thr
+		if thr.Mode != st.lastThrottleModeByAgent[agent] {
+			if thr.Mode == ModeAllow {
+				log.Printf("weekly throttle[%s] cleared (now %s)", agent, thr.Mode)
+			} else {
+				log.Printf("weekly throttle[%s] active: %s (%s)", agent, thr.Mode, thr.Reason)
+			}
+			st.lastThrottleModeByAgent[agent] = thr.Mode
+		}
+
+		prevCap := st.govCapByAgent[agent]
+		if prevCap == 0 {
+			if b, err := st.store.GetKV("gov_cap_" + agent); err == nil && len(b) > 0 {
+				if v, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+					prevCap = v
+				}
 			}
 		}
-	}
-	five, seven, qok := latestQuota()
-	var samples []QuotaSample
-	if cfg.Orch.Throttle != nil && cfg.Orch.Throttle.GovernorEnabled {
-		window := cfg.Orch.Throttle.withDefaults().rateWindowDur()
-		samples, _ = st.store.LoadQuotaSamples(now.Add(-window).Unix())
-	}
-	active := countRunning(st)
-	gov := GovernorDecide(now, five, seven, qok, samples, active, st.govCap, cfg.Orch.Throttle)
-	st.SetGovernorState(gov)
-	if gov.EffectiveCap != math.MaxInt {
-		st.govCap = gov.EffectiveCap
-		_ = st.store.PutKV("gov_cap", []byte(strconv.Itoa(gov.EffectiveCap)))
-	}
-	// Log only on cap/binding transitions to avoid per-tick noise.
-	if gov.EffectiveCap != st.lastGovCap || gov.Binding != st.lastGovBinding {
-		if gov.Enabled {
-			log.Printf("governor: cap=%s active=%d paused-target=%d binding=%s burn(weekly=%.2f/h target=%.2f/h) projected-eow=%.1f%%",
-				capLabel(gov.EffectiveCap), active, gov.PausedTarget, gov.Binding,
-				gov.BurnWeekly, gov.TargetWeekly, gov.ProjectedEndPct)
-		} else if st.lastGovCap != 0 && st.lastGovCap != math.MaxInt {
-			log.Printf("governor: disabled/fail-open (uncapped)")
+		var samples []QuotaSample
+		if cfg.Orch.Throttle != nil && cfg.Orch.Throttle.GovernorEnabled {
+			window := cfg.Orch.Throttle.withDefaults().rateWindowDur()
+			samples, _ = st.store.LoadQuotaSamples(agent, now.Add(-window).Unix())
 		}
-		st.lastGovCap = gov.EffectiveCap
-		st.lastGovBinding = gov.Binding
+		active := countRunning(cfg, st, agent)
+		gov := GovernorDecide(now, five, seven, qok, samples, active, prevCap, cfg.Orch.Throttle)
+		govByAgent[agent] = gov
+		st.SetGovernorState(agent, gov)
+		if gov.EffectiveCap != math.MaxInt {
+			st.govCapByAgent[agent] = gov.EffectiveCap
+			_ = st.store.PutKV("gov_cap_"+agent, []byte(strconv.Itoa(gov.EffectiveCap)))
+		} else if prevCap > 0 {
+			// Fail-open (e.g. warm-up right after a restart, before a live quota
+			// reading + samples arrive): KEEP the last known cap so admission
+			// stays bounded instead of bursting to raw VM capacity. The admission
+			// loop uses st.govCapByAgent as the warm-up ceiling.
+			st.govCapByAgent[agent] = prevCap
+		}
+		if gov.EffectiveCap != st.lastGovCapByAgent[agent] || gov.Binding != st.lastGovBindingByAgent[agent] {
+			if gov.Enabled {
+				log.Printf("governor[%s]: cap=%s active=%d paused-target=%d binding=%s burn(weekly=%.2f/h target=%.2f/h) projected-eow=%.1f%%",
+					agent, capLabel(gov.EffectiveCap), active, gov.PausedTarget, gov.Binding,
+					gov.BurnWeekly, gov.TargetWeekly, gov.ProjectedEndPct)
+			} else if st.lastGovCapByAgent[agent] != 0 && st.lastGovCapByAgent[agent] != math.MaxInt {
+				log.Printf("governor[%s]: disabled/fail-open (uncapped)", agent)
+			}
+			st.lastGovCapByAgent[agent] = gov.EffectiveCap
+			st.lastGovBindingByAgent[agent] = gov.Binding
+		}
+		dutyByAgent[agent] = gov.Enabled && cfg.Orch.Throttle != nil && cfg.Orch.Throttle.DutyCycle
 	}
 
 	// Never-strand reconcile pass: runs BEFORE ghIssueList so a list error
 	// can't skip it. Clears paused flags for dead panes and resumes everything
-	// when duty-cycle is not actively managing. Resume gates on dutyOn (not just
-	// gov.Enabled): if duty_cycle is flipped off while governor_enabled stays
-	// true, persisted paused jobs must still be resumed or they'd stay SIGSTOP'd
-	// forever.
-	dutyOn := gov.Enabled && cfg.Orch.Throttle != nil && cfg.Orch.Throttle.DutyCycle
-	reconcilePaused(cfg, st, dutyOn)
+	// when that agent's duty-cycle is not actively managing.
+	reconcilePaused(cfg, st, dutyByAgent)
 
 	type routed struct {
 		is     Issue
@@ -464,35 +491,44 @@ func tick(cfg *Config, st *State) {
 		}
 		return candidates[a] < candidates[b]
 	})
-	// The governor's adaptive cap only bounds admission when it's enabled and
-	// has a reading; otherwise freeVM (per-VM capacity) is the only limit.
-	admitSlots := math.MaxInt
-	if gov.Enabled && gov.EffectiveCap != math.MaxInt {
-		// Count TOTAL governable (running + paused), not just running: a paused
-		// session still occupies a slot (it resumes and burns later), so the cap
-		// must include it or pausing one would free a slot for fresh work.
-		admitSlots = gov.EffectiveCap - countGovernable(st)
-		if admitSlots < 0 {
-			admitSlots = 0
+	// Admission is bounded by per-VM `capacity` (freeVMAllow) ONLY — each VM
+	// fills to its own ceiling. The governor no longer imposes an account-wide
+	// concurrency cap: summing every VM of an agent into one number conflated
+	// independent boxes and stranded free slots (e.g. claude capped at 20 left
+	// a 20-slot box sitting at 13 because a 7-slot box held the rest). Burn
+	// stays safe via the hard throttle gate (admittable() below: over-pace =>
+	// BlocksNewWork, account-wide) plus the duty-cycle pause pass, which sheds
+	// in-flight load toward gov.PausedTarget. A duty-cycle-paused job keeps its
+	// VM slot in freeVMAllow's load count, so shedding is never undone by an
+	// admission refill. gov.EffectiveCap is still computed (display + the slew
+	// anchor that feeds PausedTarget) but no longer gates inflow.
+	admitSlotsByAgent := map[string]int{}
+	for _, agent := range agents {
+		admitSlotsByAgent[agent] = math.MaxInt
+	}
+	admittedByAgent := map[string]int{}
+	// admittable reports whether an agent can still take new work this tick:
+	// throttle not blocking AND governor cap not exhausted. freeVMAllow uses it
+	// to skip that agent's VMs, so a capped codex doesn't strand an issue that
+	// claude could run (and vice-versa).
+	admittable := func(agent string) bool {
+		if thrByAgent[agent].BlocksNewWork() {
+			return false
 		}
+		return admittedByAgent[agent] < admitSlotsByAgent[agent]
 	}
 
-	admitted := 0
 	for _, n := range candidates {
 		r := open[n]
-		if thr.BlocksNewWork() {
-			log.Printf("issue #%d: weekly throttle active (%s: %s), deferring spawn", n, thr.Mode, thr.Reason)
-			continue
-		}
-		if admitted >= admitSlots {
-			log.Printf("issue #%d: governor cap reached (cap=%s active=%d), deferring spawn",
-				n, capLabel(gov.EffectiveCap), active)
-			continue
-		}
-		vm := freeVM(cfg, st)
+		vm := freeVMAllow(cfg, st, admittable)
 		if vm == nil {
-			log.Printf("issue #%d: no free VM, skipping", n)
+			// No VM whose agent still has capacity + throttle/governor headroom.
+			log.Printf("issue #%d: no admittable VM (capacity/throttle/governor), deferring spawn", n)
 			continue
+		}
+		agent := vmAgent(*vm).name
+		if agent == "" {
+			agent = "claude"
 		}
 		if err := spawn(cfg, st, vm, r.is, r.target); err != nil {
 			log.Printf("issue #%d: spawn failed on %s: %v", n, vm.Name, err)
@@ -506,7 +542,7 @@ func tick(cfg *Config, st *State) {
 			}
 			j.Priority = p
 		}
-		admitted++
+		admittedByAgent[agent]++
 		saveStateLogged(st)
 	}
 
@@ -572,7 +608,7 @@ func tick(cfg *Config, st *State) {
 				saveStateLogged(st)
 				continue
 			}
-			tickCron(cfg, st, n, j, r.is, r.target, thr)
+			tickCron(cfg, st, n, j, r.is, r.target, thrByAgent[jobAccount(cfg, j)])
 			continue
 		}
 		// Duty-cycle-paused sessions are frozen (SIGSTOP'd): skip the poke/PR
@@ -683,6 +719,7 @@ func tick(cfg *Config, st *State) {
 			if err := st.store.PutClosedJob(n, closedState, j); err != nil {
 				log.Printf("issue #%d: put closed_jobs: %v", n, err)
 			}
+			closeInboxIssue(cfg, n, v.State, j.TargetRepo, j.PR)
 			tearDown(cfg, st, n)
 			saveStateLogged(st)
 			continue
@@ -735,6 +772,7 @@ func tick(cfg *Config, st *State) {
 				if err := st.store.PutClosedJob(n, closedState, j); err != nil {
 					log.Printf("issue #%d: put closed_jobs: %v", n, err)
 				}
+				closeInboxIssue(cfg, n, fresh.State, j.TargetRepo, j.PR)
 				tearDown(cfg, st, n)
 				saveStateLogged(st)
 				continue
@@ -744,8 +782,8 @@ func tick(cfg *Config, st *State) {
 		// modes can gate pokes, and only when throttle_pokes=true. We skip
 		// without marking reviews/comments Seen, so the poke re-fires after
 		// release. Default config => never gates => zero behavior change.
-		if thr.BlocksPokes(cfg.Orch.Throttle) {
-			log.Printf("issue #%d: weekly throttle active (%s), deferring poke", n, thr.Mode)
+		if pthr := thrByAgent[jobAccount(cfg, j)]; pthr.BlocksPokes(cfg.Orch.Throttle) {
+			log.Printf("issue #%d: weekly throttle active (%s), deferring poke", n, pthr.Mode)
 			continue
 		}
 		// Poke debounce: each poke is a turn that re-reads the whole context, so
@@ -790,13 +828,18 @@ func tick(cfg *Config, st *State) {
 		log.Printf("issue #%d: poked PR #%d", n, j.PR)
 	}
 
-	// Duty-cycle pass: when the governor is enabled with duty_cycle on, SIGSTOP
-	// the lowest-priority running sessions / SIGCONT the highest-priority paused
-	// ones so the paused set matches gov.PausedTarget. Resume-before-pause,
-	// bounded ops/tick. Disabled / fail-open => PausedTarget==0 and the
-	// reconcile pass already resumed everything, so this is a no-op.
-	if gov.Enabled && cfg.Orch.Throttle != nil && cfg.Orch.Throttle.DutyCycle {
-		applyDutyCycle(cfg, st, gov, cfg.Orch.Throttle.withDefaults().maxPauseDur())
+	// Duty-cycle pass, per agent: when an agent's governor is enabled with
+	// duty_cycle on, kill the lowest-priority running sessions of THAT agent /
+	// resume the highest-priority paused ones so its paused set matches
+	// gov.PausedTarget. Resume-before-pause, bounded ops/tick. Disabled /
+	// fail-open => PausedTarget==0 and reconcile already resumed everything.
+	if cfg.Orch.Throttle != nil && cfg.Orch.Throttle.DutyCycle {
+		for _, agent := range agents {
+			gov := govByAgent[agent]
+			if gov.Enabled {
+				applyDutyCycle(cfg, st, agent, gov, cfg.Orch.Throttle.withDefaults().maxPauseDur())
+			}
+		}
 	}
 }
 

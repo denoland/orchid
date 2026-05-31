@@ -12,6 +12,11 @@ import {
 } from './session'
 
 export { defineTunnelSession } from './session'
+export {
+  INNER_URL_HEADER,
+  INNER_METHOD_HEADER,
+  INNER_HEADERS_HEADER,
+} from './session'
 export type { Env, RelayOptions, RoutingMode, SessionContext, Frame } from './types'
 
 // makeRelayApp returns a Hono app that handles agent connects, public

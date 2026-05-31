@@ -1,323 +1,28 @@
 
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
-import {
-  ReactFlow,
-  ReactFlowProvider,
-  Background,
-  BackgroundVariant,
-  Handle,
-  Position,
-  MarkerType,
-  NodeResizer,
-  useNodesState,
-  useEdgesState,
-  applyNodeChanges,
-  applyEdgeChanges,
-  useReactFlow,
-  type Node,
-  type Edge,
-  type Connection,
-  type NodeTypes,
-  type NodeChange,
-  type EdgeChange,
-  type NodeProps,
-} from '@xyflow/react'
-import '@xyflow/react/dist/style.css'
 import type { Job, State } from './types'
 import { attention, ciStatus, LEVEL_COLOR, type AttentionLevel } from './attention'
 import { Pane } from './Pane'
 import { Composer } from './Composer'
 import { mockJobs, mockVMs } from './mock'
-import {
-  NoteNode, LinkNode, TextNode,
-  CollabLayer, useCollabSocket,
-  detectVariant, fetchGitHubSnippet,
-  type UserNode,
-  type NoteData, type TextData, type LinkData, type LinkVariant,
-  NOTE_W, NOTE_H, LINK_W, LINK_H,
-} from '@orchid/whiteboard'
+import { OrchidArt } from './OrchidArt'
+import { AgentLogo } from './AgentLogo'
 
 import type { RelayInfo } from './App'
 import { WSBusContext } from './App'
 
 interface Props { state: State; relay: RelayInfo | null }
 
-const CARD_W = 220
-const CARD_H = 96
-const COLS = 4
-const GAP = 18
-const HEADER_OFFSET = 220
-
-type Tool = 'select' | 'box' | 'note' | 'text'
-
-interface Snap {
-  cards: Record<string, { x: number; y: number }>
-  user: UserNode[]
-  edges: Edge[]
-  viewport?: { x: number; y: number; zoom: number }
-  panes?: Record<string, { x: number; y: number; w: number; h: number }>
-  view?: 'canvas' | 'list'
-}
-
-function emptySnap(): Snap {
-  return { cards: {}, user: [], edges: [], panes: {} }
-}
-function normalizeSnap(raw: any): Snap {
-  if (!raw || typeof raw !== 'object') return emptySnap()
-  const users: any[] = Array.isArray(raw.user) ? raw.user : []
-  // Backfill: any auto-injected link node missing the compact flag
-  // (added later) should render as a chip too.
-  for (const u of users) {
-    if (u && typeof u === 'object' && u.type === 'link'
-        && typeof u.id === 'string' && u.id.startsWith('auto-')
-        && u.data && u.data.compact !== true) {
-      u.data.compact = true
-    }
-  }
-  return {
-    cards: raw.cards ?? {},
-    user: users,
-    edges: raw.edges ?? [],
-    viewport: raw.viewport,
-    panes: raw.panes ?? {},
-    view: raw.view === 'list' ? 'list' : 'canvas',
-  }
-}
-/// Fetches the layout snap from orch. Returns `null` on any failure
-/// (network, auth, parse). The caller must NOT treat null as "empty
-/// snap" — that would defeat the persisted layout the first time a
-/// request blips. Use `null` to keep the rebuild effect parked.
-async function fetchSnap(): Promise<Snap | null> {
-  try {
-    const r = await fetch('/api/snap', { credentials: 'include', cache: 'no-store' })
-    if (!r.ok) return null
-    return normalizeSnap(await r.json())
-  } catch { return null }
-}
-// Bus-aware snap save path. When the events WS is up, layout writes
-// piggyback that connection (saveBusSender is wired by App.tsx on
-// mount) so card drags don't hit the /api/snap HTTP route — every
-// avoided round-trip is one fewer DO request on Cloudflare. The HTTP
-// PUT remains as a fallback for local-mode operators with no relay
-// agent connected, and for pagehide when the bus isn't initialised.
-let saveBusSender: ((msg: any) => void) | null = null
-export function setSnapBusSender(fn: ((msg: any) => void) | null) { saveBusSender = fn }
-let saveTimer: ReturnType<typeof setTimeout> | null = null
-let savePending: Snap | null = null
-function doPut(body: Snap) {
-  if (saveBusSender) {
-    try { saveBusSender({ t: 'snap-put', snap: body }) } catch {}
-    return Promise.resolve()
-  }
-  return fetch('/api/snap', {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    credentials: 'include',
-    keepalive: true,
-    body: JSON.stringify(body),
-  }).catch(() => {})
-}
-function saveSnap(s: Snap) {
-  savePending = s
-  if (saveTimer) return
-  saveTimer = setTimeout(() => {
-    const body = savePending
-    saveTimer = null
-    savePending = null
-    if (body) doPut(body)
-  }, 300)
-}
-function flushSnap() {
-  if (saveTimer) {
-    clearTimeout(saveTimer)
-    saveTimer = null
-  }
-  const body = savePending
-  savePending = null
-  if (!body) return
-  if (saveBusSender) {
-    try { saveBusSender({ t: 'snap-put', snap: body }) } catch {}
-    return
-  }
-  // sendBeacon survives navigation when the bus isn't available.
-  const json = JSON.stringify(body)
-  const sent = typeof navigator !== 'undefined' && navigator.sendBeacon &&
-    navigator.sendBeacon('/api/snap', new Blob([json], { type: 'application/json' }))
-  if (!sent) doPut(body)
-}
-if (typeof window !== 'undefined') {
-  window.addEventListener('pagehide', flushSnap)
-  window.addEventListener('beforeunload', flushSnap)
-  window.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushSnap()
-  })
-}
-
-const newId = () => Math.random().toString(36).slice(2, 9)
-
-// ─── card node ────────────────────────────────────────────────────────
-
-type CardData = {
-  job: Job
-  setExpanded: (tmux: string) => void
-}
-
-// Realtime activity bus. The relay's canvas WS pushes {type:'activity',
+// Realtime activity bus. The relay's events WS pushes {type:'activity',
 // tmux, ts} messages whenever a session's pane changes — these arrive
-// faster than the /api/state poll. CardNode subscribes and overrides
-// `attention()` to 'working' for the brief window after a push so the
-// dashboard reacts immediately instead of waiting for the next poll.
+// faster than the /api/state poll. List rows subscribe via ActivityContext
+// and override `attention()` to 'working' for the brief window after a
+// push so the dashboard reacts immediately instead of waiting for the
+// next poll.
 const ActivityContext = React.createContext<{ at: Map<string, number>; tick: number }>({
   at: new Map(), tick: 0,
 })
 const ACTIVITY_HOLD_MS = 4000
-
-function CardNode({ data, dragging }: NodeProps<Node<CardData, 'card'>>) {
-  const { job, setExpanded } = data
-  const activity = React.useContext(ActivityContext)
-  let attn = attention(job)
-  // Push-driven override: if the relay pinged us recently for this tmux,
-  // treat the card as working for the next few seconds regardless of
-  // what the slower polled activity array says. A pending prompt outranks
-  // it though — the activity ping fires once on the busy→prompted screen
-  // redraw, but the dialog is sitting there waiting on a human and the
-  // card should stay red until the prompt clears.
-  const lastPing = activity.at.get(job.tmux)
-  if (lastPing && Date.now() - lastPing < ACTIVITY_HOLD_MS && !job.needs_input) {
-    attn = { ...attn, level: 'working', reason: 'active' }
-  }
-  const ringClass = 'ring-zinc-200/80 dark:ring-zinc-700/70 ' + (
-    attn.level === 'needs-you' ? 'card-status-needs '
-    : attn.level === 'working' ? 'card-status-working '
-    : attn.level === 'watching' ? 'card-status-watching '
-    : ''
-  )
-  const vmOffline = job.vm_online === false
-  const closed = job.closed_state === 'merged' || job.closed_state === 'closed'
-  const merged = job.closed_state === 'merged'
-  // Governor surface: priority badge (hidden at the default 0) and a frozen
-  // indicator when the session is duty-cycle SIGSTOP'd. paused_state is the
-  // always-present flag from /api/state; paused is the omitempty blob mirror.
-  const priority = job.priority ?? 0
-  const paused = (job.paused_state ?? job.paused) === true && !closed
-  return (
-    <div
-      onClick={(e) => {
-        if (dragging) return
-        e.stopPropagation()
-        setExpanded(job.tmux)
-      }}
-      className={
-        'relative bg-white/95 dark:bg-zinc-900/95 backdrop-blur rounded-xl ring-1 shadow-sm hover:shadow-md cursor-pointer ' +
-        ringClass +
-        (vmOffline ? ' card-vm-offline' : '') +
-        (closed ? ' card-closed' : '')
-      }
-      style={{ width: CARD_W, height: CARD_H, opacity: closed ? 0.6 : (vmOffline ? 0.55 : 1) }}
-      title={closed ? `PR ${job.closed_state}` : (vmOffline ? `${job.vm} is offline — session paused` : undefined)}
-    >
-      <Handle
-        type="target"
-        position={Position.Left}
-        style={{ background: '#a78bfa', width: 8, height: 8, border: '1.5px solid white' }}
-      />
-      <Handle
-        type="source"
-        position={Position.Right}
-        style={{ background: '#a78bfa', width: 8, height: 8, border: '1.5px solid white' }}
-      />
-      <CardCompact job={job} />
-      {priority !== 0 && !closed && (
-        <div
-          className="absolute bottom-1.5 left-2 text-[10px] mono px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300"
-          title={`priority ${priority}`}
-        >
-          P{priority}
-        </div>
-      )}
-      {paused && (
-        <div
-          className="absolute bottom-1.5 right-2 inline-flex items-center gap-1 text-[10px] mono px-1.5 py-0.5 rounded-full bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300"
-          title="paused by the pacing governor (duty-cycle SIGSTOP) — token burn frozen, context preserved"
-        >
-          ❄ paused
-        </div>
-      )}
-      {closed && (
-        <div
-          className={
-            'absolute top-1.5 right-2 text-[10px] mono px-1.5 py-0.5 rounded-full ' +
-            (merged
-              ? 'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300'
-              : 'bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400')
-          }
-        >
-          {merged ? 'merged' : 'closed'}
-        </div>
-      )}
-      {!closed && vmOffline && (
-        <div className="absolute top-1.5 right-2 text-[10px] mono text-zinc-400 dark:text-zinc-500">
-          {job.vm} offline
-        </div>
-      )}
-    </div>
-  )
-}
-
-// Whiteboard primitives (note / text / link / stroke nodes, pen overlay,
-// collab WS) live in @orchid/whiteboard. Orchid-only nodes (CardNode
-// above, PaneWindowNode below) stay here.
-
-// ─── pane window node ───
-
-type PaneNodeData = {
-  tmux: string
-  jobRef: { current: Map<string, Job> }
-  onClose: (tmux: string) => void
-}
-
-function PaneWindowNode({ data, selected }: NodeProps<Node<PaneNodeData, 'pane'>>) {
-  const job = data.jobRef.current.get(data.tmux)
-  const ci = job ? ciStatus(job.last_check_conclusions ?? {}) : 'pending'
-  const title = job?.issue_title || data.tmux
-  return (
-    <div className="rounded-lg overflow-hidden shadow-2xl ring-1 ring-black/40 flex flex-col bg-[#0b0b0e] w-full h-full">
-      <NodeResizer
-        minWidth={480}
-        minHeight={320}
-        isVisible={selected}
-        lineClassName="!border-violet-400"
-        handleClassName="!bg-violet-400"
-      />
-      <div className="h-8 bg-zinc-800/95 flex items-center px-3 gap-3 select-none flex-shrink-0 cursor-grab active:cursor-grabbing">
-        <div className="flex gap-1.5 flex-shrink-0">
-          <button
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => { e.stopPropagation(); data.onClose(data.tmux) }}
-            className="w-3 h-3 rounded-full bg-rose-500 hover:bg-rose-400 transition-colors"
-            title="close"
-          />
-          <span className="w-3 h-3 rounded-full bg-amber-400" />
-          <span className="w-3 h-3 rounded-full bg-emerald-500" />
-        </div>
-        <div className="flex-1 min-w-0 text-center text-[12px] text-zinc-300 truncate">
-          {title}
-        </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
-          {job?.pr && job?.target_repo && (
-            <PRBadge repo={job.target_repo} pr={job.pr} ci={ci} />
-          )}
-        </div>
-      </div>
-      <div
-        className="flex-1 min-h-0 nodrag nowheel"
-        onPointerDown={(e) => e.stopPropagation()}
-      >
-        <Pane session={data.tmux} />
-      </div>
-    </div>
-  )
-}
 
 function PRBadge({ repo, pr, ci }: { repo: string; pr: number; ci: 'fail' | 'pass' | 'pending' }) {
   const variant: 'open' | 'closed' | 'pending' =
@@ -357,32 +62,10 @@ function PRIcon({ variant }: { variant: 'open' | 'closed' | 'pending' }) {
   )
 }
 
-const nodeTypes: NodeTypes = { card: CardNode, note: NoteNode, link: LinkNode, text: TextNode, pane: PaneWindowNode }
-
-function makeCardNode(
-  job: Job,
-  pos: { x: number; y: number },
-  setExpanded: (tmux: string) => void,
-): Node<CardData, 'card'> {
-  return {
-    id: job.tmux,
-    type: 'card',
-    position: { x: pos.x, y: pos.y },
-    data: { job, setExpanded },
-    style: { width: CARD_W, height: CARD_H },
-    draggable: true,
-    zIndex: 2,
-  }
-}
-
 // ─── dashboard ────────────────────────────────────────────────────────
 
 export function Dashboard({ state, relay }: Props) {
-  return (
-    <ReactFlowProvider>
-      <DashboardInner state={state} relay={relay} />
-    </ReactFlowProvider>
-  )
+  return <DashboardInner state={state} relay={relay} />
 }
 
 // ?mock=<n> in the URL prepends N fake sessions to the live jobs list
@@ -405,225 +88,20 @@ function DashboardInner({ state: rawState, relay }: Props) {
     return { ...rawState, jobs, vms: [...mockVMs(), ...(rawState.vms ?? [])] }
   }, [rawState, jobs])
   const inbox = state.inbox ?? ''
-  const snapRef = useRef<Snap>(emptySnap())
-  const [snapLoaded, setSnapLoaded] = useState(false)
   const jobsByTmuxRef = useRef<Map<string, Job>>(new Map())
-  const [nodes, setNodes] = useNodesState<Node>([])
-  const [edges, setEdges] = useEdgesState<Edge>(snapRef.current.edges)
-  const [tool, setTool] = useState<Tool>('select')
-  const lastPaneClickRef = useRef(0)
-  const containerRef = useRef<HTMLDivElement>(null)
-  const sendRef = useRef<(msg: any) => void>(() => {})
-  // Shared events-WS bus from App.tsx — see WSBusContext. Used for
-  // inbound snap pushes and to skip the /api/canvas/ws side-channel.
+  // Shared events-WS bus from App.tsx — see WSBusContext. Used here for
+  // inbound `activity` pushes that beat the slower /api/state poll.
   const bus = useContext(WSBusContext)
 
-  const persist = useCallback(() => { saveSnap(snapRef.current) }, [])
-
-  // Snap (canvas layout) arrives via two channels, whichever wins:
-  //  1. Relay's events WS — primed on accept with the cached layout,
-  //     no HTTP round-trip. Skipped when there's no bus (local mode).
-  //  2. Fallback fetch of /api/snap. Retries on transient failure so a
-  //     single 503 right after OAuth doesn't let the rebuild effect
-  //     default-grid the layout and PUT that clobbering snap back.
-  const snapLoadedRef = useRef(false)
-  useEffect(() => { snapLoadedRef.current = snapLoaded }, [snapLoaded])
-  useEffect(() => {
-    if (!bus) return
-    return bus.subscribe((msg: any) => {
-      if (msg?.t !== 'snap') return
-      try {
-        const s = normalizeSnap(msg.snap ?? {})
-        snapRef.current = s
-        setEdges(s.edges)
-        if (s.view) setView(s.view)
-        setSnapLoaded(true)
-      } catch {}
-    })
-  }, [bus])
-  useEffect(() => {
-    let alive = true
-    let attempt = 0
-    const load = async () => {
-      while (alive) {
-        if (snapLoadedRef.current) return
-        const s = await fetchSnap()
-        if (!alive) return
-        if (s) {
-          snapRef.current = s
-          setEdges(s.edges)
-          if (s.view) setView(s.view)
-          setSnapLoaded(true)
-          return
-        }
-        attempt++
-        await new Promise((r) => setTimeout(r, Math.min(8000, 500 * 2 ** attempt)))
-      }
-    }
-    load()
-    return () => { alive = false }
-  }, [])
-
-  // pinToCanvas adds a card to the canvas. If posOverride is provided,
-  // place there (used by the canvas-side palette to drop at viewport
-  // centre). Otherwise pack into the next free grid slot.
-  const pinToCanvas = useCallback((tmux: string, posOverride?: { x: number; y: number }) => {
-    if (snapRef.current.cards[tmux]) return
-    let pos = posOverride
-    if (!pos) {
-      const used = new Set<string>()
-      for (const c of Object.values(snapRef.current.cards)) {
-        const col = Math.round(c.x / (CARD_W + GAP))
-        const row = Math.round((c.y - HEADER_OFFSET) / (CARD_H + GAP))
-        used.add(`${col},${row}`)
-      }
-      let col = 0, row = 0
-      while (used.has(`${col},${row}`)) {
-        col++
-        if (col >= COLS) { col = 0; row++ }
-      }
-      pos = { x: col * (CARD_W + GAP), y: HEADER_OFFSET + row * (CARD_H + GAP) }
-    }
-    snapRef.current.cards[tmux] = pos
-    persist()
-    setNodes((nds) => [...nds])
-  }, [persist, setNodes])
-
-  const makePaneNode = useCallback((tmux: string, x: number, y: number, w = 720, h = 480): Node<PaneNodeData, 'pane'> => ({
-    id: 'pane:' + tmux,
-    type: 'pane',
-    position: { x, y },
-    data: {
-      tmux,
-      jobRef: jobsByTmuxRef,
-      onClose: (t: string) => closePane(t),
-    },
-    style: { width: w, height: h },
-    zIndex: 50,
-    draggable: true,
-    selectable: true,
-  }), [])
-
-  const openPane = useCallback((tmux: string) => {
-    const paneId = 'pane:' + tmux
-    // Default position: a step away from the card so it doesn't fully cover it.
-    const card = snapRef.current.cards[tmux]
-    const stored = snapRef.current.panes?.[tmux]
-    const x = stored?.x ?? (card ? card.x + CARD_W + 40 : 200)
-    const y = stored?.y ?? (card ? card.y : 240)
-    const w = stored?.w ?? 720
-    const h = stored?.h ?? 480
-    if (!snapRef.current.panes) snapRef.current.panes = {}
-    snapRef.current.panes[tmux] = { x, y, w, h }
-    persist()
-    setNodes((nds) => nds.some((n) => n.id === paneId)
-      ? nds
-      : [...nds, makePaneNode(tmux, x, y, w, h)])
-    sendRef.current({ type: 'pane:open', tmux, x, y, w, h })
-  }, [persist, setNodes, makePaneNode])
-
-  const closePane = useCallback((tmux: string) => {
-    const paneId = 'pane:' + tmux
-    setNodes((nds) => nds.filter((n) => n.id !== paneId))
-    if (snapRef.current.panes) {
-      delete snapRef.current.panes[tmux]
-      persist()
-    }
-    sendRef.current({ type: 'pane:close', tmux })
-  }, [persist, setNodes])
-
-  const setExpanded = openPane
-
-  // ─── user node bindings (notes + links) ───
-  const updateNote = useCallback((id: string, text: string) => {
-    const u = snapRef.current.user.find((n) => n.id === id)
-    if (u) { u.data.text = text; persist() }
-    setNodes((nds) => nds.map((n) => n.id === id ? { ...n, data: { ...(n.data as any), text } } : n))
-    sendRef.current({ type: 'note:upsert', id, text })
-  }, [setNodes, persist])
-  const deleteUserNode = useCallback((id: string) => {
-    const u = snapRef.current.user.find((n) => n.id === id)
-    const kind = u?.type
-    snapRef.current.user = snapRef.current.user.filter((u) => u.id !== id)
-    persist()
-    setNodes((nds) => nds.filter((n) => n.id !== id))
-    sendRef.current({ type: (kind === 'link' ? 'link:delete' : 'note:delete'), id })
-  }, [setNodes, persist])
-
-  const makeNoteNode = useCallback((u: UserNode): Node<NoteData, 'note'> => ({
-    id: u.id,
-    type: 'note',
-    position: { x: u.x, y: u.y },
-    data: {
-      text: (u.data.text as string) ?? '',
-      onChange: (t: string) => updateNote(u.id, t),
-      onDelete: () => deleteUserNode(u.id),
-    },
-    style: { width: NOTE_W, height: NOTE_H },
-  }), [updateNote, deleteUserNode])
-
-  const makeTextNode = useCallback((u: UserNode, startEditing = false): Node<TextData, 'text'> => ({
-    id: u.id,
-    type: 'text',
-    position: { x: u.x, y: u.y },
-    data: {
-      text: (u.data.text as string) ?? '',
-      onChange: (t: string) => updateNote(u.id, t),
-      onDelete: () => deleteUserNode(u.id),
-      startEditing,
-    },
-  }), [updateNote, deleteUserNode])
-
-  const makeLinkNode = useCallback((u: UserNode): Node<LinkData, 'link'> => ({
-    id: u.id,
-    type: 'link',
-    position: { x: u.x, y: u.y },
-    data: {
-      url: u.data.url as string,
-      title: u.data.title as string,
-      variant: u.data.variant as LinkVariant,
-      image: u.data.image as string | undefined,
-      description: u.data.description as string | undefined,
-      site: u.data.site as string | undefined,
-      snippet: u.data.snippet as string | undefined,
-      onDelete: () => deleteUserNode(u.id),
-    },
-    style: { width: LINK_W, height: LINK_H },
-  }), [deleteUserNode])
-
-  const enrichLink = useCallback(async (u: UserNode) => {
-    const url = u.data.url as string
-    const variant = u.data.variant as LinkVariant
-    const updates: Partial<LinkData> = {}
-    if (variant === 'github-code' && !u.data.snippet) {
-      const snippet = await fetchGitHubSnippet(url)
-      if (snippet) updates.snippet = snippet
-    }
-    if (Object.keys(updates).length === 0) return
-    Object.assign(u.data, updates)
-    persist()
-    setNodes((nds) => nds.map((n) => n.id === u.id ? makeLinkNode(u) : n))
-    sendRef.current({ type: 'link:upsert', id: u.id, x: u.x, y: u.y, data: u.data })
-  }, [persist, setNodes, makeLinkNode])
-
-  // ─── card sync ───
-  // Keep a jobs lookup synced for pane nodes that read it lazily.
-  useEffect(() => {
-    jobsByTmuxRef.current = new Map(jobs.filter((j) => j.tmux).map((j) => [j.tmux, j]))
-  }, [jobs])
-
-  // Skip rebuilds while a drag is in flight. React Flow loses its internal
-  // drag tracking if the nodes prop is replaced mid-drag, which previously
-  // reverted card positions to their pre-drag values.
-  const draggingRef = useRef(false)
-  const [view, setView] = useState<'canvas' | 'list'>('canvas')
-  const [showSettings, setShowSettings] = useState<false | SectionId>(false)
+  const [tab, setTab] = useState<Tab>('sessions')
+  const [q, setQ] = useState('') // search, lives in the nav (GitHub-style)
+  const openSettings = useCallback((s: SectionId) => setTab(sectionToTab(s)), [])
   const [showCapture, setShowCapture] = useState(false)
-  // In list view, clicking a row opens this pane modal instead of a
-  // canvas node (which doesn't render in list mode).
+  const [showStats, setShowStats] = useState(false) // mobile: usage sidebar drawer
+  // Clicking a list row opens this session in a modal pane.
   const [listExpanded, setListExpanded] = useState<string | null>(null)
-  // Last-seen activity timestamp per tmux. Updated from the canvas WS;
-  // CardNode reads via ActivityContext for sub-poll-latency indicators.
+  // Last-seen activity timestamp per tmux. Updated from the events WS;
+  // ListRow reads via ActivityContext for sub-poll-latency indicators.
   const activityAtRef = useRef<Map<string, number>>(new Map())
   const [activityTick, setActivityTick] = useState(0)
   const activityCtx = useMemo(
@@ -631,565 +109,235 @@ function DashboardInner({ state: rawState, relay }: Props) {
     [activityTick],
   )
 
+  // Keep a jobs lookup synced for the pane modal that reads it lazily.
   useEffect(() => {
-    // Defer until the server snap arrives. Otherwise the first state poll
-    // races ahead with an empty snap, lays out cards on the default grid,
-    // and the saveSnap below clobbers the persisted positions.
-    if (!snapLoaded) return
-    if (draggingRef.current) return // see draggingRef comment above
-    setNodes((current) => {
-      const snap = snapRef.current
-      const haveCard = new Map<string, Node>()
-      for (const n of current) if (n.type === 'card') haveCard.set(n.id, n)
-      const live = new Set(jobs.filter((j) => j.tmux).map((j) => j.tmux))
+    jobsByTmuxRef.current = new Map(jobs.filter((j) => j.tmux).map((j) => [j.tmux, j]))
+  }, [jobs])
 
-      const result: Node[] = []
-      // Keep non-card nodes as-is.
-      for (const n of current) if (n.type !== 'card') result.push(n)
-      // Keep live card nodes — preserve React Flow's position (the user's
-      // last drag) verbatim. The rebuild effect MUST NOT touch snap.cards
-      // for live cards; that's the job of onNodeDragStop / onNodesChange.
-      for (const n of current) {
-        if (n.type !== 'card') continue
-        if (!live.has(n.id)) continue
-        const job = jobs.find((j) => j.tmux === n.id)!
-        result.push({
-          ...n,
-          data: { ...(n.data as CardData), job, setExpanded },
-        })
-      }
-      // Restore card nodes for sessions the operator has already placed.
-      // We deliberately do NOT auto-grid new cards onto the canvas —
-      // spawns land in the list view; the canvas only shows what the
-      // operator explicitly dragged or pinned there.
-      const newCards: Node[] = []
-      for (const j of jobs) {
-        if (!j.tmux || haveCard.has(j.tmux)) continue
-        const persisted = snap.cards[j.tmux]
-        if (!persisted) continue
-        newCards.push(makeCardNode(j, persisted, setExpanded))
-      }
-      // Prune cards whose sessions are gone — but only when we actually
-      // have a live jobs list. An empty jobs prop is the normal initial
-      // state (before /api/state has returned), and wiping snap.cards in
-      // that window caused the next poll to lay everything out on the
-      // default grid and overwrite the persisted layout.
-      if (jobs.length > 0) {
-        for (const id of Object.keys(snap.cards)) {
-          if (!live.has(id)) delete snap.cards[id]
-        }
-      }
-      // Drop edges that reference sessions that are gone.
-      const validIds = new Set([...live, ...snap.user.map((u) => u.id)])
-      const prunedEdges = snap.edges.filter((e) => validIds.has(e.source) && validIds.has(e.target))
-      if (prunedEdges.length !== snap.edges.length) {
-        snap.edges = prunedEdges
-        setEdges(prunedEdges)
-      }
-      // User nodes (notes/links/text) live in current already; if none, rehydrate.
-      if (!current.some((n) => n.type === 'note' || n.type === 'link' || n.type === 'text')) {
-        for (const u of snap.user) {
-          if (u.type === 'note') result.push(makeNoteNode(u))
-          else if (u.type === 'link') result.push(makeLinkNode(u))
-          else if (u.type === 'text') result.push(makeTextNode(u))
-        }
-      }
-      // Pane windows — restore from snap if none present.
-      if (!current.some((n) => n.type === 'pane')) {
-        for (const [tmux, p] of Object.entries(snap.panes ?? {})) {
-          if (!live.has(tmux)) continue
-          result.push(makePaneNode(tmux, p.x, p.y, p.w, p.h))
-        }
-      }
-      result.push(...newCards)
-      // Persist only when the rebuild actually mutated snap.cards (new
-      // cards placed, dead ones pruned). Saving on every poll spams PUTs
-      // and was racing user drags.
-      if (newCards.length > 0) saveSnap(snap)
-      return result
+  // Subscribe to the events WS for realtime `activity` pings so a session
+  // flips to "working" immediately instead of waiting for the next poll.
+  useEffect(() => {
+    if (!bus) return
+    return bus.subscribe((msg: any) => {
+      if (msg?.type !== 'activity') return
+      const tmux = msg.tmux as string
+      if (!tmux) return
+      activityAtRef.current.set(tmux, Date.now())
+      setActivityTick((t) => t + 1)
     })
-  }, [jobs, snapLoaded, setNodes, setExpanded, makeNoteNode, makeLinkNode, makeTextNode, makePaneNode])
-
-  const onEdgesChange = useCallback((changes: EdgeChange[]) => {
-    setEdges((eds) => {
-      const next = applyEdgeChanges(changes, eds)
-      snapRef.current.edges = next
-      persist()
-      return next
-    })
-    for (const ch of changes) {
-      if (ch.type === 'remove') sendRef.current({ type: 'edge:remove', id: ch.id })
-    }
-  }, [setEdges, persist])
-
-  const buildEdge = (conn: Connection): Edge => ({
-    ...conn,
-    id: `e_${conn.source}_${conn.target}_${newId()}`,
-    type: 'smoothstep',
-    animated: false,
-    selectable: true,
-    focusable: true,
-    deletable: true,
-    interactionWidth: 24,
-    markerEnd: { type: MarkerType.ArrowClosed, color: '#a78bfa', width: 18, height: 18 },
-    style: { stroke: '#a78bfa', strokeWidth: 1.6 },
-    label: 'then',
-    labelStyle: { fontSize: 10, fontFamily: 'ui-monospace, monospace', fill: '#7c3aed' },
-    labelBgStyle: { fill: '#faf5ff' },
-    labelBgPadding: [4, 2] as [number, number],
-    labelBgBorderRadius: 4,
-  })
-
-  const applyEdgeAdd = useCallback((edge: Edge) => {
-    setEdges((eds) => {
-      if (eds.some((e) => e.id === edge.id)) return eds
-      const next = [...eds, edge]
-      snapRef.current.edges = next
-      persist()
-      return next
-    })
-  }, [setEdges, persist])
-
-  const onConnect = useCallback((conn: Connection) => {
-    if (!conn.source || !conn.target || conn.source === conn.target) return
-    const edge = buildEdge(conn)
-    applyEdgeAdd(edge)
-    sendRef.current({ type: 'edge:add', edge })
-  }, [applyEdgeAdd])
-
-  const onNodesChange = useCallback((changes: NodeChange[]) => {
-    setNodes((nds) => applyNodeChanges(changes, nds))
-    for (const ch of changes) {
-      if (ch.type === 'position' && ch.position) {
-        const id = ch.id
-        const pos = ch.position
-        if (snapRef.current.cards[id]) {
-          snapRef.current.cards[id] = pos
-        } else if (id.startsWith('pane:')) {
-          const tmux = id.slice(5)
-          if (!snapRef.current.panes) snapRef.current.panes = {}
-          const prev = snapRef.current.panes[tmux] ?? { w: 720, h: 480, x: 0, y: 0 }
-          snapRef.current.panes[tmux] = { ...prev, x: pos.x, y: pos.y }
-        } else {
-          const u = snapRef.current.user.find((n) => n.id === id)
-          if (u) { u.x = pos.x; u.y = pos.y }
-        }
-        persist()
-        sendRef.current({ type: 'node:move', id, x: pos.x, y: pos.y })
-      }
-      if (ch.type === 'dimensions' && ch.dimensions && (ch.id.startsWith('pane:'))) {
-        const tmux = ch.id.slice(5)
-        if (!snapRef.current.panes) snapRef.current.panes = {}
-        const prev = snapRef.current.panes[tmux] ?? { x: 0, y: 0, w: 720, h: 480 }
-        snapRef.current.panes[tmux] = { ...prev, w: ch.dimensions.width, h: ch.dimensions.height }
-        persist()
-        sendRef.current({ type: 'pane:resize', tmux, w: ch.dimensions.width, h: ch.dimensions.height })
-      }
-      if (ch.type === 'remove') {
-        const id = ch.id
-        const userIdx = snapRef.current.user.findIndex((u) => u.id === id)
-        if (userIdx >= 0) {
-          const kind = snapRef.current.user[userIdx].type
-          snapRef.current.user.splice(userIdx, 1)
-          persist()
-          sendRef.current({ type: kind === 'link' ? 'link:delete' : 'note:delete', id })
-        }
-      }
-    }
-  }, [setNodes, persist])
-
-  // ─── add text ───
-  const rf = useReactFlow()
-  const addTextAt = useCallback((screenX: number, screenY: number) => {
-    const pos = rf.screenToFlowPosition({ x: screenX, y: screenY })
-    const id = newId()
-    const u: UserNode = { type: 'text', id, x: pos.x, y: pos.y, data: { text: '' } }
-    snapRef.current.user.push(u)
-    persist()
-    setNodes((nds) => [...nds, makeTextNode(u, true)])
-    setTool('select')
-    sendRef.current({ type: 'note:upsert', kind: 'text', id, x: pos.x, y: pos.y, text: '' })
-  }, [rf, persist, setNodes, makeTextNode, setTool])
-
-  // ─── add note ───
-  const addNote = useCallback(() => {
-    const id = newId()
-    // Place near current viewport center.
-    const r = containerRef.current?.getBoundingClientRect()
-    const x = ((r?.width ?? 800) / 2 - 110) - 0
-    const y = HEADER_OFFSET + 40
-    const u: UserNode = { type: 'note', id, x, y, data: { text: '' } }
-    snapRef.current.user.push(u)
-    persist()
-    setNodes((nds) => [...nds, makeNoteNode(u)])
-    setTool('select')
-    sendRef.current({ type: 'note:upsert', id, x, y, text: '' })
-  }, [persist, setNodes, makeNoteNode, setTool])
-
-  // ─── paste handler ───
-  useEffect(() => {
-    const onPaste = (e: ClipboardEvent) => {
-      // Ignore pastes targeting form fields.
-      const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return
-      const text = e.clipboardData?.getData('text/plain')?.trim()
-      if (!text) return
-      if (!/^https?:\/\//i.test(text)) return
-      e.preventDefault()
-      const { variant, title, image } = detectVariant(text)
-      const id = newId()
-      const r = containerRef.current?.getBoundingClientRect()
-      const x = ((r?.width ?? 800) / 2 - 140)
-      const y = HEADER_OFFSET + 60
-      const u: UserNode = {
-        type: 'link', id, x, y,
-        data: { url: text, variant, title, ...(image ? { image } : {}) },
-      }
-      snapRef.current.user.push(u)
-      persist()
-      setNodes((nds) => [...nds, makeLinkNode(u)])
-      enrichLink(u)
-      sendRef.current({ type: 'link:upsert', id, x, y, data: u.data })
-    }
-    document.addEventListener('paste', onPaste)
-    return () => document.removeEventListener('paste', onPaste)
-  }, [persist, setNodes, makeLinkNode, enrichLink])
-
-  // Enrich any restored link nodes that don't yet have og/snippet data.
-  useEffect(() => {
-    for (const u of snapRef.current.user) {
-      if (u.type !== 'link') continue
-      const variant = u.data.variant as LinkVariant
-      if ((variant === 'github-code' && !u.data.snippet) || (variant !== 'youtube' && !u.data.image)) {
-        enrichLink(u)
-      }
-    }
-    // intentionally only run on mount
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  // ─── collab receive — apply remote ops to local state ───
-  const handleRemote = useCallback((msg: any) => {
-    switch (msg.type) {
-      case 'activity': {
-        const tmux = msg.tmux as string
-        if (!tmux) break
-        activityAtRef.current.set(tmux, Date.now())
-        setActivityTick((t) => t + 1)
-        break
-      }
-      case 'node:move': {
-        const id = msg.id as string
-        const x = msg.x as number
-        const y = msg.y as number
-        if (typeof x !== 'number' || typeof y !== 'number') break
-        if (snapRef.current.cards[id]) {
-          snapRef.current.cards[id] = { x, y }
-        } else {
-          const u = snapRef.current.user.find((n) => n.id === id)
-          if (u) { u.x = x; u.y = y }
-        }
-        persist()
-        setNodes((nds) => nds.map((n) => n.id === id ? { ...n, position: { x, y } } : n))
-        break
-      }
-      case 'edge:add':
-        if (msg.edge) applyEdgeAdd(msg.edge as Edge)
-        break
-      case 'edge:remove':
-        if (msg.id) {
-          setEdges((eds) => {
-            const next = eds.filter((e) => e.id !== msg.id)
-            if (next.length === eds.length) return eds
-            snapRef.current.edges = next
-            persist()
-            return next
-          })
-        }
-        break
-      case 'pane:open': {
-        const tmux = msg.tmux as string
-        if (!tmux) break
-        const x = (msg.x as number) ?? 200
-        const y = (msg.y as number) ?? 240
-        const w = (msg.w as number) ?? 720
-        const h = (msg.h as number) ?? 480
-        if (!snapRef.current.panes) snapRef.current.panes = {}
-        snapRef.current.panes[tmux] = { x, y, w, h }
-        persist()
-        const paneId = 'pane:' + tmux
-        setNodes((nds) => nds.some((n) => n.id === paneId)
-          ? nds
-          : [...nds, makePaneNode(tmux, x, y, w, h)])
-        break
-      }
-      case 'pane:close': {
-        const tmux = msg.tmux as string
-        if (!tmux) break
-        if (snapRef.current.panes) {
-          delete snapRef.current.panes[tmux]
-          persist()
-        }
-        const paneId = 'pane:' + tmux
-        setNodes((nds) => nds.filter((n) => n.id !== paneId))
-        break
-      }
-      case 'pane:resize': {
-        const tmux = msg.tmux as string
-        const w = msg.w as number, h = msg.h as number
-        if (!tmux || typeof w !== 'number' || typeof h !== 'number') break
-        if (!snapRef.current.panes) snapRef.current.panes = {}
-        const prev = snapRef.current.panes[tmux] ?? { x: 0, y: 0, w: 720, h: 480 }
-        snapRef.current.panes[tmux] = { ...prev, w, h }
-        persist()
-        const paneId = 'pane:' + tmux
-        setNodes((nds) => nds.map((n) => n.id === paneId
-          ? { ...n, style: { ...n.style, width: w, height: h } } : n))
-        break
-      }
-      case 'note:upsert': {
-        const id = msg.id as string
-        const text = (msg.text ?? '') as string
-        const kind = (msg.kind === 'text' ? 'text' : 'note') as 'text' | 'note'
-        let u = snapRef.current.user.find((n) => n.id === id)
-        if (!u) {
-          u = { type: kind, id, x: msg.x as number, y: msg.y as number, data: { text } }
-          snapRef.current.user.push(u)
-          setNodes((nds) => nds.some((n) => n.id === id) ? nds : [
-            ...nds,
-            kind === 'text' ? makeTextNode(u!) : makeNoteNode(u!),
-          ])
-        } else {
-          u.data.text = text
-          setNodes((nds) => nds.map((n) => n.id === id
-            ? { ...n, data: { ...(n.data as any), text } } : n))
-        }
-        persist()
-        break
-      }
-      case 'note:delete':
-      case 'link:delete': {
-        const id = msg.id as string
-        snapRef.current.user = snapRef.current.user.filter((u) => u.id !== id)
-        persist()
-        setNodes((nds) => nds.filter((n) => n.id !== id))
-        break
-      }
-      case 'link:upsert': {
-        const id = msg.id as string
-        const data = (msg.data ?? {}) as Record<string, unknown>
-        let u = snapRef.current.user.find((n) => n.id === id)
-        if (!u) {
-          u = { type: 'link', id, x: msg.x as number, y: msg.y as number, data }
-          snapRef.current.user.push(u)
-          setNodes((nds) => nds.some((n) => n.id === id) ? nds : [...nds, makeLinkNode(u!)])
-        } else {
-          Object.assign(u.data, data)
-          setNodes((nds) => nds.map((n) => n.id === id ? makeLinkNode(u!) : n))
-        }
-        persist()
-        break
-      }
-    }
-  }, [applyEdgeAdd, setNodes, setEdges, persist, makeNoteNode, makeLinkNode, makeTextNode, makePaneNode])
-
-  const { cursors, sendCursor, send } = useCollabSocket({ onMessage: handleRemote, transport: bus })
-  useEffect(() => { sendRef.current = send }, [send])
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (tool !== 'select') { setTool('select'); return }
-        setNodes((nds) => {
-          if (!nds.some((n) => n.type === 'pane')) return nds
-          // Close all open pane windows on Escape.
-          return nds.filter((n) => n.type !== 'pane')
-        })
-      }
-      if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return
-      if (e.key === 'v') setTool('select')
-      if (e.key === 'r') setTool('box')
-      if (e.key === 't') setTool('text')
-      if (e.key === 'n') addNote()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [tool, setExpanded, addNote])
+  }, [bus])
 
   return (
     <ActivityContext.Provider value={activityCtx}>
-    <div ref={containerRef} className="relative h-screen w-screen">
-      {!showSettings && !showCapture && (
-        <Header
-          inbox={inbox}
-          count={jobs.length}
-          quota={state.quota}
-          governor={state.governor}
-          view={view}
-          setView={(v) => {
-            setView(v)
-            snapRef.current.view = v
-            persist()
-          }}
-          onOpenSettings={() => setShowSettings('orch')}
-          onOpenCapture={() => setShowCapture(true)}
-        />
-      )}
-      {!showSettings && !showCapture && (
-        <WarningStack
-          stateLoaded={state.connect !== undefined}
-          githubConnected={!!state.connect?.github.connected}
-          inbox={state.inbox}
-          openSettings={(s) => setShowSettings(s)}
-        />
-      )}
-      {showSettings && <SettingsPage jobs={jobs} state={state} relay={relay} initialSection={showSettings} onClose={() => setShowSettings(false)} />}
+    <div className="min-h-screen w-full overflow-x-hidden flex flex-col bg-zinc-50 dark:bg-zinc-950">
+      <TopBar
+        count={jobs.filter((j) => !j.closed_state).length}
+        vmCount={(state.vms ?? []).length}
+        intgCount={(state.connect?.github.connected ? 1 : 0) + Object.values(state.agents ?? {}).filter((m) => m?.quota).length}
+        tab={tab}
+        setTab={setTab}
+        q={q}
+        setQ={setQ}
+        onOpenCapture={() => setShowCapture(true)}
+        onToggleStats={() => setShowStats((v) => !v)}
+      />
+      <div className="flex items-start">
+        {tab !== 'sessions' ? (
+          <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)]">
+            <SettingsPage key={tab} jobs={jobs} state={state} relay={relay} initialSection={TAB_SECTION[tab]} onClose={() => setTab('sessions')} />
+          </div>
+        ) : (
+          <>
+            <div className="flex-1 min-w-0 flex flex-col p-3 sm:p-6 lg:px-[4em] lg:py-[2.5em]">
+              <WarningStack
+                stateLoaded={state.connect !== undefined}
+                githubConnected={!!state.connect?.github.connected}
+                inbox={state.inbox}
+                openSettings={openSettings}
+              />
+              {/* L/R 4em gutters (no top/bottom); bordered container, sidebar bg, no radius. */}
+              <div className="rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-800 bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
+                <ListView jobs={jobs} q={q} onOpen={(t) => setListExpanded(t)} />
+              </div>
+            </div>
+            <Sidebar state={state} open={showStats} onClose={() => setShowStats(false)} />
+          </>
+        )}
+      </div>
       {showCapture && <CapturePage jobs={jobs} inbox={inbox} onClose={() => setShowCapture(false)} />}
-      {view === 'canvas' && !showSettings && !showCapture && (
-        <FloatingToolbar tool={tool} setTool={setTool} addNote={addNote} />
-      )}
-      {view === 'canvas' && !showSettings && !showCapture && (
-        <SessionPalette
-          jobs={jobs}
-          pinned={snapRef.current.cards}
-          onPin={(tmux) => {
-            // Convert the viewport's screen-space centre into flow
-            // coords, then subtract half the card size in flow space
-            // (subtracting in screen space picks up the zoom factor
-            // and the card lands off-camera).
-            const r = containerRef.current?.getBoundingClientRect()
-            let pos: { x: number; y: number } | undefined
-            if (r) {
-              const c = rf.screenToFlowPosition({
-                x: r.left + r.width / 2,
-                y: r.top + r.height / 2,
-              })
-              pos = { x: c.x - CARD_W / 2, y: c.y - CARD_H / 2 }
-            }
-            pinToCanvas(tmux, pos)
-          }}
-        />
-      )}
-      {view === 'canvas' && !showSettings && !showCapture && (
-        <CollabLayer cursors={cursors} sendCursor={sendCursor} containerRef={containerRef} />
-      )}
-      {view === 'list' && (
-        <ListView jobs={jobs} onOpen={(t) => setListExpanded(t)} onPin={pinToCanvas} pinned={snapRef.current.cards} />
-      )}
-      {view === 'list' && listExpanded && (
+      {listExpanded && (
         <PaneModal tmux={listExpanded} jobsByTmuxRef={jobsByTmuxRef} onClose={() => setListExpanded(null)} />
       )}
-      {view === 'canvas' && <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={nodeTypes}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
-        onPaneClick={(e) => {
-          if (tool === 'text') {
-            addTextAt(e.clientX, e.clientY)
-            return
-          }
-          // Double-click on empty canvas opens the Capture modal —
-          // primary entry point for filing a new issue. Single-click is
-          // a no-op so panning still feels natural.
-          if (tool === 'select') {
-            const now = Date.now()
-            const isDouble = now - lastPaneClickRef.current < 400
-            lastPaneClickRef.current = now
-            if (isDouble) setShowCapture(true)
-          }
-        }}
-        onNodeDragStart={() => {
-          draggingRef.current = true
-        }}
-        onNodeDragStop={(_e, node) => {
-          draggingRef.current = false
-          const id = node.id
-          const pos = node.position
-          if (snapRef.current.cards[id]) {
-            snapRef.current.cards[id] = { x: pos.x, y: pos.y }
-          } else if (id.startsWith('pane:')) {
-            const tmux = id.slice(5)
-            if (!snapRef.current.panes) snapRef.current.panes = {}
-            const prev = snapRef.current.panes[tmux] ?? { w: 720, h: 480, x: 0, y: 0 }
-            snapRef.current.panes[tmux] = { ...prev, x: pos.x, y: pos.y }
-          } else {
-            const u = snapRef.current.user.find((n) => n.id === id)
-            if (u) { u.x = pos.x; u.y = pos.y }
-          }
-          persist()
-          sendRef.current({ type: 'node:move', id, x: pos.x, y: pos.y })
-        }}
-        selectionOnDrag={tool === 'box'}
-        selectionMode={'partial' as any}
-        onMoveEnd={(_e, viewport) => {
-          snapRef.current.viewport = viewport
-          persist()
-        }}
-        proOptions={{ hideAttribution: true }}
-        panOnDrag={tool === 'select' ? true : (tool === 'box' ? [1, 2] : false)}
-        nodesDraggable={tool === 'select' || tool === 'box'}
-        panOnScroll={false}
-        zoomOnScroll
-        zoomOnPinch
-        zoomOnDoubleClick={false}
-        minZoom={0.25}
-        maxZoom={2}
-        nodesConnectable={tool === 'select'}
-        nodesFocusable
-        edgesFocusable
-        elementsSelectable
-        deleteKeyCode={['Backspace', 'Delete']}
-        defaultViewport={snapRef.current.viewport ?? { x: 0, y: 0, zoom: 1 }}
-        fitView={false}
-      >
-        <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="#d4d4d8" />
-      </ReactFlow>}
     </div>
     </ActivityContext.Provider>
   )
 }
 
-function Header({
-  count, quota, governor, view, setView, onOpenSettings, onOpenCapture,
-}: {
-  inbox: string; count: number
-  quota?: State['quota']
-  governor?: State['governor']
-  view: 'canvas' | 'list'; setView: (v: 'canvas' | 'list') => void
-  onOpenSettings: () => void
-  onOpenCapture: () => void
-}) {
-  // Stop pointer events on the entire header row so clicks on the title /
-  // toggle / link don't bubble through to the ReactFlow pane behind it.
+/// Right-hand telemetry sidebar: the per-agent usage + governor strips (claude,
+/// codex, …) given room to breathe, a live VM list, and the orchid line-art
+/// anchored at the bottom edge. The strips are the same QuotaStrip the navbar
+/// used — just stacked vertically as the page's persistent ops column. Hidden
+/// below lg so the canvas keeps the full width on narrow screens.
+function Sidebar({ state, open, onClose }: { state: State; open: boolean; onClose: () => void }) {
+  const agents = state.agents ?? {}
+  // claude first, then any other agents (codex…), only those with a reading.
+  const order = ['claude', ...Object.keys(agents).filter((a) => a !== 'claude')]
+  const present = order.filter((a) => agents[a]?.quota || agents[a]?.governor)
   return (
-    <div className="fixed top-0 inset-x-0 z-40 pointer-events-none">
-      <div className="px-4 sm:px-8 pt-4 sm:pt-6 flex flex-col gap-3">
-        <div
-          className="pointer-events-auto flex flex-wrap items-baseline gap-x-3 gap-y-2"
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <h1 className="serif text-[32px] sm:text-[44px] font-medium leading-none text-zinc-900 dark:text-zinc-100 italic">
-            Orchid
-          </h1>
-          <span className="mono text-[12px] text-zinc-400 dark:text-zinc-500">{count}</span>
-          {quota && (
-            <div className="hidden sm:block">
-              <QuotaStrip quota={quota} governor={governor} />
+    <>
+      {/* mobile backdrop when the drawer is open */}
+      <div
+        className={'fixed inset-0 z-40 bg-black/40 lg:hidden transition-opacity ' + (open ? 'opacity-100' : 'opacity-0 pointer-events-none')}
+        onClick={onClose}
+        aria-hidden
+      />
+      <aside
+        className={
+          'flex flex-col w-[86vw] max-w-sm h-full overflow-hidden border-l border-zinc-200 dark:border-zinc-800 bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur ' +
+          // mobile: off-canvas drawer (fixed, full height). desktop: a full-height
+          // column (bg + border run all the way down via self-stretch); a sticky
+          // inner keeps the telemetry + art in view while the page scrolls.
+          'fixed inset-y-0 right-0 z-50 shadow-2xl transition-transform lg:static lg:self-stretch lg:overflow-visible lg:z-0 lg:w-80 lg:max-w-none lg:shadow-none lg:translate-x-0 lg:flex-shrink-0 ' +
+          (open ? 'translate-x-0' : 'translate-x-full lg:translate-x-0')
+        }
+      >
+      <div className="relative flex flex-col h-full overflow-hidden lg:sticky lg:top-[93px] lg:h-[calc(100vh-93px)]">
+      <button
+        className="lg:hidden absolute top-3 right-3 z-20 w-7 h-7 flex items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-700/60"
+        onClick={onClose}
+        aria-label="Close usage panel"
+      >
+        ✕
+      </button>
+      <div className="flex-1 overflow-y-auto px-4 py-5 flex flex-col gap-5 z-10">
+        <h2 className="mono text-[10px] uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">
+          Usage &amp; pacing
+        </h2>
+        {present.length === 0 && (
+          <div className="text-[12px] text-zinc-500 dark:text-zinc-400">No quota reading yet…</div>
+        )}
+        {present.map((a) => {
+          const m = agents[a]!
+          return m.quota ? (
+            <QuotaStrip key={a} quota={m.quota} governor={m.governor} label={a} stacked />
+          ) : null
+        })}
+
+        <div className="border-t border-zinc-200 dark:border-zinc-800 pt-4 flex flex-col gap-2">
+          <h2 className="mono text-[10px] uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">
+            VMs
+          </h2>
+          {state.vms.map((vm) => (
+            <div key={vm.name} className="flex items-center gap-2 text-[12px]">
+              <span
+                className={
+                  'w-1.5 h-1.5 rounded-full flex-shrink-0 ' +
+                  (vm.online === false ? 'bg-zinc-400 dark:bg-zinc-600' : 'bg-emerald-500')
+                }
+                title={vm.online === false ? 'offline' : 'online'}
+              />
+              <span className="mono text-zinc-700 dark:text-zinc-300 flex-1 truncate">{vm.name}</span>
+              {vm.agent && vm.agent !== 'claude' && (
+                <span className="mono text-[10px] px-1 rounded bg-zinc-200/70 dark:bg-zinc-700/70 text-zinc-500 dark:text-zinc-400">
+                  {vm.agent}
+                </span>
+              )}
+              <span className="mono text-zinc-500 dark:text-zinc-400 tabular-nums">
+                {vm.used}/{vm.capacity || '∞'}
+              </span>
             </div>
-          )}
-          <div className="flex-1" />
-          <HeaderBtnBar>
-            <ViewToggle view={view} setView={setView} />
-            <SettingsButton onClick={onOpenSettings} />
-            <ThemeToggle />
-            <LogoutButton />
-          </HeaderBtnBar>
+          ))}
         </div>
       </div>
+      <OrchidArt
+        posClassName="absolute right-0 bottom-0 z-0"
+        width="460px"
+        height="460px"
+        opacity={0.14}
+        bleed={0}
+        maskStart={30}
+        maskEnd={92}
+        transform="translate(22%, 22%)"
+      />
+      </div>
+      </aside>
+    </>
+  )
+}
+
+function TopBar({
+  count, vmCount, intgCount, tab, setTab, q, setQ, onOpenCapture, onToggleStats,
+}: {
+  count: number
+  vmCount: number
+  intgCount: number
+  tab: Tab
+  setTab: (t: Tab) => void
+  q: string
+  setQ: (s: string) => void
+  onOpenCapture: () => void
+  onToggleStats: () => void
+}) {
+  const tabs: { id: Tab; label: string; count?: number }[] = [
+    { id: 'sessions', label: 'Sessions', count },
+    { id: 'machines', label: 'Machines', count: vmCount },
+    { id: 'analytics', label: 'Analytics' },
+    { id: 'integrations', label: 'Integrations', count: intgCount },
+    { id: 'settings', label: 'Settings' },
+  ]
+  return (
+    <div className="flex-shrink-0 sticky top-0 z-40 border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950">
+      {/* Row 1: logo · search (GitHub-style) · actions */}
+      <div className="flex items-center gap-4 h-12 px-4 sm:px-6">
+        <img src="/favicon.svg" alt="Orchid" className="w-6 h-6 flex-shrink-0" />
+        <div className="hidden sm:block flex-1" />
+        <div className="relative flex-1 max-w-none sm:max-w-md">
+          <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400" width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+            <circle cx="11" cy="11" r="7" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search title, repo, #issue…"
+            className="w-full pl-9 sm:pl-8 pr-2 py-2.5 sm:py-1.5 text-[16px] sm:text-[12.5px] rounded-lg sm:rounded-md bg-zinc-100/70 dark:bg-zinc-800/60 border border-transparent focus:border-zinc-300 dark:focus:border-zinc-600 focus:bg-white dark:focus:bg-zinc-900 outline-none text-zinc-800 dark:text-zinc-200 placeholder:text-zinc-400"
+          />
+        </div>
+        <button
+          className="lg:hidden w-7 h-7 rounded-md flex items-center justify-center transition-colors text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-800 dark:hover:text-zinc-100"
+          onClick={onToggleStats}
+          aria-label="Usage & pacing"
+          title="Usage & pacing"
+        >
+          <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.9} strokeLinecap="round" strokeLinejoin="round">
+            <line x1="6" y1="20" x2="6" y2="12" /><line x1="12" y1="20" x2="12" y2="4" /><line x1="18" y1="20" x2="18" y2="14" />
+          </svg>
+        </button>
+        <HeaderBtnBar>
+          <CaptureButton onClick={onOpenCapture} />
+          <ThemeToggle />
+          <LogoutButton />
+        </HeaderBtnBar>
+      </div>
+      {/* Row 2: tabs (underline, GitHub-style) */}
+      <nav className="flex items-stretch h-11 px-2 sm:px-4 -mb-px">
+        {tabs.map((t) => {
+          const on = tab === t.id
+          return (
+            <button
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              className={
+                'relative h-full px-3.5 flex items-center gap-2 text-[14px] transition-colors ' +
+                (on ? 'text-zinc-900 dark:text-zinc-50 font-semibold' : 'text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-zinc-50')
+              }
+            >
+              {t.label}
+              {t.count != null && <span className="mono text-[11px] px-1.5 py-0.5 rounded-full bg-zinc-200/80 dark:bg-zinc-700/70 text-zinc-600 dark:text-zinc-300 tabular-nums">{t.count}</span>}
+              {on && <span className="absolute -bottom-px inset-x-1.5 h-0.5 rounded-full bg-zinc-900 dark:bg-zinc-100" />}
+            </button>
+          )
+        })}
+      </nav>
     </div>
   )
 }
@@ -1204,7 +352,7 @@ function Header({
 /// bar gets a pace-target marker (where usage *should* be by now) and
 /// the strip drives its coloring + a status chip off the authoritative
 /// server mode rather than the local elapsed-time heuristic.
-function QuotaStrip({ quota, governor }: { quota: NonNullable<State['quota']>; governor?: State['governor'] }) {
+function QuotaStrip({ quota, governor, label, stacked }: { quota: NonNullable<State['quota']>; governor?: State['governor']; label?: string; stacked?: boolean }) {
   const now = Math.floor(Date.now() / 1000)
   const thr = quota.throttle
   const fmt = (secs: number) => {
@@ -1235,7 +383,7 @@ function QuotaStrip({ quota, governor }: { quota: NonNullable<State['quota']>; g
       hot === 'red' ? 'bg-rose-500' : hot === 'amber' ? 'bg-amber-500' : 'bg-emerald-500/80 dark:bg-emerald-400/80'
     return (
       <div className="flex items-center gap-1.5">
-        <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500 w-[18px]">{label}</span>
+        <span className="mono text-[10px] text-zinc-500 dark:text-zinc-400 w-[18px]">{label}</span>
         <div className={'relative h-1.5 w-20 rounded-full overflow-hidden ' + trackColor}>
           <div className={'absolute inset-y-0 left-0 ' + fillColor} style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} />
           {targetPct !== undefined && (
@@ -1247,7 +395,7 @@ function QuotaStrip({ quota, governor }: { quota: NonNullable<State['quota']>; g
           )}
         </div>
         <span className="mono text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">{Math.round(pct)}%</span>
-        <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500">{fmt(resets - now)}</span>
+        <span className="mono text-[10px] text-zinc-500 dark:text-zinc-400">{fmt(resets - now)}</span>
       </div>
     )
   }
@@ -1272,11 +420,60 @@ function QuotaStrip({ quota, governor }: { quota: NonNullable<State['quota']>; g
     }
   }
   let title =
-    'Claude subscription usage: 5-hour session window and 7-day cap. Amber = burning faster than elapsed time would sustain.'
+    (label ? `${label} usage` : 'Claude subscription usage') +
+    ': 5-hour session window and 7-day cap. Amber = burning faster than elapsed time would sustain.'
+  if (quota.plan_type) title += `\nplan: ${quota.plan_type}`
+  if (quota.credits != null) title += `\ncredits: $${quota.credits.toFixed(2)}`
   if (thr) {
     if (thr.reason) title += `\n${thr.reason}`
     if (thr.projected_exhaust_at) title += `\nexhausts in ${fmt(thr.projected_exhaust_at - now)} at current burn`
   }
+  const bars = (
+    <>
+      {bar('5h', quota.five_hour_pct, quota.five_hour_resets_at, 5 * 3600)}
+      {bar('7d', quota.seven_day_pct, quota.seven_day_resets_at, 7 * 24 * 3600, {
+        hot: sevenHot,
+        targetPct: thr?.target_pct,
+      })}
+    </>
+  )
+  const chipEl = chip && (
+    <span className={'mono text-[10px] px-1.5 py-0.5 rounded-full whitespace-nowrap ' + chip.cls}>{chip.text}</span>
+  )
+  const govEl = governor?.enabled && <GovernorStrip gov={governor} />
+
+  if (stacked) {
+    // Two columns: logo + label + bars on the left, the weekly % as a big
+    // glance number filling the right-center free area (amber when over-pace).
+    return (
+      <div
+        className="pointer-events-auto w-full flex items-center gap-3 bg-white/70 dark:bg-zinc-900/70 ring-1 ring-zinc-200 dark:ring-zinc-700 rounded-lg px-3 py-3"
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+        title={title}
+      >
+        <div className="flex-1 min-w-0 flex flex-col gap-2">
+          <div className="flex items-center gap-1.5">
+            <AgentLogo account={label ?? 'claude'} size={15} className="text-zinc-700 dark:text-zinc-200 flex-shrink-0" />
+            <span className="mono text-[12px] text-zinc-600 dark:text-zinc-300 truncate">{label}</span>
+            {quota.plan_type && (
+              <span className="mono text-[9px] px-1 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 whitespace-nowrap">{quota.plan_type}</span>
+            )}
+          </div>
+          <div className="flex flex-col gap-1.5">{bars}</div>
+          {(chipEl || govEl) && <div className="flex flex-wrap items-center gap-2">{chipEl}{govEl}</div>}
+        </div>
+        <div className="flex flex-col items-center justify-center flex-shrink-0 leading-none px-1">
+          <span className={'mono font-semibold tabular-nums tracking-tight text-[32px] ' + (sevenHot === 'red' ? 'text-rose-500' : sevenHot ? 'text-amber-500' : 'text-zinc-900 dark:text-zinc-100')}>
+            {Math.round(quota.seven_day_pct)}
+            <span className="text-[14px] font-normal text-zinc-500 dark:text-zinc-400">%</span>
+          </span>
+          <span className="mono text-[9px] uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400 mt-1">7d</span>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div
       className="pointer-events-auto ml-3 flex items-center gap-3 bg-white/80 dark:bg-zinc-900/80 backdrop-blur ring-1 ring-zinc-200 dark:ring-zinc-700 rounded-md px-2.5 py-1"
@@ -1284,15 +481,14 @@ function QuotaStrip({ quota, governor }: { quota: NonNullable<State['quota']>; g
       onClick={(e) => e.stopPropagation()}
       title={title}
     >
-      {bar('5h', quota.five_hour_pct, quota.five_hour_resets_at, 5 * 3600)}
-      {bar('7d', quota.seven_day_pct, quota.seven_day_resets_at, 7 * 24 * 3600, {
-        hot: sevenHot,
-        targetPct: thr?.target_pct,
-      })}
-      {chip && (
-        <span className={'mono text-[10px] px-1.5 py-0.5 rounded-full whitespace-nowrap ' + chip.cls}>{chip.text}</span>
+      {label && (
+        <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 whitespace-nowrap">
+          {label}
+        </span>
       )}
-      {governor?.enabled && <GovernorStrip gov={governor} />}
+      {bars}
+      {chipEl}
+      {govEl}
     </div>
   )
 }
@@ -1318,11 +514,10 @@ function GovernorStrip({ gov }: { gov: NonNullable<State['governor']> }) {
     `burn ${burn.toFixed(1)}%/h ${over ? '>' : '≤'} target ${target.toFixed(1)}%/h (binding ${gov.binding || 'weekly'})\n` +
     `projected end-of-week ${gov.projected_end_pct.toFixed(0)}% vs 92% ceiling`
   return (
-    <div className="flex items-center gap-1.5 pl-2 border-l border-zinc-200 dark:border-zinc-700" title={title}>
-      <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500">gov</span>
+    <div className="flex items-center gap-1.5" title={title}>
       <span className="mono text-[10px] text-zinc-600 dark:text-zinc-300 tabular-nums">
         cap {capLabel}
-        <span className="text-zinc-400 dark:text-zinc-500">
+        <span className="text-zinc-500 dark:text-zinc-400">
           {' '}({gov.active}
           {gov.paused > 0 && <span className="text-sky-600 dark:text-sky-400">/{gov.paused}❄</span>})
         </span>
@@ -1333,7 +528,7 @@ function GovernorStrip({ gov }: { gov: NonNullable<State['governor']> }) {
       <span
         className={
           'mono text-[10px] tabular-nums ' +
-          (projOver ? 'text-amber-700 dark:text-amber-300' : 'text-zinc-400 dark:text-zinc-500')
+          (projOver ? 'text-amber-700 dark:text-amber-300' : 'text-zinc-500 dark:text-zinc-400')
         }
       >
         →{gov.projected_end_pct.toFixed(0)}%
@@ -1345,11 +540,8 @@ function GovernorStrip({ gov }: { gov: NonNullable<State['governor']> }) {
 /// Pill container around the top-right action buttons. Matches the
 /// FloatingToolbar's chrome (white/zinc-900 backdrop, ring, shadow).
 function HeaderBtnBar({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="flex items-center gap-1 bg-white/95 dark:bg-zinc-900/95 backdrop-blur ring-1 ring-zinc-200 dark:ring-zinc-700 rounded-xl px-1.5 py-1.5 shadow-lg shadow-zinc-300/40 dark:shadow-black/40">
-      {children}
-    </div>
-  )
+  // Plain inline group — the buttons live directly in the navbar, no pill chrome.
+  return <div className="flex items-center gap-0.5">{children}</div>
 }
 
 function CaptureButton({ onClick }: { onClick: () => void }) {
@@ -1357,7 +549,7 @@ function CaptureButton({ onClick }: { onClick: () => void }) {
     <button
       onClick={onClick}
       title="Capture — file a new issue"
-      className="w-9 h-9 rounded-lg flex items-center justify-center transition-colors text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+      className="w-7 h-7 rounded-md flex items-center justify-center transition-colors text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-800 dark:hover:text-zinc-100"
     >
       {/* feather-style paper-plane: "send a thought into the inbox" */}
       <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
@@ -1394,7 +586,7 @@ function CapturePage({ jobs, inbox, onClose }: { jobs: Job[]; inbox: string; onC
       >
         <div className="px-6 h-12 flex items-center gap-3 border-b border-zinc-200 dark:border-zinc-800 flex-shrink-0">
           <span className="serif italic text-[20px] text-zinc-900 dark:text-zinc-100">Capture</span>
-          <span className="mono text-[12px] text-zinc-400 dark:text-zinc-500">spawn an idea</span>
+          <span className="mono text-[12px] text-zinc-500 dark:text-zinc-400">spawn an idea</span>
           <div className="flex-1" />
           <button
             onClick={onClose}
@@ -1449,7 +641,7 @@ function RecentCaptureRow({ job, inbox }: { job: Job; inbox: string }) {
         <div className="text-[14px] text-zinc-900 dark:text-zinc-100 truncate">
           {job.issue_title || job.tmux || `#${job.issue}`}
         </div>
-        <div className="mt-0.5 mono text-[11px] text-zinc-400 dark:text-zinc-500 truncate">
+        <div className="mt-0.5 mono text-[11px] text-zinc-500 dark:text-zinc-400 truncate">
           #{job.issue} · {repo}{job.pr ? ` · PR #${job.pr}` : ''}
         </div>
       </div>
@@ -1468,7 +660,7 @@ function DocsButton() {
     <a
       href="/docs"
       title="Docs"
-      className="w-9 h-9 rounded-lg flex items-center justify-center transition-colors text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+      className="w-7 h-7 rounded-md flex items-center justify-center transition-colors text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-800 dark:hover:text-zinc-100"
     >
       <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
         <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
@@ -1628,7 +820,7 @@ function GitHubIntegration({ state }: { state: State }) {
              className="mono text-[13px] text-blue-600 dark:text-blue-400 underline">{flow.verification_uri}</a>
           <div className="text-[12px] text-zinc-500 dark:text-zinc-400 mt-3 mb-1">Enter code:</div>
           <div className="mono text-[20px] tracking-widest text-zinc-900 dark:text-zinc-100 select-all">{flow.user_code}</div>
-          <div className="text-[11px] text-zinc-400 dark:text-zinc-500 mt-3">Waiting for approval…</div>
+          <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-3">Waiting for approval…</div>
         </div>
       )}
       {error && (
@@ -1661,7 +853,7 @@ function SettingsButton({ onClick }: { onClick: () => void }) {
     <button
       onClick={onClick}
       title="Settings"
-      className="w-9 h-9 rounded-lg flex items-center justify-center transition-colors text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+      className="w-7 h-7 rounded-md flex items-center justify-center transition-colors text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-800 dark:hover:text-zinc-100"
     >
       <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
         <circle cx="12" cy="12" r="3" />
@@ -1793,7 +985,7 @@ function RepoPicker({ value, onChange, placeholder, repos, error }: {
                 <span className="text-zinc-500 dark:text-zinc-400">{owner}</span>
                 <span className="text-zinc-300 dark:text-zinc-600">/</span>
                 <span className="font-medium mono">{name}</span>
-                {selected?.private && <span className="text-[10.5px] text-zinc-400 dark:text-zinc-500">private</span>}
+                {selected?.private && <span className="text-[10.5px] text-zinc-500 dark:text-zinc-400">private</span>}
               </div>
               {selected?.description && (
                 <div className="text-[11.5px] text-zinc-500 dark:text-zinc-400 truncate">
@@ -1803,7 +995,7 @@ function RepoPicker({ value, onChange, placeholder, repos, error }: {
             </div>
           </>
         ) : (
-          <span className="flex-1 text-[12.5px] text-zinc-400 dark:text-zinc-500">
+          <span className="flex-1 text-[12.5px] text-zinc-500 dark:text-zinc-400">
             {placeholder || 'pick a repo or type owner/repo'}
           </span>
         )}
@@ -1845,10 +1037,10 @@ function RepoPicker({ value, onChange, placeholder, repos, error }: {
               </div>
             )}
             {!repos && !error && (
-              <div className="px-3 py-4 text-[12.5px] text-zinc-400 dark:text-zinc-500 italic">loading repos…</div>
+              <div className="px-3 py-4 text-[12.5px] text-zinc-500 dark:text-zinc-400 italic">loading repos…</div>
             )}
             {repos && filtered.length === 0 && (
-              <div className="px-3 py-4 text-[12.5px] text-zinc-400 dark:text-zinc-500">
+              <div className="px-3 py-4 text-[12.5px] text-zinc-500 dark:text-zinc-400">
                 no matches — paste owner/repo below
               </div>
             )}
@@ -1864,13 +1056,13 @@ function RepoPicker({ value, onChange, placeholder, repos, error }: {
                     <span className="text-zinc-500 dark:text-zinc-400 truncate">{r.full_name.split('/')[0]}</span>
                     <span className="text-zinc-300 dark:text-zinc-600">/</span>
                     <span className="font-medium text-zinc-900 dark:text-zinc-100 mono truncate">{r.full_name.split('/')[1]}</span>
-                    {r.private && <span className="text-[10.5px] text-zinc-400 dark:text-zinc-500">private</span>}
+                    {r.private && <span className="text-[10.5px] text-zinc-500 dark:text-zinc-400">private</span>}
                   </div>
                   {r.description && (
                     <div className="text-[11.5px] text-zinc-500 dark:text-zinc-400 truncate">{r.description}</div>
                   )}
                 </div>
-                <span className="mono text-[10px] text-zinc-400 dark:text-zinc-500 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
+                <span className="mono text-[10px] text-zinc-500 dark:text-zinc-400 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
                   {timeAgo(r.pushed_at)}
                 </span>
               </button>
@@ -1907,6 +1099,17 @@ function timeAgo(iso?: string | null): string {
 
 type SectionId = 'orch' | 'integrations' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
 
+// Top-level tabs. Sessions is the list; the rest open SettingsPage focused on a
+// section — Machines (VMs), Analytics (usage), Integrations get their own tab;
+// Settings holds the rest (orch/access/capture/targets/danger) via its own nav.
+type Tab = 'sessions' | 'machines' | 'analytics' | 'integrations' | 'settings'
+const TAB_SECTION: Record<Exclude<Tab, 'sessions'>, SectionId> = {
+  machines: 'vms', analytics: 'usage', integrations: 'integrations', settings: 'orch',
+}
+function sectionToTab(s: SectionId): Tab {
+  return s === 'vms' ? 'machines' : s === 'usage' ? 'analytics' : s === 'integrations' ? 'integrations' : 'settings'
+}
+
 function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
   jobs: Job[]
   state: State
@@ -1922,8 +1125,18 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
     cfg: OrchestratorCfg; gh: GhCfg; targets: TargetCfg[]
   } | null>(null)
   const [status, setStatus] = useState<string>('')
-  const [section, setSection] = useState<SectionId>(initialSection ?? 'orch')
   const { repos, error: reposError } = useRepos(true)
+
+  // Machines / Analytics / Integrations each own a top-level tab now, so
+  // here they render as a single bare section. The "Settings" tab (orch)
+  // flattens everything that's left into one scroll page — no inner nav.
+  const flat = !initialSection || initialSection === 'orch'
+  const FLAT_IDS: SectionId[] = ['orch', 'access', 'capture', 'targets', 'danger']
+  const vis = (id: SectionId) => flat ? FLAT_IDS.includes(id) : initialSection === id
+  const pageTitle = initialSection === 'vms' ? 'Machines'
+    : initialSection === 'usage' ? 'Analytics'
+    : initialSection === 'integrations' ? 'Integrations'
+    : 'Settings'
 
   useEffect(() => {
     let alive = true
@@ -2000,6 +1213,17 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
     setTimeout(() => setStatus(''), 6000)
   }
 
+  // Auto-save: debounce 800ms after the last edit. No Save button — the
+  // form persists itself. saveRef keeps the effect off the save closure
+  // so it always runs the latest one without re-arming on every render.
+  const saveRef = useRef(save)
+  saveRef.current = save
+  useEffect(() => {
+    if (!dirty) return
+    const id = setTimeout(() => { saveRef.current() }, 800)
+    return () => clearTimeout(id)
+  }, [dirty, cfg, gh, targets])
+
   const setField = <K extends keyof OrchestratorCfg>(k: K, v: OrchestratorCfg[K]) => {
     setCfg((c) => c ? { ...c, [k]: v } : c)
   }
@@ -2014,7 +1238,7 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
   const sessionsByVM = useMemo(() => {
     const m = new Map<string, Job[]>()
     for (const j of jobs) {
-      if (!j.tmux) continue
+      if (!j.tmux || j.closed_state) continue
       const arr = m.get(j.vm) ?? []
       arr.push(j)
       m.set(j.vm, arr)
@@ -2034,49 +1258,18 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
   ]
 
   return (
-    <div className="absolute inset-0 z-30 bg-white dark:bg-zinc-950 flex flex-col">
-      <div className="px-8 h-14 flex items-center gap-3 border-b border-zinc-200 dark:border-zinc-800 flex-shrink-0">
-        <button
-          onClick={onClose}
-          className="text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 flex items-center gap-1 text-[13px]"
-          title="Back (esc)"
-        >
-          <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="15 18 9 12 15 6" />
-          </svg>
-        </button>
-        <span className="serif italic text-[24px] text-zinc-900 dark:text-zinc-100 ml-2">Settings</span>
-        <div className="flex-1" />
-        {status && <span className="text-[12px] text-zinc-500 dark:text-zinc-400">{status}</span>}
-        <button
-          onClick={save}
-          disabled={!dirty || status === 'saving'}
-          className="text-[12px] px-3 py-1.5 rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90"
-        >Save</button>
-      </div>
+    <div className="absolute inset-0 z-30 bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur flex flex-col">
+      {/* Auto-save status — subtle floating pill, no header bar / Save button. */}
+      {status && (
+        <div className="pointer-events-none fixed bottom-4 right-4 z-50 mono text-[11px] px-3 py-1.5 rounded-md shadow-lg bg-zinc-900/95 dark:bg-zinc-100/95 text-zinc-50 dark:text-zinc-900">
+          {status === 'saving' ? 'saving…' : status}
+        </div>
+      )}
 
-      <div className="flex-1 min-h-0 flex flex-col md:flex-row">
-        {/* mobile: horizontal scroll chip rail; desktop: left aside */}
-        <aside className="md:w-48 flex-shrink-0 border-b md:border-b-0 md:border-r border-zinc-200 dark:border-zinc-800 px-3 py-3 md:py-6 overflow-x-auto md:overflow-y-auto">
-          <nav className="flex md:flex-col gap-0.5 whitespace-nowrap">
-            {navItems.map((it) => (
-              <button
-                key={it.id}
-                onClick={() => setSection(it.id)}
-                className={
-                  'text-left px-3 py-1.5 rounded-md text-[13px] transition-colors flex-shrink-0 ' +
-                  (section === it.id
-                    ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100'
-                    : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100')
-                }
-              >{it.label}</button>
-            ))}
-          </nav>
-        </aside>
-
+      <div className="flex-1 min-h-0 flex flex-col">
         <main className="flex-1 min-w-0 overflow-auto">
           <div className="max-w-[820px] mx-auto px-4 sm:px-8 md:px-10 py-6 md:py-10 space-y-8">
-            {section === 'orch' && (
+            {vis('orch') && (
               <>
                 <Section title="GitHub">
                   <Field label="Inbox repo" hint="Issues filed here drive orchid. Labels map to targets.">
@@ -2115,7 +1308,7 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
               </>
             )}
 
-            {section === 'access' && (
+            {vis('access') && (
               <Section
                 title="Access"
                 subtitle="You always have access. Add GitHub users you want to share this dashboard with — they sign in via OAuth and only see your subdomain."
@@ -2127,7 +1320,7 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
               </Section>
             )}
 
-            {section === 'capture' && (
+            {vis('capture') && (
               <>
                 <Section
                   title="Connect Orchid Capture"
@@ -2185,16 +1378,16 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
               </>
             )}
 
-            {section === 'vms' && (
+            {vis('vms') && (
               <Section
-                title="VMs"
+                title="Machines"
                 subtitle="Worker sessions run on boxes that have joined this orch. Bring a new one online by running the join command on it — no SSH config to fill in here."
               >
                 <VMJoinGuide vms={vms} sessionsByVM={sessionsByVM} relay={relay} />
               </Section>
             )}
 
-            {section === 'targets' && (
+            {vis('targets') && (
               <Section
                 title="Targets"
                 subtitle="Inbox labels → work repos. Add a repo and the label defaults to its name (override if you want)."
@@ -2203,7 +1396,7 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
               </Section>
             )}
 
-            {section === 'integrations' && (
+            {vis('integrations') && (
               <Section
                 title="Integrations"
                 subtitle="Connect orchid to the services the daemon and the spawned sessions talk to."
@@ -2222,16 +1415,16 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
               </Section>
             )}
 
-            {section === 'usage' && (
+            {vis('usage') && (
               <Section
                 title="Usage"
-                subtitle="Per-session Claude spend + context, pulled from each pane's statusline feed. Updates in near-real-time."
+                subtitle="Token throughput (input + output + cache writes — cache reads excluded) and live context, pulled from each pane's statusline feed. Updates in near-real-time."
               >
                 <UsageTable jobs={jobs} quota={state.quota} governor={state.governor} />
               </Section>
             )}
 
-            {section === 'danger' && (
+            {vis('danger') && (
               <Section
                 title="Danger zone"
                 subtitle="These actions can't be undone from the dashboard."
@@ -2288,7 +1481,7 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
     <div className="grid grid-cols-[180px_1fr] gap-4 items-start">
       <div>
         <div className="text-[13px] text-zinc-700 dark:text-zinc-300">{label}</div>
-        {hint && <div className="text-[11px] text-zinc-400 dark:text-zinc-500 mt-0.5 leading-snug">{hint}</div>}
+        {hint && <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-0.5 leading-snug">{hint}</div>}
       </div>
       <div>{children}</div>
     </div>
@@ -2388,9 +1581,8 @@ function VMJoinGuide({ vms, sessionsByVM, relay }: {
 
   return (
     <div className="space-y-6">
-      <JoinCommandCard info={info} />
       <div>
-        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-2 px-1">Connected</div>
+        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-2 px-1">Connected</div>
         <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800/70 overflow-hidden">
           {vms.length === 0 && (
             <div className="px-4 py-5 text-[13px] text-zinc-500 dark:text-zinc-400 text-center">
@@ -2425,17 +1617,18 @@ function VMJoinGuide({ vms, sessionsByVM, relay }: {
                     {local ? 'localhost' : `${vm.user ?? 'root'}@${vm.host ?? '?'}`} · {vm.agent || 'claude'}
                   </div>
                 </div>
-                <span className="mono text-[11px] text-zinc-400 dark:text-zinc-500 flex-shrink-0">
+                <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 flex-shrink-0">
                   {live} / {vm.capacity ?? '∞'}
                 </span>
               </div>
             )
           })}
         </div>
-        <div className="mt-2 px-1 text-[11.5px] text-zinc-400 dark:text-zinc-500">
+        <div className="mt-2 px-1 text-[11.5px] text-zinc-500 dark:text-zinc-400">
           Per-VM SSH settings, capacity, agent, and bot overrides live in <code className="mono">swarm.hcl</code>.
         </div>
       </div>
+      <JoinCommandCard info={info} />
     </div>
   )
 }
@@ -2447,6 +1640,23 @@ import type { UsageHistoryRow } from './types'
 /// the bundle size. X axis = day, Y axis = USD. Bars are stacked by
 /// model family so a glance shows where the budget went (opus vs
 /// sonnet vs haiku splits).
+// Subscriptions don't bill per-token, so dollar figures are noise here.
+// What matters is token throughput. tok() = real NEW tokens: input +
+// output + cache WRITES. We deliberately EXCLUDE cache_read — every turn
+// re-reads the full cached prefix, so it re-counts the same tokens
+// thousands of times (billed ~0.1x, not real throughput). Including it
+// inflated a day to ~20B ("read Wikipedia several times"); this is the
+// honest consumption number. fmtTok renders it compact (1.2M / 340K).
+function tok(r: UsageHistoryRow): number {
+  return (r.input_tokens ?? 0) + (r.output_tokens ?? 0) + (r.cache_creation ?? 0)
+}
+function fmtTok(n: number): string {
+  if (n >= 1e9) return (n / 1e9).toFixed(n < 1e10 ? 1 : 0) + 'B'
+  if (n >= 1e6) return (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + 'M'
+  if (n >= 1e3) return (n / 1e3).toFixed(n < 1e4 ? 1 : 0) + 'K'
+  return String(Math.round(n))
+}
+
 function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
   type DayBar = { date: string; opus: number; sonnet: number; haiku: number; other: number; total: number }
   const grid = useMemo<DayBar[]>(() => {
@@ -2466,13 +1676,13 @@ function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
       const fam = m.includes('opus') ? 'opus'
         : m.includes('sonnet') ? 'sonnet'
         : m.includes('haiku') ? 'haiku' : 'other'
-      bar[fam] += r.cost_usd
-      bar.total += r.cost_usd
+      bar[fam] += tok(r)
+      bar.total += tok(r)
     }
     return Array.from(by.values())
   }, [rows, days])
 
-  const max = Math.max(0.01, ...grid.map((g) => g.total))
+  const max = Math.max(1, ...grid.map((g) => g.total))
   const total = grid.reduce((acc, g) => acc + g.total, 0)
   const W = 760, H = 200, pad = { l: 36, r: 12, t: 12, b: 22 }
   const innerW = W - pad.l - pad.r
@@ -2495,12 +1705,12 @@ function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5 relative">
       <div className="flex items-center mb-3">
-        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
-          Daily spend · last {days}d
+        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+          Daily tokens · last {days}d
         </div>
         <div className="flex-1" />
         <div className="mono text-[12px] text-zinc-600 dark:text-zinc-300 tabular-nums">
-          ${total.toFixed(2)} window total
+          {fmtTok(total)} tok window
         </div>
       </div>
       <svg
@@ -2512,8 +1722,8 @@ function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
         {ticks.map((t, i) => (
           <g key={i}>
             <line x1={pad.l} x2={W - pad.r} y1={t.y} y2={t.y} stroke="currentColor" className="text-zinc-200 dark:text-zinc-800" strokeDasharray={i === 0 ? '' : '2 3'} />
-            <text x={pad.l - 6} y={t.y + 3} textAnchor="end" className="fill-zinc-400 dark:fill-zinc-500" fontSize="9">
-              ${t.v.toFixed(t.v < 1 ? 2 : 1)}
+            <text x={pad.l - 6} y={t.y + 3} textAnchor="end" className="fill-zinc-500 dark:fill-zinc-400" fontSize="9">
+              {fmtTok(t.v)}
             </text>
           </g>
         ))}
@@ -2550,7 +1760,7 @@ function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
                 return <rect key={j} x={x + 1} y={yCursor} width={Math.max(0, barW - 2)} height={Math.max(0, h)} fill={s.fill} opacity={hover && !hot ? 0.5 : 1} />
               })}
               {i % Math.ceil(days / 8) === 0 && (
-                <text x={x + barW / 2} y={H - 6} textAnchor="middle" className="fill-zinc-400 dark:fill-zinc-500" fontSize="9">
+                <text x={x + barW / 2} y={H - 6} textAnchor="middle" className="fill-zinc-500 dark:fill-zinc-400" fontSize="9">
                   {g.date.slice(5)}
                 </text>
               )}
@@ -2564,11 +1774,11 @@ function UsageChart({ rows, days }: { rows: UsageHistoryRow[]; days: number }) {
           style={{ left: Math.min(hover.x + 14, 600), top: Math.max(40, hover.y - 8) }}
         >
           <div className="text-[10.5px] opacity-80">{hovered.date}</div>
-          <div className="tabular-nums font-medium">${hovered.total.toFixed(2)}</div>
-          {hovered.opus   > 0 && <div className="tabular-nums">opus ${hovered.opus.toFixed(2)}</div>}
-          {hovered.sonnet > 0 && <div className="tabular-nums">sonnet ${hovered.sonnet.toFixed(2)}</div>}
-          {hovered.haiku  > 0 && <div className="tabular-nums">haiku ${hovered.haiku.toFixed(2)}</div>}
-          {hovered.other  > 0 && <div className="tabular-nums">other ${hovered.other.toFixed(2)}</div>}
+          <div className="tabular-nums font-medium">{fmtTok(hovered.total)} tok</div>
+          {hovered.opus   > 0 && <div className="tabular-nums">opus {fmtTok(hovered.opus)}</div>}
+          {hovered.sonnet > 0 && <div className="tabular-nums">sonnet {fmtTok(hovered.sonnet)}</div>}
+          {hovered.haiku  > 0 && <div className="tabular-nums">haiku {fmtTok(hovered.haiku)}</div>}
+          {hovered.other  > 0 && <div className="tabular-nums">other {fmtTok(hovered.other)}</div>}
         </div>
       )}
       <div className="flex items-center gap-3 mt-2 mono text-[10.5px] text-zinc-500 dark:text-zinc-400">
@@ -2595,12 +1805,14 @@ interface DonutSlice {
 /// pop + dimmed siblings) and surfaces a tooltip with the label /
 /// value / share, anchored at the cursor. Pure SVG + a thin
 /// React-state hover model so we keep zero chart-lib deps.
-function Donut({ slices, title, units = '$', subtitle }: {
+function Donut({ slices, title, units = '$', subtitle, fmt }: {
   slices: DonutSlice[]
   title: string
   units?: string
   subtitle?: string
+  fmt?: (n: number) => string
 }) {
+  const fv = fmt ?? ((n: number) => units + n.toFixed(2))
   const [hover, setHover] = useState<{ key: string; x: number; y: number } | null>(null)
   const ref = useRef<SVGSVGElement | null>(null)
   const total = useMemo(() => slices.reduce((acc, s) => acc + s.value, 0), [slices])
@@ -2636,10 +1848,10 @@ function Donut({ slices, title, units = '$', subtitle }: {
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5 relative">
       <div className="flex items-center mb-3">
-        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">{title}</div>
+        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">{title}</div>
         <div className="flex-1" />
         <div className="mono text-[12px] text-zinc-600 dark:text-zinc-300 tabular-nums">
-          {units}{total.toFixed(2)}{subtitle ? ' · ' + subtitle : ''}
+          {fv(total)}{subtitle ? ' · ' + subtitle : ''}
         </div>
       </div>
       <div className="flex items-center gap-6">
@@ -2676,7 +1888,7 @@ function Donut({ slices, title, units = '$', subtitle }: {
           })}
           {/* center label */}
           <text x={110} y={106} textAnchor="middle" className="fill-zinc-900 dark:fill-zinc-100 mono" fontSize="18">
-            {hoveredSlice ? `${units}${hoveredSlice.value.toFixed(2)}` : `${units}${total.toFixed(2)}`}
+            {hoveredSlice ? fv(hoveredSlice.value) : fv(total)}
           </text>
           <text x={110} y={124} textAnchor="middle" className="fill-zinc-500 dark:fill-zinc-400 mono" fontSize="10">
             {hoveredSlice ? `${(hoveredFrac * 100).toFixed(1)}%` : 'total'}
@@ -2698,8 +1910,8 @@ function Donut({ slices, title, units = '$', subtitle }: {
                   <span className="flex-1 min-w-0 truncate text-zinc-700 dark:text-zinc-300" title={s.meta || s.label}>
                     {s.label}
                   </span>
-                  <span className="mono tabular-nums text-zinc-600 dark:text-zinc-300 w-14 text-right">{units}{s.value.toFixed(2)}</span>
-                  <span className="mono tabular-nums text-zinc-400 dark:text-zinc-500 w-10 text-right">{(frac * 100).toFixed(1)}%</span>
+                  <span className="mono tabular-nums text-zinc-600 dark:text-zinc-300 w-14 text-right">{fv(s.value)}</span>
+                  <span className="mono tabular-nums text-zinc-500 dark:text-zinc-400 w-10 text-right">{(frac * 100).toFixed(1)}%</span>
                 </div>
               )
             })}
@@ -2712,7 +1924,7 @@ function Donut({ slices, title, units = '$', subtitle }: {
           style={{ left: hover.x + 14, top: hover.y - 8 }}
         >
           <div>{hoveredSlice.label}</div>
-          <div className="tabular-nums">{units}{hoveredSlice.value.toFixed(2)} · {(hoveredFrac * 100).toFixed(1)}%</div>
+          <div className="tabular-nums">{fv(hoveredSlice.value)} · {(hoveredFrac * 100).toFixed(1)}%</div>
           {hoveredSlice.meta && <div className="text-[10px] opacity-70">{hoveredSlice.meta}</div>}
         </div>
       )}
@@ -2737,7 +1949,7 @@ function UsageBySessionDonut({
     const by = new Map<string, { total: number; issue: number }>()
     for (const r of rows) {
       const cur = by.get(r.session_id) ?? { total: 0, issue: 0 }
-      cur.total += r.cost_usd
+      cur.total += tok(r)
       if (r.issue) cur.issue = r.issue
       by.set(r.session_id, cur)
     }
@@ -2762,8 +1974,9 @@ function UsageBySessionDonut({
   return (
     <Donut
       slices={slices}
-      title={`Spend by session · ${days}d`}
+      title={`Tokens by session · ${days}d`}
       subtitle={`${sessionCount} sessions`}
+      fmt={fmtTok}
     />
   )
 }
@@ -2784,7 +1997,7 @@ function UsageByRepoDonut({
     for (const r of rows) {
       const job = r.issue ? jobByIssue.get(r.issue) : undefined
       const repo = job?.target_repo ?? 'unknown'
-      by.set(repo, (by.get(repo) ?? 0) + r.cost_usd)
+      by.set(repo, (by.get(repo) ?? 0) + tok(r))
     }
     const sorted = Array.from(by.entries()).sort((a, b) => b[1] - a[1])
     return sorted.map(([repo, v], i) => ({
@@ -2797,8 +2010,9 @@ function UsageByRepoDonut({
   return (
     <Donut
       slices={slices}
-      title={`Spend by repo · ${days}d`}
+      title={`Tokens by repo · ${days}d`}
       subtitle={`${slices.length} repos`}
+      fmt={fmtTok}
     />
   )
 }
@@ -2861,7 +2075,7 @@ function _legacyUsageBySessionChart({ rows, days, jobs }: { rows: UsageHistoryRo
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
       <div className="flex items-center mb-3">
-        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
           Spend by session · last {days}d
         </div>
         <div className="flex-1" />
@@ -2873,7 +2087,7 @@ function _legacyUsageBySessionChart({ rows, days, jobs }: { rows: UsageHistoryRo
         {ticks.map((t, i) => (
           <g key={i}>
             <line x1={pad.l} x2={W - pad.r} y1={t.y} y2={t.y} stroke="currentColor" className="text-zinc-200 dark:text-zinc-800" strokeDasharray={i === 0 ? '' : '2 3'} />
-            <text x={pad.l - 6} y={t.y + 3} textAnchor="end" className="fill-zinc-400 dark:fill-zinc-500" fontSize="9">${t.v.toFixed(t.v < 1 ? 2 : 1)}</text>
+            <text x={pad.l - 6} y={t.y + 3} textAnchor="end" className="fill-zinc-500 dark:fill-zinc-400" fontSize="9">${t.v.toFixed(t.v < 1 ? 2 : 1)}</text>
           </g>
         ))}
         {grid.map((g, i) => {
@@ -2892,7 +2106,7 @@ function _legacyUsageBySessionChart({ rows, days, jobs }: { rows: UsageHistoryRo
                 return <rect key={sid} x={x + 1} y={yCursor} width={Math.max(0, barW - 2)} height={Math.max(0, h)} fill={colors[sid]} />
               })}
               {i % Math.ceil(days / 8) === 0 && (
-                <text x={x + barW / 2} y={H - 6} textAnchor="middle" className="fill-zinc-400 dark:fill-zinc-500" fontSize="9">{g.date.slice(5)}</text>
+                <text x={x + barW / 2} y={H - 6} textAnchor="middle" className="fill-zinc-500 dark:fill-zinc-400" fontSize="9">{g.date.slice(5)}</text>
               )}
               <title>{`${g.date}\n$${g.total.toFixed(2)}`}</title>
             </g>
@@ -2925,14 +2139,14 @@ function UsageRollups({ rows }: { rows: UsageHistoryRow[] }) {
   const windowSum = (days: number) => {
     const since = new Date(Date.now() - days * 86400_000).toISOString().slice(0, 10)
     return rows.filter((r) => r.date >= since && r.date <= today)
-      .reduce((acc, r) => acc + r.cost_usd, 0)
+      .reduce((acc, r) => acc + tok(r), 0)
   }
   const card = (label: string, days: number) => {
     const v = windowSum(days)
     return (
       <div className="rounded-lg ring-1 ring-zinc-200 dark:ring-zinc-800 px-4 py-3 flex-1">
-        <div className="text-[10.5px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-1">{label}</div>
-        <div className="mono text-[20px] text-zinc-900 dark:text-zinc-100 tabular-nums">${v.toFixed(2)}</div>
+        <div className="text-[10.5px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-1">{label}</div>
+        <div className="mono text-[20px] text-zinc-900 dark:text-zinc-100 tabular-nums">{fmtTok(v)} <span className="text-[12px] text-zinc-500 dark:text-zinc-400">tok</span></div>
       </div>
     )
   }
@@ -2954,12 +2168,8 @@ function UsageTable({ jobs, quota, governor }: { jobs: Job[]; quota?: State['quo
     return jobs
       .filter((j) => j.usage)
       .slice()
-      .sort((a, b) => (b.usage?.cost_usd ?? 0) - (a.usage?.cost_usd ?? 0))
+      .sort((a, b) => (b.usage?.context_pct ?? 0) - (a.usage?.context_pct ?? 0))
   }, [jobs])
-  const totalSpend = useMemo(
-    () => rows.reduce((acc, j) => acc + (j.usage?.cost_usd ?? 0), 0),
-    [rows],
-  )
   const [history, setHistory] = useState<UsageHistoryRow[] | null>(null)
   const [days, setDays] = useState(30)
   useEffect(() => {
@@ -3006,32 +2216,32 @@ function UsageTable({ jobs, quota, governor }: { jobs: Job[]; quota?: State['quo
       )}
       {quota ? (
         <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
-          <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">
+          <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-3">
             Subscription quota
           </div>
           <QuotaStrip quota={quota} governor={governor} />
         </div>
       ) : (
         <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
-          <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-2">
+          <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-2">
             Subscription quota
           </div>
           <div className="text-[12.5px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
-            Not reported by Claude on this account / plan. Per-session
-            spend and context still update below — they're parsed from
-            the same statusline feed but don't depend on the optional{' '}
-            <code className="mono">rate_limits</code> field.
+            Not reported by Claude on this account / plan. Token
+            throughput and live context still update below — they're
+            parsed from the same statusline feed but don't depend on the
+            optional <code className="mono">rate_limits</code> field.
           </div>
         </div>
       )}
       <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 overflow-hidden">
         <div className="flex items-center px-4 py-3 bg-zinc-50 dark:bg-zinc-900/60 border-b border-zinc-200 dark:border-zinc-800">
-          <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
-            Per-session spend
+          <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+            Live context window
           </div>
           <div className="flex-1" />
           <div className="mono text-[12px] text-zinc-600 dark:text-zinc-300 tabular-nums">
-            ${totalSpend.toFixed(2)} total · {rows.length} active
+            {rows.length} active
           </div>
         </div>
         {rows.length === 0 && (
@@ -3041,7 +2251,6 @@ function UsageTable({ jobs, quota, governor }: { jobs: Job[]; quota?: State['quo
         )}
         <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
           {rows.map((j) => {
-            const cost = j.usage?.cost_usd ?? 0
             const ctx = j.usage?.context_pct
             const repo = j.target_repo ? j.target_repo.split('/')[1] : j.target || '—'
             return (
@@ -3057,7 +2266,7 @@ function UsageTable({ jobs, quota, governor }: { jobs: Job[]; quota?: State['quo
                 </div>
                 {typeof ctx === 'number' && (
                   <div className="flex items-center gap-1.5 flex-shrink-0">
-                    <span className="mono text-[11px] text-zinc-400 dark:text-zinc-500">ctx</span>
+                    <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400">ctx</span>
                     <div className="relative h-1.5 w-16 rounded-full overflow-hidden bg-zinc-200 dark:bg-zinc-800">
                       <div
                         className="absolute inset-y-0 left-0 bg-violet-500/80"
@@ -3069,9 +2278,6 @@ function UsageTable({ jobs, quota, governor }: { jobs: Job[]; quota?: State['quo
                     </span>
                   </div>
                 )}
-                <span className="mono text-[12.5px] text-zinc-900 dark:text-zinc-100 tabular-nums w-16 text-right flex-shrink-0">
-                  ${cost.toFixed(2)}
-                </span>
               </div>
             )
           })}
@@ -3092,7 +2298,7 @@ function JoinCommandCard({ info }: { info: RelayInfo | null | 'unavailable' }) {
   if (info === null) {
     return (
       <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 p-6">
-        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">Add a VM</div>
+        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-3">Add a VM</div>
         <div className="text-[12.5px] text-zinc-500 dark:text-zinc-400">Loading…</div>
       </div>
     )
@@ -3100,7 +2306,7 @@ function JoinCommandCard({ info }: { info: RelayInfo | null | 'unavailable' }) {
   if (info === 'unavailable' || !info.login || !info.token) {
     return (
       <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 p-6 space-y-3">
-        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Add a VM</div>
+        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Add a VM</div>
         <div className="text-[13px] text-zinc-700 dark:text-zinc-300 leading-relaxed">
           This orch is running standalone — there's no relay endpoint for a
           new VM to join through.
@@ -3127,8 +2333,8 @@ function JoinCommandCard({ info }: { info: RelayInfo | null | 'unavailable' }) {
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 p-6 space-y-5">
       <div className="flex items-center justify-between">
-        <div className="text-[12px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Add a VM</div>
-        <div className="text-[11.5px] text-zinc-400 dark:text-zinc-500">SSH into the new box as root</div>
+        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Add a VM</div>
+        <div className="text-[11.5px] text-zinc-500 dark:text-zinc-400">SSH into the new box as root</div>
       </div>
       <JoinStep n={1} label="Install orch">
         <JoinCmd value={install} />
@@ -3148,7 +2354,7 @@ function JoinStep({ n, label, children }: { n: number; label: string; children: 
   return (
     <div>
       <div className="flex items-center gap-2 mb-1.5">
-        <span className="mono text-[10.5px] text-zinc-400 dark:text-zinc-500">{n}.</span>
+        <span className="mono text-[10.5px] text-zinc-500 dark:text-zinc-400">{n}.</span>
         <span className="text-[12px] text-zinc-600 dark:text-zinc-300">{label}</span>
       </div>
       {children}
@@ -3164,8 +2370,8 @@ function JoinCmd({ value, secret }: { value: string; secret?: boolean }) {
   const display = revealed ? value : value.replace(/(\S+)$/, (m) => m.replace(/./g, '•'))
   return (
     <div className="relative group">
-      <pre className="bg-zinc-950 text-zinc-100 mono text-[12px] p-3 pr-24 rounded-lg overflow-x-auto whitespace-pre">{display}</pre>
-      <div className="absolute top-1/2 right-2 -translate-y-1/2 flex items-center gap-1">
+      <pre className="bg-zinc-950 text-zinc-100 mono text-[12px] p-3 pr-24 rounded-lg whitespace-pre-wrap break-all">{display}</pre>
+      <div className="absolute top-2 right-2 flex items-center gap-1">
         {secret && (
           <button
             onClick={() => setRevealed((v) => !v)}
@@ -3218,7 +2424,7 @@ function TargetsList({ targets, setTargets, repos, reposError }: {
                 <div className="w-8 h-8 rounded-md bg-zinc-100 dark:bg-zinc-800 flex-shrink-0" />
               )}
               <div className="text-[13.5px] truncate flex-1 min-w-0">
-                <span className="text-zinc-400 dark:text-zinc-500">{owner || '—'}</span>
+                <span className="text-zinc-500 dark:text-zinc-400">{owner || '—'}</span>
                 <span className="text-zinc-300 dark:text-zinc-600 mx-0.5">/</span>
                 <span className="mono text-zinc-900 dark:text-zinc-100">{name || '—'}</span>
               </div>
@@ -3307,7 +2513,7 @@ function AllowedUsers({ values, onChange }: { values: string[]; onChange: (v: st
         ))}
       </div>
       <div className="flex items-center gap-2 bg-zinc-50 dark:bg-zinc-950 ring-1 ring-zinc-200 dark:ring-zinc-800 rounded-lg px-3 py-2">
-        <span className="text-zinc-400 dark:text-zinc-500 text-[14px]">@</span>
+        <span className="text-zinc-500 dark:text-zinc-400 text-[14px]">@</span>
         <input
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
@@ -3352,10 +2558,10 @@ function UserRow({ login, profile, owner, onRemove }: {
         className="mono text-[13.5px] text-zinc-900 dark:text-zinc-100 hover:underline truncate flex-1"
       >@{login}</a>
       {p?.name && (
-        <span className="text-[12px] text-zinc-400 dark:text-zinc-500 truncate hidden sm:inline">{p.name}</span>
+        <span className="text-[12px] text-zinc-500 dark:text-zinc-400 truncate hidden sm:inline">{p.name}</span>
       )}
       {owner && (
-        <span className="text-[11px] text-zinc-400 dark:text-zinc-500">you</span>
+        <span className="text-[11px] text-zinc-500 dark:text-zinc-400">you</span>
       )}
       {profile === 'missing' && (
         <span className="text-[11px] text-rose-500 dark:text-rose-400">not found</span>
@@ -3411,182 +2617,251 @@ function ChipList({ values, onChange, placeholder }: { values: string[]; onChang
   )
 }
 
-function ViewToggle({ view, setView }: { view: 'canvas' | 'list'; setView: (v: 'canvas' | 'list') => void }) {
-  const next = view === 'canvas' ? 'list' : 'canvas'
-  const title = `Switch to ${next} view`
-  return (
-    <button
-      onClick={() => setView(next)}
-      title={title}
-      className="w-9 h-9 rounded-lg flex items-center justify-center transition-colors text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-    >
-      {view === 'canvas' ? (
-        // canvas → currently canvas; show "list" icon to indicate switch
-        <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-          <line x1="8" y1="6" x2="21" y2="6" />
-          <line x1="8" y1="12" x2="21" y2="12" />
-          <line x1="8" y1="18" x2="21" y2="18" />
-          <circle cx="4" cy="6" r="1" />
-          <circle cx="4" cy="12" r="1" />
-          <circle cx="4" cy="18" r="1" />
-        </svg>
-      ) : (
-        // list → currently list; show "canvas" (grid) icon
-        <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-          <rect x="3" y="3" width="7" height="7" />
-          <rect x="14" y="3" width="7" height="7" />
-          <rect x="3" y="14" width="7" height="7" />
-          <rect x="14" y="14" width="7" height="7" />
-        </svg>
-      )}
-    </button>
-  )
+type SortKey = 'newest' | 'oldest' | 'active' | 'attention'
+const SORT_LABEL: Record<SortKey, string> = {
+  newest: 'Newest', oldest: 'Oldest', active: 'Recently active', attention: 'Needs attention',
 }
+const PER_PAGE = 25
 
-function ListView({ jobs, onOpen, onPin, pinned }: {
+function ListView({ jobs, q, onOpen }: {
   jobs: Job[]
+  q: string
   onOpen: (tmux: string) => void
-  onPin?: (tmux: string) => void
-  pinned?: Record<string, { x: number; y: number }>
 }) {
   const activity = React.useContext(ActivityContext)
-  // Group by attention level so the highest-signal cards rise to the top
-  // without losing their visual category. Inside a group, sort by score
-  // then alphabetically for stable rendering.
-  const groups = useMemo(() => {
-    const order: AttentionLevel[] = ['needs-you', 'working', 'watching', 'quiet']
-    const buckets: Record<AttentionLevel, Job[]> = {
-      'needs-you': [], 'working': [], 'watching': [], 'quiet': [],
+  const [sort, setSort] = useState<SortKey>('newest')
+  const [page, setPage] = useState(0)
+
+  const rows = useMemo(() => {
+    const ts = (j: Job) => (j.spawned_at ? Date.parse(j.spawned_at) || 0 : 0)
+    // Live sessions + deduped ghosts (one per issue) in one set.
+    const byIssue = new Map<number, Job>()
+    const live: Job[] = []
+    for (const j of jobs) {
+      if (j.closed_state) {
+        const p = byIssue.get(j.issue)
+        if (!p || (j.closed_at ?? 0) > (p.closed_at ?? 0)) byIssue.set(j.issue, j)
+      } else if (j.tmux) {
+        live.push(j)
+      }
     }
-    for (const j of jobs) buckets[attention(j).level].push(j)
-    return order
-      .map((lvl) => ({
-        lvl,
-        jobs: buckets[lvl].sort((a, b) => {
-          const sa = attention(a).score, sb = attention(b).score
-          if (sa !== sb) return sb - sa
-          return (a.issue_title || '').localeCompare(b.issue_title || '')
-        }),
-      }))
-      .filter((g) => g.jobs.length > 0)
-  }, [jobs])
+    let all = [...live, ...byIssue.values()]
+    const term = q.trim().toLowerCase()
+    if (term) {
+      all = all.filter((j) =>
+        (j.issue_title || '').toLowerCase().includes(term) ||
+        (j.target_repo || '').toLowerCase().includes(term) ||
+        String(j.issue).includes(term) ||
+        (j.tmux || '').toLowerCase().includes(term),
+      )
+    }
+    const rank = (j: Job) => (j.closed_state ? 4 : { 'needs-you': 0, 'working': 1, 'watching': 2, 'quiet': 3 }[attention(j).level])
+    all.sort((a, b) => {
+      if (sort === 'oldest') return ts(a) - ts(b)
+      if (sort === 'active') return (activity.at.get(b.tmux ?? '') ?? 0) - (activity.at.get(a.tmux ?? '') ?? 0) || ts(b) - ts(a)
+      if (sort === 'attention') return rank(a) - rank(b) || ts(b) - ts(a)
+      return ts(b) - ts(a) // newest
+    })
+    return all
+  }, [jobs, q, sort, activity])
+
+  const pages = Math.max(1, Math.ceil(rows.length / PER_PAGE))
+  const cur = Math.min(page, pages - 1)
+  const slice = rows.slice(cur * PER_PAGE, cur * PER_PAGE + PER_PAGE)
 
   return (
-    <div className="absolute inset-0 top-[84px] sm:top-[96px] overflow-auto">
-      <div className="max-w-[1100px] mx-auto px-4 sm:px-8 md:px-10 pb-16 space-y-8">
-        {jobs.length === 0 && (
-          <div className="py-24 text-center text-zinc-400 dark:text-zinc-500">
-            <div className="serif italic text-[28px] mb-2">Empty</div>
-            <div className="text-[13px]">Open an issue in your inbox repo to spawn a session.</div>
+    <div className="flex flex-col">
+      {/* List — flush to the container edges (rows carry their own padding) */}
+      <div>
+        {rows.length === 0 ? (
+          <div className="py-24 text-center text-zinc-500 dark:text-zinc-400">
+            <div className="serif italic text-[28px] mb-2">{q ? 'No matches' : 'Empty'}</div>
+            <div className="text-[13px]">{q ? 'Try a different search.' : 'Open an issue in your inbox repo to spawn a session.'}</div>
+          </div>
+        ) : (
+          <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+            {slice.map((job) => (
+              <SessionRow
+                key={(job.closed_state ? 'done-' : '') + (job.tmux || String(job.issue))}
+                job={job}
+                onOpen={onOpen}
+                activityAt={activity.at.get(job.tmux ?? '')}
+              />
+            ))}
           </div>
         )}
-        {groups.map((g) => (
-          <section key={g.lvl}>
-            <div className="flex items-baseline gap-3 mb-3 px-2">
-              <span className="serif italic text-[20px] text-zinc-900 dark:text-zinc-100">
-                {GROUP_LABEL[g.lvl]}
-              </span>
-              <span className="mono text-[11px] text-zinc-400 dark:text-zinc-500">{g.jobs.length}</span>
-            </div>
-            <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
-              {g.jobs.map((job) => (
-                <ListRow
-                  key={job.tmux || String(job.issue)}
-                  job={job}
-                  onOpen={onOpen}
-                  onPin={onPin}
-                  isPinned={!!(job.tmux && pinned && pinned[job.tmux])}
-                  activityAt={activity.at.get(job.tmux ?? '')}
-                />
-              ))}
-            </div>
-          </section>
-        ))}
       </div>
+
+      {/* Pagination */}
+      {pages > 1 && (
+        <div className="flex items-center justify-between px-3 py-2 border-t border-zinc-200 dark:border-zinc-800 flex-shrink-0 mono text-[11px] text-zinc-500 dark:text-zinc-400">
+          <span className="tabular-nums">{cur * PER_PAGE + 1}–{Math.min((cur + 1) * PER_PAGE, rows.length)} of {rows.length}</span>
+          <div className="flex items-center gap-3">
+            <button disabled={cur === 0} onClick={() => setPage(cur - 1)} className="disabled:opacity-30 hover:text-zinc-800 dark:hover:text-zinc-200">‹ Prev</button>
+            <span className="tabular-nums">{cur + 1} / {pages}</span>
+            <button disabled={cur >= pages - 1} onClick={() => setPage(cur + 1)} className="disabled:opacity-30 hover:text-zinc-800 dark:hover:text-zinc-200">Next ›</button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
-const GROUP_LABEL: Record<AttentionLevel, string> = {
-  'needs-you': 'Needs you',
-  'working':   'Working',
-  'watching':  'Awaiting review',
-  'quiet':     'Quiet',
+// Octicon-style git glyphs (GitHub's own paths, 16-grid, currentColor).
+const OCTICON_PR =
+  'M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z'
+const OCTICON_MERGE =
+  'M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z'
+
+function Octicon({ d, className = '' }: { d: string; className?: string }) {
+  return (
+    <svg width={15} height={15} viewBox="0 0 16 16" fill="currentColor" className={className}>
+      <path d={d} />
+    </svg>
+  )
 }
 
-function ListRow({ job, onOpen, onPin, isPinned, activityAt }: {
+// PrStatusIcon: a GitHub-familiar glyph for the session's PR/CI state, and a
+// link to the PR itself. merged → purple merge; PR + CI fail → red ✗ ; PR + CI
+// pass → green ✓ ; PR open (CI pending) → green PR glyph; no PR yet → a small
+// "building" dot (pulses while active).
+function PrStatusIcon({ job, active }: { job: Job; active: boolean }) {
+  const ci = ciStatus(job.last_check_conclusions ?? {})
+  let glyph: React.ReactNode
+  let label = ''
+  if (job.closed_state === 'merged') {
+    glyph = <Octicon d={OCTICON_MERGE} className="text-violet-500" />
+    label = 'merged'
+  } else if (job.closed_state === 'closed') {
+    glyph = (
+      <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} className="text-zinc-400" strokeLinecap="round">
+        <circle cx="12" cy="12" r="9" /><line x1="9" y1="9" x2="15" y2="15" /><line x1="15" y1="9" x2="9" y2="15" />
+      </svg>
+    )
+    label = 'closed'
+  } else if (job.pr && ci === 'fail') {
+    glyph = (
+      <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} className="text-rose-500" strokeLinecap="round">
+        <circle cx="12" cy="12" r="9" /><line x1="9" y1="9" x2="15" y2="15" /><line x1="15" y1="9" x2="9" y2="15" />
+      </svg>
+    )
+    label = 'CI failing'
+  } else if (job.pr && ci === 'pass') {
+    glyph = (
+      <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} className="text-emerald-500" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="9" /><polyline points="8.5 12.5 11 15 15.5 9.5" />
+      </svg>
+    )
+    label = 'CI passing'
+  } else if (job.pr) {
+    glyph = <Octicon d={OCTICON_PR} className="text-emerald-500" />
+    label = 'PR open'
+  } else {
+    glyph = <span className={'block w-2.5 h-2.5 rounded-full bg-sky-500 ' + (active ? 'animate-pulse' : '')} />
+    label = 'building — no PR yet'
+  }
+  const cls = 'flex-shrink-0 flex items-center justify-center w-5 h-5'
+  if (job.pr && job.target_repo) {
+    return (
+      <a
+        href={`https://github.com/${job.target_repo}/pull/${job.pr}`}
+        target="_blank"
+        rel="noreferrer"
+        onClick={(e) => e.stopPropagation()}
+        className={cls + ' hover:opacity-70'}
+        title={`${label} — open PR #${job.pr}`}
+      >
+        {glyph}
+      </a>
+    )
+  }
+  return <span className={cls} title={label}>{glyph}</span>
+}
+
+// SessionRow: one compact row for the unified list. Live sessions are buttons
+// (open the pane); merged/closed ghosts are dimmed static rows. The PR-status
+// glyph links to the PR. needs-action rows get a rose left-accent + tag.
+function SessionRow({ job, onOpen, activityAt }: {
   job: Job
   onOpen: (tmux: string) => void
-  onPin?: (tmux: string) => void
-  isPinned?: boolean
   activityAt?: number
 }) {
+  const ghost = !!job.closed_state
   let attn = attention(job)
-  if (activityAt && Date.now() - activityAt < ACTIVITY_HOLD_MS && !job.needs_input) {
+  if (!ghost && activityAt && Date.now() - activityAt < ACTIVITY_HOLD_MS && !job.needs_input) {
     attn = { ...attn, level: 'working', reason: 'active' }
   }
-  const color = LEVEL_COLOR[attn.level]
   const repo = job.target_repo ? job.target_repo.split('/')[1] : job.target || '—'
   const agent = job.tmux?.toLowerCase().startsWith('codex') ? 'codex' :
     job.tmux?.toLowerCase().startsWith('claude') ? 'claude' : 'unknown'
-  const issueNum = String(job.issue ?? '').replace(/^0+/, '')
-  const isActive = attn.level === 'working'
+  const isActive = !ghost && attn.level === 'working'
+  const needsAction = !ghost && attn.level === 'needs-you'
+  const age = fmtAgo(job.spawned_at)
+
+  const body = (
+    <>
+      <PrStatusIcon job={job} active={isActive} />
+      <div className="flex-1 min-w-0">
+        <div
+          className={
+            'truncate text-[14px] leading-snug ' +
+            (ghost
+              ? 'text-zinc-500 dark:text-zinc-400'
+              : 'text-zinc-900 dark:text-zinc-100 ' + (needsAction ? 'font-semibold' : 'font-medium'))
+          }
+        >
+          {job.issue_title || job.tmux || '—'}
+        </div>
+        <div className="mt-0.5 mono text-[11.5px] text-zinc-500 dark:text-zinc-400 flex items-center gap-1.5 truncate">
+          <AgentMark agent={agent as Agent} />
+          <span>{repo}</span>
+          {ghost ? (
+            <span className={job.closed_state === 'merged' ? 'text-violet-500' : 'text-zinc-500 dark:text-zinc-400'}>{job.closed_state}</span>
+          ) : (
+            <>
+              {age && <><span className="text-zinc-300 dark:text-zinc-600">·</span><span>{age}</span></>}
+              {needsAction && (
+                <span className="mono text-[9px] uppercase tracking-wide px-1.5 py-px rounded-full bg-rose-100 text-rose-600 dark:bg-rose-900/40 dark:text-rose-300">
+                  {job.needs_input ? 'needs input' : attn.reason}
+                </span>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </>
+  )
+
+  if (ghost) {
+    return <div className="flex items-center gap-3 py-2.5 px-3 opacity-55 hover:opacity-90 transition-opacity">{body}</div>
+  }
   return (
     <button
       onClick={() => job.tmux && onOpen(job.tmux)}
-      className="group w-full text-left py-4 px-2 hover:bg-zinc-50/80 dark:hover:bg-zinc-900/40 transition-colors flex items-center gap-5"
+      className={
+        'group w-full text-left flex items-center gap-3 py-2.5 px-3 border-l-2 transition-colors ' +
+        (needsAction
+          ? 'border-rose-400 bg-rose-50/40 dark:bg-rose-950/15 hover:bg-rose-50 dark:hover:bg-rose-950/25'
+          : 'border-transparent hover:bg-zinc-50/80 dark:hover:bg-zinc-900/40')
+      }
     >
-      <span className="relative flex w-2.5 h-2.5 flex-shrink-0">
-        {isActive && (
-          <span className={`absolute inline-flex h-full w-full rounded-full ${color.bar} opacity-60 animate-ping`} />
-        )}
-        <span className={`relative w-2.5 h-2.5 rounded-full ${color.bar}`} />
-      </span>
-      <div className="flex-1 min-w-0">
-        <div className="text-[15px] leading-snug text-zinc-900 dark:text-zinc-100 truncate font-medium">
-          {job.issue_title || job.tmux || '—'}
-        </div>
-        <div className="mt-0.5 mono text-[11px] text-zinc-400 dark:text-zinc-500 flex items-center gap-2 truncate">
-          <AgentMark agent={agent as Agent} />
-          <span>{repo}</span>
-          {issueNum && <span className="text-zinc-300 dark:text-zinc-600">·</span>}
-          {issueNum && <span>#{issueNum}</span>}
-          {job.pr ? (
-            <>
-              <span className="text-zinc-300 dark:text-zinc-600">·</span>
-              <span>PR #{job.pr}</span>
-            </>
-          ) : null}
-        </div>
-      </div>
-      {onPin && job.tmux && (
-        <span
-          role="button"
-          tabIndex={0}
-          onClick={(e) => { e.stopPropagation(); if (!isPinned) onPin(job.tmux) }}
-          onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); if (!isPinned) onPin(job.tmux) } }}
-          title={isPinned ? 'Already on canvas' : 'Pin to canvas'}
-          className={
-            'opacity-0 group-hover:opacity-100 transition-opacity rounded p-1 ' +
-            (isPinned
-              ? 'text-violet-500 cursor-default'
-              : 'text-zinc-400 hover:text-violet-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer')
-          }
-        >
-          <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-            {/* pin icon */}
-            <path d="M12 17v5" />
-            <path d="M9 10.76V6a3 3 0 0 1 3-3v0a3 3 0 0 1 3 3v4.76l2 2.24v2H7v-2z" />
-          </svg>
-        </span>
-      )}
-      <span className="text-zinc-300 dark:text-zinc-600 opacity-0 group-hover:opacity-100 transition-opacity">
-        <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-          <polyline points="9 18 15 12 9 6" />
-        </svg>
-      </span>
+      {body}
     </button>
   )
+}
+
+// fmtAgo renders a compact relative duration since an RFC3339 timestamp.
+function fmtAgo(iso?: string): string | null {
+  if (!iso) return null
+  const t = Date.parse(iso)
+  if (!t || Number.isNaN(t)) return null
+  const s = Math.max(0, (Date.now() - t) / 1000)
+  if (s < 90) return `${Math.round(s)}s`
+  const m = s / 60
+  if (m < 90) return `${Math.round(m)}m`
+  const h = m / 60
+  if (h < 36) return `${Math.round(h)}h`
+  return `${Math.round(h / 24)}d`
 }
 
 function PaneModal({ tmux, jobsByTmuxRef, onClose }: {
@@ -3655,7 +2930,7 @@ function LogoutButton() {
     <a
       href="/logout"
       title="Log out"
-      className="w-9 h-9 rounded-lg flex items-center justify-center transition-colors text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+      className="w-7 h-7 rounded-md flex items-center justify-center transition-colors text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-800 dark:hover:text-zinc-100"
     >
       <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
         <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
@@ -3714,7 +2989,7 @@ function ThemeToggle() {
     <button
       onClick={() => setDark(d => !d)}
       title={dark ? 'switch to light' : 'switch to dark'}
-      className="w-9 h-9 rounded-lg flex items-center justify-center transition-colors text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+      className="w-7 h-7 rounded-md flex items-center justify-center transition-colors text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-800 dark:hover:text-zinc-100"
     >
       {dark ? (
         <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
@@ -3730,207 +3005,6 @@ function ThemeToggle() {
   )
 }
 
-// Bottom-center floating toolbar in the tldraw style: a pill of icon
-// buttons with the active tool highlighted.
-// Floating session palette pinned to the bottom-right on canvas view.
-// Click the "+" to open a searchable picker of unpinned sessions; click
-// one to drop its card at the current viewport centre. Closes on Esc
-// or click outside.
-function SessionPalette({
-  jobs, pinned, onPin,
-}: {
-  jobs: Job[]
-  pinned: Record<string, { x: number; y: number }>
-  onPin: (tmux: string) => void
-}) {
-  const [open, setOpen] = useState(false)
-  const [filter, setFilter] = useState('')
-  const rootRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
-    const onDown = (e: PointerEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as globalThis.Node)) setOpen(false)
-    }
-    window.addEventListener('keydown', onKey)
-    window.addEventListener('pointerdown', onDown)
-    return () => {
-      window.removeEventListener('keydown', onKey)
-      window.removeEventListener('pointerdown', onDown)
-    }
-  }, [open])
-
-  const candidates = useMemo(() => {
-    const q = filter.trim().toLowerCase()
-    return jobs
-      .filter((j) => j.tmux && !pinned[j.tmux])
-      .filter((j) => {
-        if (!q) return true
-        return (j.issue_title?.toLowerCase().includes(q)
-          || j.tmux?.toLowerCase().includes(q)
-          || j.target_repo?.toLowerCase().includes(q)
-          || j.target?.toLowerCase().includes(q))
-      })
-      .sort((a, b) => attention(b).score - attention(a).score)
-      .slice(0, 60)
-  }, [jobs, pinned, filter])
-
-  return (
-    <div ref={rootRef} className="fixed bottom-5 right-5 z-40">
-      {open && (
-        <div className="mb-2 w-[320px] rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-700 bg-white dark:bg-zinc-900 shadow-2xl overflow-hidden flex flex-col">
-          <div className="flex items-center gap-2 px-3 py-2 border-b border-zinc-100 dark:border-zinc-800">
-            <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} className="text-zinc-400">
-              <circle cx="11" cy="11" r="7" />
-              <line x1="20" y1="20" x2="16.5" y2="16.5" />
-            </svg>
-            <input
-              autoFocus
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder="add session to canvas…"
-              className="flex-1 text-[13px] bg-transparent outline-none text-zinc-900 dark:text-zinc-100"
-            />
-            <span className="mono text-[10px] text-zinc-400 tabular-nums">{candidates.length}</span>
-          </div>
-          <div className="max-h-[320px] overflow-auto">
-            {candidates.length === 0 ? (
-              <div className="px-3 py-4 text-[12px] text-zinc-400 dark:text-zinc-500 text-center">
-                {jobs.length === 0 ? 'no sessions yet' : 'everything pinned'}
-              </div>
-            ) : candidates.map((j) => {
-              const attn = attention(j)
-              const color = LEVEL_COLOR[attn.level]
-              const repo = j.target_repo?.split('/')[1] || j.target || '—'
-              return (
-                <button
-                  key={j.tmux}
-                  onClick={() => { onPin(j.tmux); setOpen(false); setFilter('') }}
-                  className="w-full text-left flex items-center gap-2 px-3 py-2 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
-                >
-                  <span className={`w-2 h-2 rounded-full ${color.bar} flex-shrink-0`} />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-[12.5px] text-zinc-900 dark:text-zinc-100 truncate">
-                      {j.issue_title || j.tmux}
-                    </div>
-                    <div className="mono text-[10.5px] text-zinc-400 dark:text-zinc-500 truncate">
-                      {repo}{j.pr ? ` · PR #${j.pr}` : ''}
-                    </div>
-                  </div>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-      )}
-      <button
-        onClick={() => setOpen((v) => !v)}
-        title="Add session to canvas"
-        className={
-          'w-12 h-12 rounded-full shadow-lg shadow-zinc-300/40 dark:shadow-black/40 flex items-center justify-center transition-colors ' +
-          (open
-            ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-200'
-            : 'bg-violet-600 text-white hover:bg-violet-700')
-        }
-      >
-        <svg width={18} height={18} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round">
-          {open ? (
-            <><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></>
-          ) : (
-            <><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></>
-          )}
-        </svg>
-      </button>
-    </div>
-  )
-}
-
-function FloatingToolbar({
-  tool, setTool, addNote,
-}: { tool: Tool; setTool: (t: Tool) => void; addNote: () => void }) {
-  return (
-    <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 pointer-events-auto">
-      <div className="flex items-center gap-1 bg-white/95 dark:bg-zinc-900/95 backdrop-blur ring-1 ring-zinc-200 dark:ring-zinc-700 rounded-xl px-1.5 py-1.5 shadow-lg shadow-zinc-300/40 dark:shadow-black/40">
-        <ToolBtn active={tool === 'select'} onClick={() => setTool('select')} title="Select (V)" hint="V">
-          <IconArrow />
-        </ToolBtn>
-        <ToolBtn active={tool === 'box'} onClick={() => setTool('box')} title="Box select (R)" hint="R">
-          <IconBox />
-        </ToolBtn>
-        <div className="w-px h-5 bg-zinc-200 dark:bg-zinc-700 mx-1" />
-        <ToolBtn active={tool === 'text'} onClick={() => setTool('text')} title="Text (T)" hint="T">
-          <IconText />
-        </ToolBtn>
-        <ToolBtn active={false} onClick={addNote} title="Note (N)" hint="N">
-          <IconNote />
-        </ToolBtn>
-      </div>
-    </div>
-  )
-}
-
-function ToolBtn({
-  active, onClick, title, children, hint,
-}: {
-  active: boolean; onClick: () => void; title: string; hint?: string
-  children: React.ReactNode
-}) {
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      className={
-        'w-9 h-9 rounded-lg flex items-center justify-center transition-colors relative group ' +
-        (active
-          ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
-          : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800')
-      }
-    >
-      {children}
-      {hint && (
-        <span
-          className={
-            'absolute -bottom-1 right-1 mono text-[8px] ' +
-            (active ? 'text-zinc-400' : 'text-zinc-400')
-          }
-        >
-          {hint}
-        </span>
-      )}
-    </button>
-  )
-}
-
-function IconArrow() {
-  return (
-    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
-      <path d="M5 3l5 18 3-8 8-3z" strokeLinejoin="round" />
-    </svg>
-  )
-}
-function IconBox() {
-  return (
-    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeDasharray="3 2">
-      <rect x="3" y="3" width="18" height="18" rx="2" />
-    </svg>
-  )
-}
-function IconText() {
-  return (
-    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
-      <path d="M5 5h14M12 5v14" strokeLinecap="round" />
-    </svg>
-  )
-}
-function IconNote() {
-  return (
-    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
-      <path d="M4 4h12l4 4v12H4z" strokeLinejoin="round" />
-      <path d="M16 4v4h4" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
 function CardCompact({ job }: { job: Job }) {
   const repo = job.target_repo ? job.target_repo.split('/')[1] : job.target || '—'
   const agent = detectAgent(job)
@@ -3938,7 +3012,7 @@ function CardCompact({ job }: { job: Job }) {
     <div className="p-3 h-full flex flex-col gap-1.5">
       <div className="flex items-center gap-1.5 min-w-0">
         <AgentMark agent={agent} />
-        <span className="mono text-[10.5px] text-zinc-400 dark:text-zinc-500 truncate">{repo}</span>
+        <span className="mono text-[10.5px] text-zinc-500 dark:text-zinc-400 truncate">{repo}</span>
         <div className="flex-1" />
         {job.lifecycle === 'cron' && (
           <span className="mono text-[10px] text-violet-500">cron</span>

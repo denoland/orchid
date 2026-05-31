@@ -47,6 +47,7 @@ const (
 // window of these. ts and the *Reset fields are unix SECONDS, *Pct are
 // used_percentage 0-100.
 type QuotaSample struct {
+	Agent      string  `json:"agent"` // "claude" | "codex" — which account this reading is for
 	Ts         int64   `json:"ts"`
 	FivePct    float64 `json:"five_pct"`
 	FiveReset  int64   `json:"five_reset"`

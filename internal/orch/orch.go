@@ -75,19 +75,31 @@ type MentionsBlock struct {
 }
 
 type VMBlock struct {
-	Name            string `hcl:",label" json:"name"`
-	Host            string `hcl:"host" json:"host"`
-	User            string `hcl:"user,optional" json:"user,omitempty"`
-	Key             string `hcl:"key,optional" json:"key,omitempty"`
-	Capacity        int    `hcl:"capacity,optional" json:"capacity,omitempty"`
-	Sccache         bool   `hcl:"sccache,optional" json:"sccache,omitempty"`
-	SccacheDir      string `hcl:"sccache_dir,optional" json:"sccache_dir,omitempty"`
-	SessionCmd      string `hcl:"session_cmd,optional" json:"session_cmd,omitempty"`
-	SessionHome     string `hcl:"session_home,optional" json:"session_home,omitempty"`
-	WorkdirRoot     string `hcl:"workdir_root,optional" json:"workdir_root,omitempty"`
-	BotLogin        string `hcl:"bot_login,optional" json:"bot_login,omitempty"`
-	BotEmail        string `hcl:"bot_email,optional" json:"bot_email,omitempty"`
-	Agent           string `hcl:"agent,optional" json:"agent,omitempty"`
+	Name        string `hcl:",label" json:"name"`
+	Host        string `hcl:"host" json:"host"`
+	User        string `hcl:"user,optional" json:"user,omitempty"`
+	Key         string `hcl:"key,optional" json:"key,omitempty"`
+	Capacity    int    `hcl:"capacity,optional" json:"capacity,omitempty"`
+	Sccache     bool   `hcl:"sccache,optional" json:"sccache,omitempty"`
+	SccacheDir  string `hcl:"sccache_dir,optional" json:"sccache_dir,omitempty"`
+	SessionCmd  string `hcl:"session_cmd,optional" json:"session_cmd,omitempty"`
+	SessionHome string `hcl:"session_home,optional" json:"session_home,omitempty"`
+	WorkdirRoot string `hcl:"workdir_root,optional" json:"workdir_root,omitempty"`
+	BotLogin    string `hcl:"bot_login,optional" json:"bot_login,omitempty"`
+	BotEmail    string `hcl:"bot_email,optional" json:"bot_email,omitempty"`
+	Agent       string `hcl:"agent,optional" json:"agent,omitempty"`
+	// Account is the billing/metering identity this VM's sessions count against
+	// — the key the quota sampler + governor pace independently. Defaults to the
+	// agent name. Set it to run TWO accounts of the same agent (e.g. two codex
+	// logins on one host: agent="codex" for both, account="codex"/"codex-mini",
+	// each with its own CodexHome). Surfaced per-account on the dashboard.
+	Account string `hcl:"account,optional" json:"account,omitempty"`
+	// CodexHome overrides the codex CLI's home dir (the CODEX_HOME env var:
+	// auth.json + config.toml + sessions/ rollouts) for this VM, so a second
+	// codex account on the same host-user has isolated auth + usage telemetry.
+	// Empty => the agent's default (~/.codex). Honored in the session_cmd AND
+	// the trust-stamp/usage-tailer. May contain $HOME (expanded by the shell).
+	CodexHome       string `hcl:"codex_home,optional" json:"codex_home,omitempty"`
 	IdleMarker      string `hcl:"idle_marker,optional" json:"idle_marker,omitempty"`
 	BusyMarker      string `hcl:"busy_marker,optional" json:"busy_marker,omitempty"`
 	BootstrapPrompt string `hcl:"bootstrap_prompt,optional" json:"bootstrap_prompt,omitempty"`
@@ -158,11 +170,11 @@ type State struct {
 	healthMu sync.RWMutex
 	health   map[string]VMHealth
 
-	// lastThrottleMode is the throttle mode observed on the previous tick,
-	// used to log only on mode transitions (not every tick). Guarded by
-	// st.mu (only read/written inside tick()). Not persisted — defaults to
-	// ModeAllow on a fresh process.
-	lastThrottleMode ThrottleMode
+	// lastThrottleModeByAgent is each agent's throttle mode observed on the
+	// previous tick, used to log only on mode transitions (not every tick).
+	// Guarded by st.mu (only read/written inside tick()). Not persisted —
+	// defaults to ModeAllow on a fresh process.
+	lastThrottleModeByAgent map[string]ThrottleMode
 
 	// Proactive pacing governor in-memory state (see governor.go). Guarded by
 	// st.mu (read/written inside tick(), snapshotted under st.mu for /api/state).
@@ -171,15 +183,18 @@ type State struct {
 	// re-derived every tick. On a fresh process govCap is 0 (=> GovernorDecide
 	// treats it as "start at maxActive") and lastGovDecision is the zero
 	// (fail-open) value.
-	govCap int
-	// lastGovDecision is surfaced on /api/state from the HTTP goroutine, so it
+	// Per-agent (claude/codex): each agent paces against its own account quota.
+	// govCapByAgent is the slew anchor per agent, mirrored to the kv table
+	// ("gov_cap_<agent>") so it survives a restart. Written under st.mu (tick).
+	govCapByAgent map[string]int
+	// lastGovByAgent is surfaced on /api/state from the HTTP goroutine, so it
 	// is guarded by its OWN mutex (govMu), NEVER st.mu — tick() holds st.mu for
 	// a full multi-second scheduler pass and /api/state must not block on it.
-	govMu           sync.RWMutex
-	lastGovDecision GovernorDecision
-	// lastGovBinding/lastGovCap let tick() log only on governor transitions.
-	lastGovBinding string
-	lastGovCap     int
+	govMu          sync.RWMutex
+	lastGovByAgent map[string]GovernorDecision
+	// lastGovBinding/lastGovCap (per agent) let tick() log only on transitions.
+	lastGovBindingByAgent map[string]string
+	lastGovCapByAgent     map[string]int
 }
 
 // VMHealth is the in-memory liveness record for one configured VM.
@@ -204,26 +219,30 @@ func (s *State) VMHealth(name string) VMHealth {
 	return s.health[name]
 }
 
-// GovernorState returns a copy of the last governor decision under st.mu, for
-// the lock-free /api/state builder (which otherwise reads only httpSnap). Mirror
-// of VMHealth: the HTTP goroutine never touches govCap/lastGovDecision directly.
-// SetGovernorState records the latest governor verdict for /api/state. Called
-// from tick() (which already holds st.mu); takes only govMu, so the HTTP reader
-// never contends with the scheduler pass. Lock order is always st.mu → govMu
-// (never the reverse), so no deadlock.
-func (s *State) SetGovernorState(d GovernorDecision) {
+// SetGovernorState records one agent's latest governor verdict for /api/state.
+// Called from tick() (which already holds st.mu); takes only govMu, so the HTTP
+// reader never contends with the scheduler pass. Lock order is always st.mu →
+// govMu (never the reverse), so no deadlock.
+func (s *State) SetGovernorState(agent string, d GovernorDecision) {
 	s.govMu.Lock()
-	s.lastGovDecision = d
+	if s.lastGovByAgent == nil {
+		s.lastGovByAgent = map[string]GovernorDecision{}
+	}
+	s.lastGovByAgent[agent] = d
 	s.govMu.Unlock()
 }
 
-// GovernorState returns a copy of the last governor decision for the lock-free
-// /api/state builder. Guarded by govMu (NOT st.mu) so it never blocks behind a
-// long tick().
-func (s *State) GovernorState() GovernorDecision {
+// GovernorStates returns a copy of the per-agent governor decisions for the
+// lock-free /api/state builder. Guarded by govMu (NOT st.mu) so it never blocks
+// behind a long tick().
+func (s *State) GovernorStates() map[string]GovernorDecision {
 	s.govMu.RLock()
 	defer s.govMu.RUnlock()
-	return s.lastGovDecision
+	out := make(map[string]GovernorDecision, len(s.lastGovByAgent))
+	for a, d := range s.lastGovByAgent {
+		out[a] = d
+	}
+	return out
 }
 
 // MaintainerCache caches the configured org's member logins. Refreshed
@@ -482,6 +501,60 @@ func parsePriorityFrontmatter(body string) int {
 	return 0
 }
 
+// validFrontmatterModels / validFrontmatterEfforts gate the claude --model and
+// --effort values an issue may request via frontmatter, so a stray value can't
+// be passed through to the CLI. Full model names (claude-*) are allowed for model.
+var validFrontmatterModels = map[string]bool{"opus": true, "sonnet": true, "haiku": true}
+var validFrontmatterEfforts = map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}
+
+// frontmatterString returns the quote-stripped value of a `key = value` line in
+// the issue body's leading ```toml frontmatter block — the exact same block
+// parsePriorityFrontmatter reads (priority lives there too). `want` must be
+// lower-case. Returns "" when there is no toml block or the key is absent.
+func frontmatterString(body, want string) string {
+	lines := strings.Split(body, "\n")
+	i := 0
+	for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
+		i++
+	}
+	if i >= len(lines) || strings.TrimSpace(lines[i]) != "```toml" {
+		return ""
+	}
+	i++
+	for ; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "```" {
+			break
+		}
+		eq := strings.Index(line, "=")
+		if eq < 0 {
+			continue
+		}
+		if strings.TrimSpace(strings.ToLower(line[:eq])) != want {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(line[eq+1:]), "\"'")
+	}
+	return ""
+}
+
+// claudeFlagsFromFrontmatter returns the " --model X --effort Y" suffix an issue
+// requests via toml frontmatter (model = "sonnet", effort = "medium"). Values
+// are validated against a fixed allowlist so only safe tokens reach the claude
+// CLI; absent or invalid values are dropped. Empty string when nothing is set.
+func claudeFlagsFromFrontmatter(body string) string {
+	out := ""
+	m := strings.ToLower(frontmatterString(body, "model"))
+	if validFrontmatterModels[m] || (m != "" && strings.HasPrefix(m, "claude-")) {
+		out += " --model " + m
+	}
+	e := strings.ToLower(frontmatterString(body, "effort"))
+	if validFrontmatterEfforts[e] {
+		out += " --effort " + e
+	}
+	return out
+}
+
 func tmuxHasSession(vm VMBlock, session string) (bool, error) {
 	_, _, err := sshExec(vm, fmt.Sprintf("tmux has-session -t %s 2>/dev/null", session))
 	if err == nil {
@@ -602,6 +675,7 @@ func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, sessionCmd
 	}
 	sessionHome := vm.SessionHome
 	agent := vmAgent(vm).name
+	codexHome := vm.CodexHome
 	script := fmt.Sprintf(`set -e
 SHARED=%q
 REPO=%q
@@ -613,6 +687,7 @@ SESSION_HOME=%q
 BOT_LOGIN=%q
 BOT_EMAIL=%q
 AGENT=%q
+CODEX_HOME=%q
 
 # 1) shared clone (once per repo per VM); always fetch fresh refs.
 # Prefer ssh when the bot has an id_ed25519 wired to github; fall back
@@ -657,11 +732,13 @@ if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ]; then
     chown -R "$SESSION_USER:$SESSION_USER" "$WORKDIR" "$SHARED" 2>/dev/null || true
 fi
 
-# 4) agent-specific pre-warm. Claude needs its per-folder trust dialog
-# pre-stamped so the TUI does not prompt; codex stores trust in ~/.codex/
-# and is operator-onboarded via the codex login subcommand once per VM,
-# no per-folder stamping. Stamp $HOME (the user running this script) and
-# SESSION_HOME if set to a different user.
+# 4) agent-specific pre-warm: pre-stamp the agent's directory-trust so the TUI
+# launches straight into the task instead of blocking on a trust prompt. Claude
+# stores per-folder trust in ~/.claude.json; codex stores per-project trust in
+# ~/.codex/config.toml keyed by the git repo root (and we add the worktree too).
+# --dangerously-bypass-approvals-and-sandbox skips codex APPROVALS but NOT the
+# trust dialog, so this stamp is required for unattended codex. Stamp $HOME (the
+# user running this script) and SESSION_HOME if set to a different user.
 if [ "$AGENT" = "claude" ]; then
   stamp_trust() {
     local CHOME="$1"
@@ -670,16 +747,60 @@ if [ "$AGENT" = "claude" ]; then
     [ -f "$CJSON" ] || echo '{}' > "$CJSON"
     jq --arg d "$WORKDIR" '.projects[$d].hasTrustDialogAccepted = true' "$CJSON" > "$CJSON.tmp" && mv "$CJSON.tmp" "$CJSON"
   }
+  # Ensure the Notification + UserPromptSubmit hooks append to notify.jsonl, so
+  # orch gets a RELIABLE "waiting for input" signal (claude emits it) instead of
+  # scraping the pane. $HOME stays literal in the stored command (claude expands
+  # it at hook runtime, like the statusLine hook).
+  stamp_hooks() {
+    local CHOME="$1"
+    [ -z "$CHOME" ] && return
+    mkdir -p "$CHOME/.claude"
+    local SJ="$CHOME/.claude/settings.json"
+    [ -f "$SJ" ] || echo '{}' > "$SJ"
+    jq '.hooks.Notification = [{"hooks":[{"type":"command","command":"tee -a $HOME/.claude/notify.jsonl >/dev/null"}]}] | .hooks.UserPromptSubmit = [{"hooks":[{"type":"command","command":"tee -a $HOME/.claude/notify.jsonl >/dev/null"}]}]' "$SJ" > "$SJ.tmp" && mv "$SJ.tmp" "$SJ"
+  }
   stamp_trust "$HOME"
+  stamp_hooks "$HOME"
   if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ] && [ "$SESSION_HOME" != "$HOME" ]; then
     stamp_trust "$SESSION_HOME"
+    stamp_hooks "$SESSION_HOME"
+  fi
+elif [ "$AGENT" = "codex" ]; then
+  # Trust the repo root + worktree in the codex home's config.toml. CDIR is the
+  # codex home directory itself (CODEX_HOME, or ~/.codex by default).
+  trust_codex() {
+    local CDIR="$1"
+    [ -z "$CDIR" ] && return
+    mkdir -p "$CDIR"
+    local CFG="$CDIR/config.toml"
+    touch "$CFG"
+    local P
+    for P in "$SHARED" "$WORKDIR"; do
+      if ! grep -qF "[projects.\"$P\"]" "$CFG" 2>/dev/null; then
+        printf '\n[projects."%%s"]\ntrust_level = "trusted"\n' "$P" >> "$CFG"
+      fi
+    done
+  }
+  if [ -n "$CODEX_HOME" ]; then
+    trust_codex "$CODEX_HOME"
+  else
+    trust_codex "$HOME/.codex"
+    if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ] && [ "$SESSION_HOME" != "$HOME" ]; then
+      trust_codex "$SESSION_HOME/.codex"
+    fi
   fi
 fi
 
-# 5) launch the pane
+# 5) launch the pane. When CODEX_HOME is set, export it into the session so the
+# codex CLI uses the isolated auth/config/rollouts dir (single source of truth:
+# the VM block's codex_home drives both the trust stamp above and the launch).
+LAUNCH="$SESSION_CMD"
+if [ -n "$CODEX_HOME" ]; then
+  LAUNCH="CODEX_HOME=\"$CODEX_HOME\" $SESSION_CMD"
+fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
-tmux new-session -d -c "$WORKDIR" -s "$SESSION" "$SESSION_CMD"
-`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome, botLogin, botEmail, agent)
+tmux new-session -d -c "$WORKDIR" -s "$SESSION" "$LAUNCH"
+`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome, botLogin, botEmail, agent, codexHome)
 
 	_, errStr, err := sshExecIn(vm, script, "bash -s")
 	if err != nil {
@@ -805,12 +926,95 @@ func paneActivityRecordTick(tmux string, hash uint64) bool {
 
 func paneActivityPrune(live map[string]bool) {
 	paneActivityMu.Lock()
-	defer paneActivityMu.Unlock()
 	for k := range paneActivity {
 		if !live[k] {
 			delete(paneActivity, k)
 		}
 	}
+	paneActivityMu.Unlock()
+	paneActionMu.Lock()
+	for k := range paneAction {
+		if !live[k] {
+			delete(paneAction, k)
+		}
+	}
+	paneActionMu.Unlock()
+}
+
+// paneAction holds the latest extracted "current action" line per session — a
+// one-line glance at what the agent is doing right now, lifted from the pane
+// tail the activity loop already captures (no extra ssh). Surfaced per job on
+// /api/state so the list view shows live work without opening the pane.
+var (
+	paneActionMu sync.RWMutex
+	paneAction   = map[string]string{}
+)
+
+func paneActionSnapshot(tmux string) string {
+	paneActionMu.RLock()
+	defer paneActionMu.RUnlock()
+	return paneAction[tmux]
+}
+
+func paneActionSet(tmux, s string) {
+	paneActionMu.Lock()
+	paneAction[tmux] = s
+	paneActionMu.Unlock()
+}
+
+// extractPaneAction picks the most recent meaningful line from a pane tail: the
+// agent's current step (a "• Exploring", "⏺ Edited x", "Working (12s…)", spinner
+// line, etc.), skipping UI chrome — the input prompt box, separator rules, and
+// the permissions footer. Best-effort: returns "" when nothing meaningful.
+func extractPaneAction(out string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		s := strings.TrimSpace(lines[i])
+		if s == "" {
+			continue
+		}
+		low := strings.ToLower(s)
+		// Chrome: footer hint + the empty-input prompt placeholders.
+		if strings.Contains(low, "bypass permissions") || strings.Contains(low, "shift+tab") ||
+			strings.Contains(low, "? for shortcuts") || strings.Contains(low, "/clear to") {
+			continue
+		}
+		// Separator rules: a line that's essentially all box-drawing / dashes.
+		if isSeparatorRule(s) {
+			continue
+		}
+		// Strip a leading marker glyph (bullet, prompt caret) to judge emptiness.
+		t := strings.TrimSpace(strings.TrimLeft(s, "•◦●·⏺⎿└│✻✶✳✦➤>›❯⏵ "))
+		if t == "" {
+			continue
+		}
+		// The input box placeholder lines start with › / ❯ and are hints, not work.
+		if (strings.HasPrefix(s, "›") || strings.HasPrefix(s, "❯")) && t == strings.TrimSpace(strings.TrimLeft(s, "›❯ ")) {
+			// Keep only if it looks like real content longer than a short hint.
+			if len(t) < 4 {
+				continue
+			}
+		}
+		if len([]rune(t)) > 120 {
+			t = string([]rune(t)[:120]) + "…"
+		}
+		return t
+	}
+	return ""
+}
+
+// isSeparatorRule reports whether a line is essentially a horizontal rule made
+// of box-drawing / dash characters (TUI divider), so it can be skipped.
+func isSeparatorRule(s string) bool {
+	n := 0
+	for _, r := range s {
+		switch r {
+		case '─', '-', '━', '═', '·', ' ', '\t':
+		default:
+			n++
+		}
+	}
+	return n == 0
 }
 
 var (
@@ -874,7 +1078,19 @@ func tmuxPaste(vm VMBlock, session, msg string) error {
 	if _, errStr, err := sshExecIn(vm, msg, fmt.Sprintf("tmux load-buffer -b %s -", buf)); err != nil {
 		return fmt.Errorf("load-buffer: %v: %s", err, errStr)
 	}
-	cmd := fmt.Sprintf("tmux paste-buffer -b %s -t %s -d; rc=$?; tmux delete-buffer -b %s 2>/dev/null || true; [ $rc -eq 0 ] || exit $rc; sleep 1; tmux send-keys -t %s C-m", buf, session, buf, session)
+	// Codex's TUI collapses large input into a "[Pasted Content N chars]"
+	// placeholder via a paste-burst heuristic. A raw paste-buffer streams
+	// in split across PTY reads, so codex sees SEVERAL placeholders and the
+	// trailing Enter lands mid-burst → the message never submits (observed
+	// 2026-05-30 on local-codex). -p wraps the content in bracketed-paste
+	// markers (ESC[200~ … ESC[201~) so codex treats it as one atomic paste
+	// and the following C-m submits. Claude's reader handles raw multiline
+	// paste fine, so only opt codex in to avoid regressing the fleet.
+	pflag := ""
+	if vm.Agent == "codex" {
+		pflag = "-p "
+	}
+	cmd := fmt.Sprintf("tmux paste-buffer %s-b %s -t %s -d; rc=$?; tmux delete-buffer -b %s 2>/dev/null || true; [ $rc -eq 0 ] || exit $rc; sleep 1; tmux send-keys -t %s C-m", pflag, buf, session, buf, session)
 	if _, errStr, err := sshExec(vm, cmd); err != nil {
 		return fmt.Errorf("paste-buffer+enter: %v: %s", err, errStr)
 	}
@@ -943,6 +1159,14 @@ func runVMHealthLoop(ctx context.Context, cfg *Config, st *State) {
 }
 
 func freeVM(cfg *Config, st *State) *VMBlock {
+	return freeVMAllow(cfg, st, nil)
+}
+
+// freeVMAllow is freeVM with an optional per-agent admission filter: when allow
+// != nil, VMs whose agent is not currently admittable (throttle/governor) are
+// skipped, so an issue routes to an agent that still has headroom instead of
+// stranding behind a capped one. allow==nil considers every VM (legacy freeVM).
+func freeVMAllow(cfg *Config, st *State, allow func(agent string) bool) *VMBlock {
 	if len(cfg.VMs) == 0 {
 		return nil
 	}
@@ -958,6 +1182,15 @@ func freeVM(cfg *Config, st *State) *VMBlock {
 		vm := &cfg.VMs[i]
 		if vm.Capacity > 0 && load[vm.Name] >= vm.Capacity {
 			continue
+		}
+		if allow != nil {
+			a := vmAgent(*vm).name
+			if a == "" {
+				a = "claude"
+			}
+			if !allow(a) {
+				continue
+			}
 		}
 		// Skip VMs the SSH probe has marked offline. The local
 		// bootstrap path (localhost) is always assumed reachable
@@ -1053,6 +1286,17 @@ func vmAgent(vm VMBlock) agentSpec {
 		spec.busyMarker = vm.BusyMarker
 	}
 	return spec
+}
+
+// vmAccount is the billing/metering identity a VM's sessions count against —
+// the key the quota sampler + governor pace independently. Defaults to the
+// agent name (so single-account agents behave exactly as before); set the VM's
+// `account` to run two logins of the same agent under distinct quota buckets.
+func vmAccount(vm VMBlock) string {
+	if vm.Account != "" {
+		return vm.Account
+	}
+	return vmAgent(vm).name
 }
 
 // vmBotIdentity resolves the git user.name / user.email used for commits in
@@ -1211,6 +1455,22 @@ func tearDown(cfg *Config, st *State, issue int) {
 	}
 	delete(st.Jobs, issue)
 	log.Printf("issue #%d: torn down (was on %s/%s)", issue, j.VM, j.Tmux)
+}
+
+// closeInboxIssue closes the inbox issue once its session's PR has reached a
+// terminal state (merged or closed). Cross-repo "Closes #N" doesn't auto-link,
+// so without this the inbox issue stays open and the scheduler respawns the
+// session every tick — which, when the PR was closed-not-merged, becomes an
+// endless spawn↔teardown flap. gh issue close on an already-closed issue is a
+// harmless no-op.
+func closeInboxIssue(cfg *Config, issue int, prState, repo string, pr int) {
+	comment := fmt.Sprintf("Auto-closing: PR https://github.com/%s/pull/%d is %s.", repo, pr, strings.ToLower(prState))
+	if _, errStr, err := run("gh", "issue", "close", fmt.Sprint(issue),
+		"--repo", cfg.GitHub.InboxRepo, "--comment", comment); err != nil {
+		log.Printf("issue #%d: close inbox issue failed: %v: %s", issue, err, strings.TrimSpace(errStr))
+		return
+	}
+	log.Printf("issue #%d: closed inbox issue (PR %s)", issue, strings.ToLower(prState))
 }
 
 // pruneWorkdir removes the per-issue workdir (git worktree + build artifacts).

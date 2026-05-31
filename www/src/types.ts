@@ -30,6 +30,9 @@ export interface Job {
   next_fire_at: string
   last_check_conclusions: Record<string, string>
   activity?: number[]
+  current_action?: string // live "what it's doing now" line lifted from the pane
+  spawned_at?: string // RFC3339 spawn time, for runtime display
+  wip?: { files: number; added: number; removed: number; ahead: number; ok: boolean } // git work-in-progress
   needs_input?: boolean
   vm_online?: boolean
   usage?: PaneUsage
@@ -65,6 +68,8 @@ export interface Quota {
   five_hour_resets_at: number
   seven_day_pct: number
   seven_day_resets_at: number
+  plan_type?: string // codex plan_type (e.g. "prolite"); empty for claude
+  credits?: number // codex $-credit balance on credit plans
   throttle?: Throttle
 }
 
@@ -85,6 +90,13 @@ export interface Governor {
   binding: 'weekly' | '5h' | ''
 }
 
+// AgentMeter is one agent's quota + governor (per-agent metering). The
+// top-level quota/governor mirror the "claude" entry for back-compat.
+export interface AgentMeter {
+  quota?: Quota
+  governor?: Governor
+}
+
 export interface State {
   jobs: Job[]
   vms: VM[]
@@ -92,4 +104,5 @@ export interface State {
   quota?: Quota
   connect?: ConnectStatus
   governor?: Governor
+  agents?: Record<string, AgentMeter>
 }

@@ -71,10 +71,12 @@ const (
 type apiJobEntry struct {
 	Issue int `json:"issue"`
 	Job
-	Activity   []int         `json:"activity,omitempty"`
-	Usage      *apiPaneUsage `json:"usage,omitempty"`
-	NeedsInput bool          `json:"needs_input,omitempty"`
-	VMOnline   bool          `json:"vm_online"`
+	Activity      []int         `json:"activity,omitempty"`
+	Usage         *apiPaneUsage `json:"usage,omitempty"`
+	NeedsInput    bool          `json:"needs_input,omitempty"`
+	CurrentAction string        `json:"current_action,omitempty"` // live "what it's doing now" line from the pane tail
+	Wip           *WipStat      `json:"wip,omitempty"`            // git work-in-progress: files/+/-/ahead
+	VMOnline      bool          `json:"vm_online"`
 	// PausedState surfaces the duty-cycle pause flag without omitempty so the
 	// dashboard can render the frozen indicator deterministically (the embedded
 	// Job.Paused is omitempty for the persisted blob). Priority flows through
@@ -99,9 +101,20 @@ type apiStateResp struct {
 	Jobs     []apiJobEntry  `json:"jobs"`
 	VMs      []apiVMEntry   `json:"vms"`
 	Inbox    string         `json:"inbox"`
-	Quota    *apiQuota      `json:"quota,omitempty"`
+	Quota    *apiQuota      `json:"quota,omitempty"` // legacy: claude's quota (back-compat)
 	Connect  *connectStatus `json:"connect,omitempty"`
-	Governor *apiGovernor   `json:"governor,omitempty"`
+	Governor *apiGovernor   `json:"governor,omitempty"` // legacy: claude's governor (back-compat)
+	// Per-agent metering: each configured agent's quota + governor, keyed by
+	// agent name ("claude"/"codex"). The legacy Quota/Governor above mirror the
+	// claude entry so existing widgets keep working.
+	Agents map[string]*apiAgentMeter `json:"agents,omitempty"`
+}
+
+// apiAgentMeter bundles one agent's quota + governor for the per-agent
+// dashboard surface.
+type apiAgentMeter struct {
+	Quota    *apiQuota    `json:"quota,omitempty"`
+	Governor *apiGovernor `json:"governor,omitempty"`
 }
 
 type apiPaneUsage struct {
@@ -115,6 +128,8 @@ type apiQuota struct {
 	FiveHourResetsAt int64        `json:"five_hour_resets_at"`
 	SevenDayPct      float64      `json:"seven_day_pct"`
 	SevenDayResetsAt int64        `json:"seven_day_resets_at"`
+	PlanType         string       `json:"plan_type,omitempty"` // codex plan_type (e.g. "prolite"); empty for claude
+	Credits          *float64     `json:"credits,omitempty"`   // codex $-credit balance on credit plans; nil otherwise
 	Throttle         *apiThrottle `json:"throttle,omitempty"`
 }
 
@@ -188,12 +203,13 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 	jobs := make([]apiJobEntry, 0, len(snap))
 	for issue, j := range snap {
 		entry := apiJobEntry{
-			Issue:       issue,
-			Job:         j,
-			Activity:    paneActivitySnapshot(j.Tmux),
-			NeedsInput:  paneNeedsInputSnapshot(j.Tmux),
-			VMOnline:    vmOnline[j.VM],
-			PausedState: j.Paused,
+			Issue:         issue,
+			Job:           j,
+			Activity:      paneActivitySnapshot(j.Tmux),
+			NeedsInput:    needsInputForIssue(issue) || paneNeedsInputSnapshot(j.Tmux),
+			CurrentAction: paneActionSnapshot(j.Tmux),
+			VMOnline:      vmOnline[j.VM],
+			PausedState:   j.Paused,
 		}
 		if u := usageForIssue(issue); u != nil {
 			entry.Usage = &apiPaneUsage{
@@ -201,6 +217,10 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 				CostUSD:    u.Cost.TotalCostUSD,
 				ContextPct: u.ContextWindow.UsedPct,
 			}
+		}
+		if w, ok := wipSnapshot(j.Tmux); ok {
+			wc := w
+			entry.Wip = &wc
 		}
 		jobs = append(jobs, entry)
 		load[j.VM]++
@@ -255,69 +275,85 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 		Inbox:   cfg.GitHub.InboxRepo,
 		Connect: &cs,
 	}
-	if five, seven, ok := latestQuota(); ok {
-		q := &apiQuota{
-			FiveHourPct:      five.UsedPct,
-			FiveHourResetsAt: five.ResetsAt,
-			SevenDayPct:      seven.UsedPct,
-			SevenDayResetsAt: seven.ResetsAt,
+	// Per-agent metering. Each configured agent (claude/codex) surfaces its own
+	// quota (5h + weekly + plan/credits) and governor verdict. The decision is a
+	// pure function of that agent's quota + wall clock (ThrottleDecide, not
+	// currentThrottle) so this snapshot path never takes the quota or st.mu
+	// locks. Active/paused are counted per agent from the same snapshot the rest
+	// of /api/state uses so the numbers match the cards. EffectiveCap math.MaxInt
+	// encodes as -1 ("uncapped"). The claude entry is also mirrored to the legacy
+	// top-level Quota/Governor for back-compat with the existing frontend.
+	now := time.Now()
+	govs := st.GovernorStates()
+	// Count active/paused governable jobs per agent in one pass.
+	activeByAgent := map[string]int{}
+	pausedByAgent := map[string]int{}
+	for _, j := range snap {
+		switch j.Lifecycle {
+		case "cron", "adhoc":
+			continue
 		}
-		// Mirror the daemon's exact decision: reuse the already-fetched
-		// readings via ThrottleDecide (not currentThrottle) so we don't
-		// re-acquire the quota lock, and this snapshot path stays free of
-		// st.mu / len(st.Jobs) — the decision is a pure function of quota +
-		// wall clock.
-		d := ThrottleDecide(time.Now(), five, seven, ok, cfg.Orch.Throttle)
-		at := &apiThrottle{
-			Mode:      d.Mode.String(),
-			Reason:    d.Reason,
-			TargetPct: d.TargetPct,
+		if j.Tmux == "" {
+			continue
 		}
-		if !d.Until.IsZero() {
-			at.Until = d.Until.Unix()
+		jc := j
+		a := jobAccount(cfg, &jc)
+		if j.Paused {
+			pausedByAgent[a]++
+		} else {
+			activeByAgent[a]++
 		}
-		if !d.ProjectedExhaust.IsZero() {
-			at.ProjectedExhaust = d.ProjectedExhaust.Unix()
-		}
-		q.Throttle = at
-		resp.Quota = q
 	}
-	// Governor telemetry. Only surfaced when the last tick's decision was
-	// enabled (fail-open => omitted, dashboard shows nothing special). Active /
-	// paused are recounted from the same snapshot the rest of /api/state uses so
-	// the numbers match the cards exactly. EffectiveCap of math.MaxInt encodes
-	// as -1 ("uncapped").
-	if gov := st.GovernorState(); gov.Enabled {
-		var active, paused int
-		for _, j := range snap {
-			switch j.Lifecycle {
-			case "cron", "adhoc":
-				continue
+	for _, agent := range configuredAccounts(cfg) {
+		m := &apiAgentMeter{}
+		if aq, ok := latestAgentQuota(agent); ok {
+			five, seven := aq.Five, aq.Seven
+			q := &apiQuota{
+				FiveHourPct:      five.UsedPct,
+				FiveHourResetsAt: five.ResetsAt,
+				SevenDayPct:      seven.UsedPct,
+				SevenDayResetsAt: seven.ResetsAt,
+				PlanType:         aq.PlanType,
+				Credits:          aq.Credits,
 			}
-			if j.Tmux == "" {
-				continue
+			d := ThrottleDecide(now, five, seven, true, cfg.Orch.Throttle)
+			at := &apiThrottle{Mode: d.Mode.String(), Reason: d.Reason, TargetPct: d.TargetPct}
+			if !d.Until.IsZero() {
+				at.Until = d.Until.Unix()
 			}
-			if j.Paused {
-				paused++
-			} else {
-				active++
+			if !d.ProjectedExhaust.IsZero() {
+				at.ProjectedExhaust = d.ProjectedExhaust.Unix()
+			}
+			q.Throttle = at
+			m.Quota = q
+		}
+		if gov := govs[agent]; gov.Enabled {
+			cap := gov.EffectiveCap
+			if cap == math.MaxInt {
+				cap = -1
+			}
+			m.Governor = &apiGovernor{
+				Enabled:         true,
+				EffectiveCap:    cap,
+				Active:          activeByAgent[agent],
+				Paused:          pausedByAgent[agent],
+				BurnWeekly:      gov.BurnWeekly,
+				TargetWeekly:    gov.TargetWeekly,
+				BurnFive:        gov.BurnFive,
+				TargetFive:      gov.TargetFive,
+				ProjectedEndPct: gov.ProjectedEndPct,
+				Binding:         gov.Binding,
 			}
 		}
-		cap := gov.EffectiveCap
-		if cap == math.MaxInt {
-			cap = -1
+		if m.Quota != nil || m.Governor != nil {
+			if resp.Agents == nil {
+				resp.Agents = map[string]*apiAgentMeter{}
+			}
+			resp.Agents[agent] = m
 		}
-		resp.Governor = &apiGovernor{
-			Enabled:         true,
-			EffectiveCap:    cap,
-			Active:          active,
-			Paused:          paused,
-			BurnWeekly:      gov.BurnWeekly,
-			TargetWeekly:    gov.TargetWeekly,
-			BurnFive:        gov.BurnFive,
-			TargetFive:      gov.TargetFive,
-			ProjectedEndPct: gov.ProjectedEndPct,
-			Binding:         gov.Binding,
+		if agent == "claude" {
+			resp.Quota = m.Quota
+			resp.Governor = m.Governor
 		}
 	}
 	body, _ := json.Marshal(resp)
@@ -876,9 +912,9 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 
 	mux.HandleFunc("/api/events/ws", auth(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			InsecureSkipVerify:  true, // same-origin only via the auth() gate
-			OriginPatterns:      []string{"*"},
-			CompressionMode:     websocket.CompressionDisabled,
+			InsecureSkipVerify: true, // same-origin only via the auth() gate
+			OriginPatterns:     []string{"*"},
+			CompressionMode:    websocket.CompressionDisabled,
 		})
 		if err != nil {
 			return

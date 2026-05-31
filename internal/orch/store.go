@@ -72,6 +72,12 @@ CREATE INDEX IF NOT EXISTS quota_samples_ts ON quota_samples(ts);`); err != nil 
 		return nil, err
 	}
 	_, _ = db.Exec(`ALTER TABLE usage_daily ADD COLUMN issue INTEGER NOT NULL DEFAULT 0`)
+	// Per-agent quota: existing rows predate multi-agent and are all claude.
+	_, _ = db.Exec(`ALTER TABLE quota_samples ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS quota_samples_agent_ts ON quota_samples(agent, ts)`)
+	// One-time dedupe: collapse closed_jobs to the newest row per issue (a past
+	// flapping issue could have left hundreds). Insert path keeps it deduped.
+	_, _ = db.Exec(`DELETE FROM closed_jobs WHERE id NOT IN (SELECT MAX(id) FROM closed_jobs GROUP BY issue)`)
 	return &Store{db: db}, nil
 }
 
@@ -315,18 +321,26 @@ func (s *Store) LoadUsageHistory(sinceDate string) ([]UsageDailyRow, error) {
 func (s *Store) InsertQuotaSample(q QuotaSample) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`INSERT INTO quota_samples (ts, five_pct, five_reset, seven_pct, seven_reset)
-		VALUES (?,?,?,?,?)`,
-		q.Ts, q.FivePct, q.FiveReset, q.SevenPct, q.SevenReset)
+	agent := q.Agent
+	if agent == "" {
+		agent = "claude"
+	}
+	_, err := s.db.Exec(`INSERT INTO quota_samples (agent, ts, five_pct, five_reset, seven_pct, seven_reset)
+		VALUES (?,?,?,?,?,?)`,
+		agent, q.Ts, q.FivePct, q.FiveReset, q.SevenPct, q.SevenReset)
 	return err
 }
 
-// LoadQuotaSamples returns all samples with ts >= sinceTs, oldest first.
-func (s *Store) LoadQuotaSamples(sinceTs int64) ([]QuotaSample, error) {
+// LoadQuotaSamples returns one agent's samples with ts >= sinceTs, oldest
+// first. Rows written before the per-agent migration default to agent='claude'.
+func (s *Store) LoadQuotaSamples(agent string, sinceTs int64) ([]QuotaSample, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT ts, five_pct, five_reset, seven_pct, seven_reset
-		FROM quota_samples WHERE ts >= ? ORDER BY ts ASC`, sinceTs)
+	if agent == "" {
+		agent = "claude"
+	}
+	rows, err := s.db.Query(`SELECT agent, ts, five_pct, five_reset, seven_pct, seven_reset
+		FROM quota_samples WHERE agent = ? AND ts >= ? ORDER BY ts ASC`, agent, sinceTs)
 	if err != nil {
 		return nil, err
 	}
@@ -334,7 +348,7 @@ func (s *Store) LoadQuotaSamples(sinceTs int64) ([]QuotaSample, error) {
 	var out []QuotaSample
 	for rows.Next() {
 		var q QuotaSample
-		if err := rows.Scan(&q.Ts, &q.FivePct, &q.FiveReset, &q.SevenPct, &q.SevenReset); err != nil {
+		if err := rows.Scan(&q.Agent, &q.Ts, &q.FivePct, &q.FiveReset, &q.SevenPct, &q.SevenReset); err != nil {
 			return nil, err
 		}
 		out = append(out, q)
@@ -458,6 +472,11 @@ func (s *Store) PutClosedJob(issue int, state string, j *Job) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// One row per issue: replace any prior closed record so a re-spawned /
+	// re-closed issue (or a flapping one) can't pile up hundreds of ghosts.
+	if _, err = s.db.Exec("DELETE FROM closed_jobs WHERE issue = ?", issue); err != nil {
+		return err
+	}
 	_, err = s.db.Exec(
 		"INSERT INTO closed_jobs (issue, state, data, closed_at) VALUES (?,?,?,?)",
 		issue, state, b, time.Now().Unix(),
