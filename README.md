@@ -4,10 +4,7 @@ Orchestration and project management with coding agents
 
 Visit https://orchid.littledivy.com to get started
 
-<img width="535" height="412" alt="image" src="https://github.com/user-attachments/assets/bea3cf08-5322-4a1c-954e-98ff2eccd8c5" />
-
-
-
+<img width="601" height="419" alt="image" src="https://github.com/user-attachments/assets/0bc63b69-6f92-406c-befa-aba122fb31d2" />
 
 ### Setup
 
