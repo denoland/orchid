@@ -317,6 +317,17 @@ html.dark .card-status-watching {
 .docs-prose th, .docs-prose td { padding: .55rem .85rem; border-bottom: 1px solid var(--line); text-align: left; }
 .docs-prose th { font-weight: 600; background: #f4f4f5; }
 
+/* docs-prose is also used in the dashboard (Memory tab), outside .docs-page —
+   so define its palette vars here (the marketing block doesn't reach it) and
+   give code blocks dark-aware colors. Without this, dark mode renders code
+   blocks as var(--ink) = near-white bg with light text (invisible). */
+.docs-prose { --line: #e4e4e7; --muted: #71717a; --orchid-deep: #7c3aed; }
+html.dark .docs-prose { --line: #27272a; --muted: #a1a1aa; --orchid-deep: #a78bfa; }
+html.dark .docs-prose code { background: #27272a; color: #e4e4e7; }
+html.dark .docs-prose pre { background: #18181b; color: #e4e4e7; }
+html.dark .docs-prose pre code { background: transparent; color: inherit; }
+html.dark .docs-prose th { background: #27272a; }
+
 .docs-burger {
   display: none;
   background: transparent; border: 0; cursor: pointer;

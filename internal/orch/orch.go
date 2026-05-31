@@ -53,6 +53,7 @@ type OrchBlock struct {
 	Mentions      *MentionsBlock `hcl:"mentions,block" json:"mentions,omitempty"`
 	Capture       *CaptureBlock  `hcl:"capture,block" json:"capture,omitempty"`
 	Throttle      *ThrottleBlock `hcl:"throttle,block" json:"throttle,omitempty"`
+	Memory        *MemoryBlock   `hcl:"memory,block" json:"memory,omitempty"`
 }
 
 type CaptureBlock struct {
@@ -375,6 +376,18 @@ func sshArgs(vm VMBlock) []string {
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
 		"-o", "StrictHostKeyChecking=accept-new",
+		// Multiplex: every idle-check / poke / tail to a host shares ONE TCP+ssh
+		// master connection instead of opening a fresh handshake. Without this,
+		// ~10 sessions on a box fire ~10 simultaneous handshakes per poll tick →
+		// the box's sshd MaxStartups resets new connections ("kex_exchange_
+		// identification: Connection reset") and the worker goes unreachable while
+		// its already-open connections keep showing live. ControlPersist keeps the
+		// master warm between calls; %C hashes user/host/port into the socket name.
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=/tmp/orch-ssh-%C",
+		"-o", "ControlPersist=120s",
+		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveCountMax=3",
 		"-i", expand(vm.Key),
 		fmt.Sprintf("%s@%s", vm.User, vm.Host),
 	}
@@ -665,7 +678,7 @@ fi
 	return nil
 }
 
-func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, sessionCmdOverride, botLogin, botEmail string) error {
+func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, sessionCmdOverride, botLogin, botEmail, memOverrideDir string) error {
 	sessionCmd := sessionCmdOverride
 	if sessionCmd == "" {
 		sessionCmd = vm.SessionCmd
@@ -688,6 +701,7 @@ BOT_LOGIN=%q
 BOT_EMAIL=%q
 AGENT=%q
 CODEX_HOME=%q
+MEM_STORE=%q
 
 # 1) shared clone (once per repo per VM); always fetch fresh refs.
 # Prefer ssh when the bot has an id_ed25519 wired to github; fall back
@@ -751,13 +765,21 @@ if [ "$AGENT" = "claude" ]; then
   # orch gets a RELIABLE "waiting for input" signal (claude emits it) instead of
   # scraping the pane. $HOME stays literal in the stored command (claude expands
   # it at hook runtime, like the statusLine hook).
+  #
+  # Also pin autoMemoryDirectory to ONE shared, persistent store per home. Claude
+  # auto-memory is otherwise keyed by cwd path, so every ephemeral issue-N
+  # worktree gets an isolated island and nothing accumulates across the swarm.
+  # Redirecting all sessions to "$CHOME/.claude/auto-memory" makes the swarm's
+  # discovered build env / maintainer prefs / ops gotchas compound into one wiki
+  # that every later session reads at startup. autoMemoryDirectory resolves from
+  # user settings (this file), and an absolute path avoids ~-expansion ambiguity.
   stamp_hooks() {
     local CHOME="$1"
     [ -z "$CHOME" ] && return
-    mkdir -p "$CHOME/.claude"
+    mkdir -p "$CHOME/.claude/auto-memory"
     local SJ="$CHOME/.claude/settings.json"
     [ -f "$SJ" ] || echo '{}' > "$SJ"
-    jq '.hooks.Notification = [{"hooks":[{"type":"command","command":"tee -a $HOME/.claude/notify.jsonl >/dev/null"}]}] | .hooks.UserPromptSubmit = [{"hooks":[{"type":"command","command":"tee -a $HOME/.claude/notify.jsonl >/dev/null"}]}]' "$SJ" > "$SJ.tmp" && mv "$SJ.tmp" "$SJ"
+    jq --arg amd "$CHOME/.claude/auto-memory" '.hooks.Notification = [{"hooks":[{"type":"command","command":"tee -a $HOME/.claude/notify.jsonl >/dev/null"}]}] | .hooks.UserPromptSubmit = [{"hooks":[{"type":"command","command":"tee -a $HOME/.claude/notify.jsonl >/dev/null"}]}] | .autoMemoryEnabled = true | .autoMemoryDirectory = $amd' "$SJ" > "$SJ.tmp" && mv "$SJ.tmp" "$SJ"
   }
   stamp_trust "$HOME"
   stamp_hooks "$HOME"
@@ -766,6 +788,17 @@ if [ "$AGENT" = "claude" ]; then
     stamp_hooks "$SESSION_HOME"
   fi
 elif [ "$AGENT" = "codex" ]; then
+  # The shared swarm knowledge base is the claude auto-memory store (one dir,
+  # maintained by every session). Codex runs as the session user too, so it can
+  # READ the same store — we just point it there via AGENTS.md (codex's native,
+  # always-loaded global instructions). One brain across both agents, no copy.
+  STORE="$MEM_STORE"
+  if [ -z "$STORE" ]; then
+    STORE="$HOME/.claude/auto-memory"
+    if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ]; then
+      STORE="$SESSION_HOME/.claude/auto-memory"
+    fi
+  fi
   # Trust the repo root + worktree in the codex home's config.toml. CDIR is the
   # codex home directory itself (CODEX_HOME, or ~/.codex by default).
   trust_codex() {
@@ -781,12 +814,35 @@ elif [ "$AGENT" = "codex" ]; then
       fi
     done
   }
+  # Stamp AGENTS.md pointing codex at the shared store + inline its current index
+  # for cold-start value. Overwritten each spawn so the inlined index stays fresh.
+  stamp_codex_agents() {
+    local CDIR="$1"
+    [ -z "$CDIR" ] && return
+    mkdir -p "$CDIR"
+    {
+      printf '# Swarm agent notes (codex)\n\n'
+      printf 'The orchid swarm keeps a shared, accumulating knowledge base that every\n'
+      printf 'past claude/codex session contributed to (build-env incantations, test\n'
+      printf 'recipes, maintainer preferences learned the hard way). Notes are kept\n'
+      printf 'per target repo under %%s/<owner>/<repo>/.\n\n' "$STORE"
+      printf 'Before starting, skim this repo (%%s) index and open any relevant note:\n' "$REPO"
+      printf '  %%s/%%s/MEMORY.md   (this repo, index)\n' "$STORE" "$REPO"
+      printf '  %%s/<owner>/<repo>/MEMORY.md   (other repos, cross-reference freely)\n\n' "$STORE"
+      printf 'If you learn a durable, reusable fact, append a short note in this repo'"'"'s\n'
+      printf 'dir so the next session inherits it.\n\n## This repo index\n'
+      grep -E '^- ' "$STORE/$REPO/MEMORY.md" 2>/dev/null || true
+    } > "$CDIR/AGENTS.md"
+  }
   if [ -n "$CODEX_HOME" ]; then
     trust_codex "$CODEX_HOME"
+    stamp_codex_agents "$CODEX_HOME"
   else
     trust_codex "$HOME/.codex"
+    stamp_codex_agents "$HOME/.codex"
     if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ] && [ "$SESSION_HOME" != "$HOME" ]; then
       trust_codex "$SESSION_HOME/.codex"
+      stamp_codex_agents "$SESSION_HOME/.codex"
     fi
   fi
 fi
@@ -798,9 +854,19 @@ LAUNCH="$SESSION_CMD"
 if [ -n "$CODEX_HOME" ]; then
   LAUNCH="CODEX_HOME=\"$CODEX_HOME\" $SESSION_CMD"
 fi
+# Per-target auto-memory: redirect claude's auto-memory to this repo's dir inside
+# the git-backed memory clone (MEM_OVERRIDE = <clone>/<dir>/<owner>/<repo>), set
+# by the caller. The sync loop commits + pushes it. Per-process env => no
+# settings-file race between concurrent sessions; cross-target notes still
+# reference each other (the dashboard resolves links across all repo dirs).
+if [ "$AGENT" = "claude" ] && [ -n "$MEM_STORE" ]; then
+  MEM_OVERRIDE="$MEM_STORE/$REPO"
+  mkdir -p "$MEM_OVERRIDE"
+  LAUNCH="CLAUDE_COWORK_MEMORY_PATH_OVERRIDE=\"$MEM_OVERRIDE\" $SESSION_CMD"
+fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -c "$WORKDIR" -s "$SESSION" "$LAUNCH"
-`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome, botLogin, botEmail, agent, codexHome)
+`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome, botLogin, botEmail, agent, codexHome, memOverrideDir)
 
 	_, errStr, err := sshExecIn(vm, script, "bash -s")
 	if err != nil {
