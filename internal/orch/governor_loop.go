@@ -27,10 +27,10 @@ const maxDutyOpsPerTick = 4
 // only consumes the data when the governor is enabled) and prunes to ~14 days
 // every 50th insert. Fails silently when there is no statusline yet (ok=false)
 // — no sample, no harm.
-func runQuotaSampleLoop(ctx context.Context, store *Store, cfg *ThrottleBlock) {
+func runQuotaSampleLoop(ctx context.Context, store *Store, cfg *Config) {
 	iv := defaultGovSampleInterval
-	if cfg != nil {
-		iv = cfg.withDefaults().sampleIntervalDur()
+	if cfg.Orch.Throttle != nil {
+		iv = cfg.Orch.Throttle.withDefaults().sampleIntervalDur()
 	}
 	t := time.NewTicker(iv)
 	defer t.Stop()
@@ -40,19 +40,23 @@ func runQuotaSampleLoop(ctx context.Context, store *Store, cfg *ThrottleBlock) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			five, seven, ok := latestQuota()
-			if !ok {
-				continue
-			}
-			if err := store.InsertQuotaSample(QuotaSample{
-				Ts:         time.Now().Unix(),
-				FivePct:    five.UsedPct,
-				FiveReset:  five.ResetsAt,
-				SevenPct:   seven.UsedPct,
-				SevenReset: seven.ResetsAt,
-			}); err != nil {
-				log.Printf("governor: insert quota sample: %v", err)
-				continue
+			// Sample each configured agent's account independently — claude and
+			// codex pace against their own buckets.
+			for _, agent := range configuredAccounts(cfg) {
+				five, seven, ok := latestQuota(agent)
+				if !ok {
+					continue
+				}
+				if err := store.InsertQuotaSample(QuotaSample{
+					Agent:      agent,
+					Ts:         time.Now().Unix(),
+					FivePct:    five.UsedPct,
+					FiveReset:  five.ResetsAt,
+					SevenPct:   seven.UsedPct,
+					SevenReset: seven.ResetsAt,
+				}); err != nil {
+					log.Printf("governor: insert quota sample (%s): %v", agent, err)
+				}
 			}
 			if n++; n%50 == 0 {
 				if err := store.PruneQuotaSamples(time.Now().Add(-14 * 24 * time.Hour).Unix()); err != nil {
@@ -73,14 +77,51 @@ func defaultPriority(cfg *Config) int {
 	return 0
 }
 
+// configuredAccounts returns the distinct billing/metering accounts across all
+// configured VMs (claude/codex/codex-mini/…), defaulting an unset account to
+// the VM's agent name. Sorted for stable iteration. This is the set the
+// governor + quota sampler pace independently.
+func configuredAccounts(cfg *Config) []string {
+	seen := map[string]bool{}
+	var out []string
+	for i := range cfg.VMs {
+		a := vmAccount(cfg.VMs[i])
+		if a == "" {
+			a = "claude"
+		}
+		if !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// jobAccount resolves the metering account a job counts against, via its VM's
+// account (which defaults to the agent name). Falls back to "claude" when the
+// VM is gone or unset.
+func jobAccount(cfg *Config, j *Job) string {
+	if j == nil {
+		return "claude"
+	}
+	if vm := vmByName(cfg, j.VM); vm != nil {
+		if a := vmAccount(*vm); a != "" {
+			return a
+		}
+	}
+	return "claude"
+}
+
 // countRunning counts the jobs the governor's cap/duty math treats as "active
-// running sessions": oneshot/PR jobs that are alive (have a tmux session) and
-// NOT paused. Cron in-flight fires and adhoc jobs are excluded — they are
-// short, timeout-bounded, and never duty-cycle victims (§2). Call under st.mu.
-func countRunning(st *State) int {
+// running sessions" for one agent: oneshot/PR jobs on that agent that are alive
+// (have a tmux session) and NOT paused. Cron in-flight fires and adhoc jobs are
+// excluded — they are short, timeout-bounded, and never duty-cycle victims
+// (§2). Call under st.mu.
+func countRunning(cfg *Config, st *State, agent string) int {
 	n := 0
 	for _, j := range st.Jobs {
-		if !governable(j) {
+		if !governable(j) || jobAccount(cfg, j) != agent {
 			continue
 		}
 		if j.Paused {
@@ -91,15 +132,15 @@ func countRunning(st *State) int {
 	return n
 }
 
-// countGovernable counts governable jobs whether running OR paused. The
+// countGovernable counts governable jobs (running OR paused) for one agent. The
 // admission cap bounds TOTAL admitted work — a paused session resumes and burns
 // again — so admission must count paused jobs too, else duty-cycle-pausing one
 // would free an admission slot and pull in fresh work, defeating the pause.
 // Call under st.mu.
-func countGovernable(st *State) int {
+func countGovernable(cfg *Config, st *State, agent string) int {
 	n := 0
 	for _, j := range st.Jobs {
-		if governable(j) {
+		if governable(j) && jobAccount(cfg, j) == agent {
 			n++
 		}
 	}
@@ -159,13 +200,13 @@ func jobsByPriority(st *State, filter func(n int, j *Job) bool, ascending bool) 
 // duty_cycle turned off while governor_enabled stays true) or the VM is gone,
 // clear the flag so the main loop respawns it (--resume) on its next pass.
 // Call under st.mu.
-func reconcilePaused(cfg *Config, st *State, dutyActive bool) {
+func reconcilePaused(cfg *Config, st *State, dutyActiveByAgent map[string]bool) {
 	changed := false
 	for n, j := range st.Jobs {
 		if !j.Paused {
 			continue
 		}
-		if !dutyActive || vmByName(cfg, j.VM) == nil {
+		if !dutyActiveByAgent[jobAccount(cfg, j)] || vmByName(cfg, j.VM) == nil {
 			j.Paused = false
 			j.PausedAt = time.Time{}
 			changed = true
@@ -189,14 +230,14 @@ func reconcilePaused(cfg *Config, st *State, dutyActive bool) {
 // decayed back under target) or it has been paused longer than maxPause
 // (never-strand). Gating resume on !OverPace, not the paused count, is what lets
 // a single hot session pace below 50% duty.
-func applyDutyCycle(cfg *Config, st *State, gov GovernorDecision, maxPause time.Duration) {
+func applyDutyCycle(cfg *Config, st *State, agent string, gov GovernorDecision, maxPause time.Duration) {
 	ops := 0
 	changed := false
 	now := time.Now()
 
 	// --- Resume pass (highest priority first, oldest-paused tiebreak) ---
 	paused := jobsByPriority(st, func(n int, j *Job) bool {
-		return j.Paused && governable(j)
+		return j.Paused && governable(j) && jobAccount(cfg, j) == agent
 	}, false) // DESC
 	sort.SliceStable(paused, func(a, b int) bool {
 		ja, jb := st.Jobs[paused[a]], st.Jobs[paused[b]]
@@ -230,7 +271,7 @@ func applyDutyCycle(cfg *Config, st *State, gov GovernorDecision, maxPause time.
 	// killing a no-PR session would lose its early work.
 	if pausedCount < gov.PausedTarget {
 		victims := jobsByPriority(st, func(n int, j *Job) bool {
-			return governable(j) && !j.Paused && j.PR > 0
+			return governable(j) && !j.Paused && j.PR > 0 && jobAccount(cfg, j) == agent
 		}, true) // ASC
 		sort.SliceStable(victims, func(a, b int) bool {
 			ja, jb := st.Jobs[victims[a]], st.Jobs[victims[b]]

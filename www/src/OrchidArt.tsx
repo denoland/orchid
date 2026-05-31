@@ -9,33 +9,37 @@ import svgBody from './orchid-spray.svg'
 /// canonical source SVG file is `.claude/skills/orchid-art/orchid-spray.svg`.
 export function OrchidArt({
   className = '',
+  posClassName = 'fixed left-0 top-1/2 z-0',
   height = '110vh',
   width = '1100px',
   opacity = 0.32,
   bleed = 38,
   maskStart = 55,
   maskEnd = 95,
+  transform,
 }: {
   className?: string
+  posClassName?: string
   height?: string
   width?: string
   opacity?: number
   bleed?: number
   maskStart?: number
   maskEnd?: number
+  transform?: string
 }) {
   const mask = `linear-gradient(to right, black 0%, black ${maskStart}%, transparent ${maskEnd}%)`
   return (
     <div
       aria-hidden
-      className={'pointer-events-none fixed left-0 top-1/2 z-0 text-blue-700 dark:text-blue-400 ' + className}
+      className={'pointer-events-none text-blue-700 dark:text-blue-400 ' + posClassName + ' ' + className}
       style={{
         width,
         height,
         opacity,
         maskImage: mask,
         WebkitMaskImage: mask,
-        transform: `translate(-${bleed}%, -50%)`,
+        transform: transform ?? `translate(-${bleed}%, -50%)`,
       }}
     >
       <svg

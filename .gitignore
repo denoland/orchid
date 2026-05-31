@@ -67,3 +67,6 @@ capture/ios/build/
 *.swo
 node_modules/
 cfrelaytun/go/example/example
+
+# cross-compiled orch binaries (build artifacts)
+orch.linux-*

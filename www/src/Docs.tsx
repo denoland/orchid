@@ -18,7 +18,7 @@ const PAGES: Page[] = [
     title: 'Dashboard',
     file: 'dashboard.md',
     section: 'start',
-    lede: 'Tour the canvas, list view, panes, and settings.',
+    lede: 'Tour the session list, PR/CI status, panes, and settings.',
   },
   {
     slug: 'configuration',

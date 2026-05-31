@@ -118,10 +118,10 @@ export default defineConfig({
     chunkSizeWarningLimit: 800,
     rollupOptions: {
       output: {
-        // Pull the two heaviest deps (react-flow, xterm) into their own
-        // chunks so the initial paint doesn't have to parse them.
+        // Pull the heaviest dep (xterm) into its own chunk so the initial
+        // paint doesn't have to parse it. (react-flow was removed with the
+        // canvas view.)
         manualChunks: {
-          'reactflow': ['@xyflow/react'],
           'xterm': ['@xterm/xterm', '@xterm/addon-fit'],
         },
       },

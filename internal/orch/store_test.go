@@ -149,7 +149,7 @@ func TestQuotaSamplesRoundTrip(t *testing.T) {
 	}
 
 	// Empty load.
-	got, err := store.LoadQuotaSamples(0)
+	got, err := store.LoadQuotaSamples("claude", 0)
 	if err != nil {
 		t.Fatalf("load empty: %v", err)
 	}
@@ -159,9 +159,9 @@ func TestQuotaSamplesRoundTrip(t *testing.T) {
 
 	// Three samples at increasing ts. Out-of-order insert to verify ORDER BY ts.
 	samples := []QuotaSample{
-		{Ts: 1000, FivePct: 10, FiveReset: 5000, SevenPct: 20, SevenReset: 9000},
-		{Ts: 3000, FivePct: 30, FiveReset: 5000, SevenPct: 40, SevenReset: 9000},
-		{Ts: 2000, FivePct: 20, FiveReset: 5000, SevenPct: 30, SevenReset: 9000},
+		{Agent: "claude", Ts: 1000, FivePct: 10, FiveReset: 5000, SevenPct: 20, SevenReset: 9000},
+		{Agent: "claude", Ts: 3000, FivePct: 30, FiveReset: 5000, SevenPct: 40, SevenReset: 9000},
+		{Agent: "claude", Ts: 2000, FivePct: 20, FiveReset: 5000, SevenPct: 30, SevenReset: 9000},
 	}
 	for _, q := range samples {
 		if err := store.InsertQuotaSample(q); err != nil {
@@ -170,21 +170,21 @@ func TestQuotaSamplesRoundTrip(t *testing.T) {
 	}
 
 	// Load all, oldest first.
-	got, err = store.LoadQuotaSamples(0)
+	got, err = store.LoadQuotaSamples("claude", 0)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
 	want := []QuotaSample{
-		{Ts: 1000, FivePct: 10, FiveReset: 5000, SevenPct: 20, SevenReset: 9000},
-		{Ts: 2000, FivePct: 20, FiveReset: 5000, SevenPct: 30, SevenReset: 9000},
-		{Ts: 3000, FivePct: 30, FiveReset: 5000, SevenPct: 40, SevenReset: 9000},
+		{Agent: "claude", Ts: 1000, FivePct: 10, FiveReset: 5000, SevenPct: 20, SevenReset: 9000},
+		{Agent: "claude", Ts: 2000, FivePct: 20, FiveReset: 5000, SevenPct: 30, SevenReset: 9000},
+		{Agent: "claude", Ts: 3000, FivePct: 30, FiveReset: 5000, SevenPct: 40, SevenReset: 9000},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("load all mismatch:\n got=%v\nwant=%v", got, want)
 	}
 
 	// sinceTs filter returns only the recent subset.
-	got, err = store.LoadQuotaSamples(2000)
+	got, err = store.LoadQuotaSamples("claude", 2000)
 	if err != nil {
 		t.Fatalf("load since: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestQuotaSamplesRoundTrip(t *testing.T) {
 	if err := store.PruneQuotaSamples(2500); err != nil {
 		t.Fatalf("prune: %v", err)
 	}
-	got, err = store.LoadQuotaSamples(0)
+	got, err = store.LoadQuotaSamples("claude", 0)
 	if err != nil {
 		t.Fatalf("load after prune: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestQuotaSamplesRoundTrip(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer store2.Close()
-	got, err = store2.LoadQuotaSamples(0)
+	got, err = store2.LoadQuotaSamples("claude", 0)
 	if err != nil {
 		t.Fatalf("load after reopen: %v", err)
 	}

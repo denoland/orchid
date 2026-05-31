@@ -13,6 +13,7 @@
 /// login. The DO holds the agent's WebSocket. HTTP/SSE proxying multiplexes
 /// frames over that socket — see userSession.ts for the frame protocol.
 import { Hono } from 'hono'
+import { INNER_URL_HEADER, INNER_METHOD_HEADER, INNER_HEADERS_HEADER } from 'cfrelaytun'
 import { handleLogin, handleOAuthCallback, currentUser } from './oauth'
 export { UserSession } from './userSession'
 
@@ -61,15 +62,15 @@ async function proxyToAgent(env: Env, subdomain: string, req: Request): Promise<
   const url = new URL(req.url)
   const innerHeaders: [string, string][] = []
   req.headers.forEach((v, k) => {
-    if (!k.toLowerCase().startsWith('x-orchid-inner-')) innerHeaders.push([k, v])
+    if (!k.toLowerCase().startsWith('x-cfrt-inner-')) innerHeaders.push([k, v])
   })
   const body = ['GET', 'HEAD'].includes(req.method) ? null : await req.arrayBuffer()
   return do_.fetch(new Request('https://internal/_proxy', {
     method: req.method,
     headers: {
-      'x-orchid-inner-url': url.pathname + url.search,
-      'x-orchid-inner-method': req.method,
-      'x-orchid-inner-headers': btoa(JSON.stringify(innerHeaders)),
+      [INNER_URL_HEADER]: url.pathname + url.search,
+      [INNER_METHOD_HEADER]: req.method,
+      [INNER_HEADERS_HEADER]: btoa(JSON.stringify(innerHeaders)),
     },
     body,
   }))
@@ -232,8 +233,8 @@ app.use('*', async (c, next) => {
         method: 'GET',
         headers: {
           'upgrade': 'websocket',
-          'x-orchid-inner-url': url.pathname + url.search,
-          'x-orchid-inner-headers': btoa(JSON.stringify(innerHeaders)),
+          [INNER_URL_HEADER]: url.pathname + url.search,
+          [INNER_HEADERS_HEADER]: btoa(JSON.stringify(innerHeaders)),
         },
       })
       return do_.fetch(proxyReq)

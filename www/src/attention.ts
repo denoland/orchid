@@ -25,10 +25,12 @@ export function attention(job: Job): Attention {
   const hasPR = job.pr > 0
   const hasTmux = job.tmux !== ''
 
-  // Positive signal from the pane sampler: the agent is showing a modal
-  // dialog (Yes/No, plan approval, …) and is blocked on a human. Outranks
-  // CI-failing because the dialog is right now, on screen, waiting.
-  if (hasTmux && job.needs_input) {
+  // needs_input (claude's idle/waiting Notification hook) means the agent
+  // stopped and is idle. That's only "needs YOU" when it isn't simply done +
+  // awaiting review: a stopped session WITH an open, non-failing PR is waiting
+  // on a reviewer, not on you, so let it fall through to the watching tiers.
+  // Flag needs-you only when there's no clean PR (no PR, or CI failing).
+  if (hasTmux && job.needs_input && !(hasPR && ci !== 'fail')) {
     return { level: 'needs-you', reason: 'awaiting your answer', score: 110 }
   }
   if (hasPR && ci === 'fail') {
