@@ -158,10 +158,15 @@ function DashboardInner({ state: rawState, relay }: Props) {
           <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)]">
             <SettingsPage key={tab} jobs={jobs} state={state} relay={relay} initialSection={TAB_SECTION[tab as Exclude<Tab, 'sessions' | 'memory' | 'analytics' | 'machines'>]} onClose={() => setTab('sessions')} />
           </div>
+        ) : relay && !relay.connected && relay.login && relay.token ? (
+          // No machine has dialed in yet → the whole Sessions view is the setup
+          // page (GitHub new-repo style), not a banner over an empty list.
+          <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)] bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
+            <FirstJoinSetup relay={relay} />
+          </div>
         ) : (
           <>
             <div className="flex-1 min-w-0 flex flex-col">
-              <FirstJoinBanner relay={relay} />
               <WarningStack
                 stateLoaded={state.inbox !== undefined}
                 inbox={state.inbox}
@@ -2715,19 +2720,30 @@ function UsageTable({ jobs, quota, governor }: { jobs: Job[]; quota?: State['quo
   )
 }
 
-// Shown inline at the top of the Sessions tab until this orch dials into the
-// relay. Replaces the old full-screen InstallModal — same install/join
-// commands, no art, no overlay.
-function FirstJoinBanner({ relay }: { relay: RelayInfo | null }) {
+// The Sessions tab's empty state before any machine has joined — like GitHub's
+// "Quick setup" screen on a fresh repo: the setup instructions ARE the page
+// (no list, no sidebar, no modal). Replaces the old full-screen InstallModal.
+function FirstJoinSetup({ relay }: { relay: RelayInfo | null }) {
   if (!relay || relay.connected || !relay.login || !relay.token) return null
   return (
-    <div className="border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/95 dark:bg-zinc-900/95 p-4 sm:p-6">
-      <div className="flex items-center gap-2.5 mb-4">
+    <div className="w-full max-w-2xl mx-auto px-4 sm:px-6 py-10 sm:py-14">
+      <div className="flex items-center gap-2 mb-2">
         <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-        <h2 className="text-[15px] font-semibold text-zinc-900 dark:text-zinc-100">Connect your orchid</h2>
-        <span className="text-[12.5px] text-zinc-500 dark:text-zinc-400 hidden sm:inline">— run these on your box to bring it online.</span>
+        <span className="mono text-[10.5px] uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Waiting for your first machine</span>
       </div>
-      <JoinCommandCard info={relay} />
+      <h1 className="text-[22px] sm:text-[26px] font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">Bring a machine online</h1>
+      <p className="mt-2.5 text-[13.5px] leading-relaxed text-zinc-500 dark:text-zinc-400 max-w-xl">
+        Orchid runs the swarm on machines you own. Run these two commands on the
+        box that should host it — a Linux server or your Mac. The moment it dials
+        in, your sessions show up right here.
+      </p>
+      <div className="mt-6">
+        <JoinCommandCard info={relay} />
+      </div>
+      <p className="mt-5 text-[12.5px] text-zinc-400 dark:text-zinc-500">
+        First time? Read the{' '}
+        <a href="/docs/getting-started" className="text-violet-600 dark:text-violet-400 hover:underline">getting started guide</a>.
+      </p>
     </div>
   )
 }
