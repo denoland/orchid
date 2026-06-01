@@ -23,18 +23,18 @@ export interface WSBus {
 }
 export const WSBusContext = createContext<WSBus | null>(null)
 
-// The bare apex and local dev are the public entry point — they show the docs
-// (with a Sign in button), no marketing landing. Every other host is a
-// per-user dashboard subdomain (<user>.orchid.littledivy.com): it ALWAYS
-// renders the dashboard, even while orch is down — it must never fall back to
-// the public docs. (Signed-in users reach their subdomain via /login →
-// /dashboard; the apex never serves a dashboard.)
-const PUBLIC_HOSTS = new Set(['orchid.littledivy.com', 'localhost', '127.0.0.1'])
+// Only the hosted marketing apex shows the docs at "/". EVERY other host serves
+// the dashboard at "/": the per-user dashboard subdomains (<user>.<apex>) AND
+// any self-hosted orch — localhost, a LAN IP, your own domain — reached
+// directly on orch's own :8000 with no relay. Docs are always available at
+// /docs on any host. (A self-hosted orch gates the dashboard itself via its
+// http_secret; the relay/subdomain login is a hosted-only concern.)
+const HOSTED_APEX = 'orchid.littledivy.com'
 
 export default function App() {
   if (location.pathname.startsWith('/docs')) return <Docs />
-  if (!PUBLIC_HOSTS.has(location.hostname)) return <DashboardApp />
-  return <Docs />
+  if (location.hostname === HOSTED_APEX) return <Docs />
+  return <DashboardApp />
 }
 
 function DashboardApp() {
@@ -56,9 +56,16 @@ function DashboardApp() {
     let reopenDelay = 1000
 
     const bounceToLogin = () => {
-      const apex = location.host.split('.').slice(1).join('.')
       const next = encodeURIComponent(location.href)
-      location.href = `https://${apex}/login?next=${next}`
+      const h = location.hostname
+      if (h === HOSTED_APEX || h.endsWith('.' + HOSTED_APEX)) {
+        // hosted: the relay's login lives on the apex
+        const apex = location.host.split('.').slice(1).join('.')
+        location.href = `https://${apex}/login?next=${next}`
+      } else {
+        // self-hosted: orch serves its own http_secret token form at /login
+        location.href = `/login?next=${next}`
+      }
     }
 
     const fetchOnce = async () => {
