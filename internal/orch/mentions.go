@@ -324,16 +324,10 @@ func dispatchMention(cfg *Config, st *State, m Mention) {
 		}
 	}
 
-	reply := fmt.Sprintf("Hi @%s — I'm an automated bot. @bartlomieju has been notified and will follow up.", m.Author)
-	kind := "issue"
-	if m.IsPR {
-		kind = "pr"
-	}
-	if _, _, err := run("gh", kind, "comment", fmt.Sprint(m.Number), "--repo", m.Repo, "--body", reply); err != nil {
-		log.Printf("mentions: external reply on %s#%d failed: %v", m.Repo, m.Number, err)
-		return
-	}
-	log.Printf("mentions: replied to external @%s in %s#%d", m.Author, m.Repo, m.Number)
+	// No public auto-reply. Only trusted maintainers (handled above) can
+	// dispatch work; a mention from anyone else is logged and ignored so the
+	// bot never posts unsolicited comments on public PRs/issues.
+	log.Printf("mentions: ignoring non-maintainer mention from @%s in %s#%d (no auto-reply)", m.Author, m.Repo, m.Number)
 }
 
 // assignedIssue is one row from `gh search issues assignee:<bot>`. The

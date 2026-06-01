@@ -1110,8 +1110,12 @@ func Main() {
 
 
 	if cfg.Orch.Mentions != nil {
+		// Probe the org-members read once for an early, visible warning — but do
+		// NOT make it fatal. A transient GitHub hiccup at boot must not take the
+		// whole orchestrator down; mentionTick re-fetches every cycle (with TTL)
+		// and skips gracefully until the read succeeds.
 		if _, err := fetchMaintainers(cfg.Orch.Mentions.Org); err != nil {
-			log.Fatalf("mentions: cannot read org %s members (token needs read:org and to be in the org): %v",
+			log.Printf("mentions: WARNING cannot read org %s members yet (needs read:org + org membership): %v — poller will retry each cycle",
 				cfg.Orch.Mentions.Org, err)
 		}
 		mentionInterval, err := time.ParseDuration(cfg.Orch.Mentions.PollInterval)
