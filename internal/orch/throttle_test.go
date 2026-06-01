@@ -168,6 +168,34 @@ func TestThrottleFiveHourGuard(t *testing.T) {
 	}
 }
 
+func TestThrottleFiveHourLinearPace(t *testing.T) {
+	// Weekly cold (used=10, target ~71) so only the 5h linear pacer can fire,
+	// and 5h used stays below the hard 85 guard so we isolate the soft pace.
+	// 5h resets in 2.5h => fiveStart = now-2.5h => elapsed frac 50% =>
+	// target 50, +slack 8 => threshold 58 (strict '>').
+	weekly := mkSeven(10, 2*24*time.Hour)
+	tests := []struct {
+		name string
+		used float64
+		want ThrottleMode
+	}{
+		{name: "5h under linear pace", used: 40, want: ModeAllow},
+		{name: "5h exactly at threshold (strict >)", used: 58, want: ModeAllow},
+		{name: "5h over linear pace -> soft throttle", used: 70, want: ModeThrottle},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := ThrottleDecide(fixedNow, mkFive(tc.used, 150*time.Minute), weekly, true, enabledCfg())
+			if d.Mode != tc.want {
+				t.Fatalf("5h used=%.0f: got %v (%s), want %v", tc.used, d.Mode, d.Reason, tc.want)
+			}
+			if tc.want == ModeThrottle && d.Reason == "" {
+				t.Errorf("expected non-empty Reason for 5h throttle")
+			}
+		})
+	}
+}
+
 func TestThrottlePrecedence(t *testing.T) {
 	// Weekly >= ceiling AND 5h >= pause simultaneously: ceiling wins.
 	seven := mkSeven(95, 3*24*time.Hour)
