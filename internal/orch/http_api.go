@@ -102,7 +102,6 @@ type apiStateResp struct {
 	VMs      []apiVMEntry   `json:"vms"`
 	Inbox    string         `json:"inbox"`
 	Quota    *apiQuota      `json:"quota,omitempty"` // legacy: claude's quota (back-compat)
-	Connect  *connectStatus `json:"connect,omitempty"`
 	Governor *apiGovernor   `json:"governor,omitempty"` // legacy: claude's governor (back-compat)
 	// Per-agent metering: each configured agent's quota + governor, keyed by
 	// agent name ("claude"/"codex"). The legacy Quota/Governor above mirror the
@@ -268,12 +267,10 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 			LastErr:  h.LastErr,
 		})
 	}
-	cs := buildConnectStatus(cfg)
 	resp := apiStateResp{
-		Jobs:    jobs,
-		VMs:     vms,
-		Inbox:   cfg.GitHub.InboxRepo,
-		Connect: &cs,
+		Jobs:  jobs,
+		VMs:   vms,
+		Inbox: cfg.GitHub.InboxRepo,
 	}
 	// Per-agent metering. Each configured agent (claude/codex) surfaces its own
 	// quota (5h + weekly + plan/credits) and governor verdict. The decision is a
@@ -573,35 +570,6 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 	}))
 
 	// Agent credentials (local provider). GET lists each account the swarm uses
-	// and whether orch has creds stored for it; POST /import seeds an account
-	// from auth files on the central host (same as `orch creds import`).
-	mux.HandleFunc("/api/credentials", auth(func(w http.ResponseWriter, r *http.Request) {
-		lc := &localCreds{kv: st.store}
-		type acct struct {
-			Account   string `json:"account"`
-			Agent     string `json:"agent"`
-			Connected bool   `json:"connected"`
-		}
-		seen := map[string]bool{}
-		out := []acct{}
-		for _, vm := range cfg.VMs {
-			a := vmAccount(vm)
-			if seen[a] {
-				continue
-			}
-			seen[a] = true
-			out = append(out, acct{Account: a, Agent: vmAgent(vm).name, Connected: lc.HasCreds(a)})
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-cache")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"provider": credProviderName(),
-			"accounts": out,
-		})
-	}))
-	// Connecting agent accounts is done out-of-band (`orch creds import`, or the
-	// credential provider's own flow) — the dashboard is status-only on purpose.
-
 	// Shared swarm memory (read-only). GET /api/memory -> parsed MEMORY.md index;
 	// GET /api/memory?note=<file.md> -> raw markdown of one topic note.
 	mux.HandleFunc("/api/memory", auth(func(w http.ResponseWriter, r *http.Request) {
@@ -1031,62 +999,6 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 				}
 			}
 		}
-	}))
-
-	mux.HandleFunc("/api/connect/status", auth(func(w http.ResponseWriter, r *http.Request) {
-		// Cheap to recompute on demand; the dashboard polls this while
-		// the device-flow modal is open.
-		if cfg.Orch.BotLogin == "" {
-			cfg.Orch.BotLogin = getConnectedLogin()
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(buildConnectStatus(cfg))
-	}))
-
-	mux.HandleFunc("/api/connect/github/start", auth(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		f, err := startGHDeviceFlow("repo,read:org,workflow")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"user_code":        f.UserCode,
-			"verification_uri": f.VerificationURL,
-			"expires_at":       f.ExpiresAt.Unix(),
-		})
-	}))
-
-	mux.HandleFunc("/api/connect/github/poll", auth(func(w http.ResponseWriter, r *http.Request) {
-		ghFlowMu.Lock()
-		f := ghFlow
-		ghFlowMu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		if f == nil {
-			_ = json.NewEncoder(w).Encode(map[string]any{"state": "idle"})
-			return
-		}
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		resp := map[string]any{"user_code": f.UserCode, "verification_uri": f.VerificationURL}
-		switch {
-		case !f.done:
-			resp["state"] = "pending"
-		case f.err != "":
-			resp["state"] = "error"
-			resp["error"] = f.err
-		default:
-			resp["state"] = "connected"
-			resp["login"] = f.login
-			if cfg.Orch.BotLogin == "" {
-				cfg.Orch.BotLogin = f.login
-			}
-		}
-		_ = json.NewEncoder(w).Encode(resp)
 	}))
 
 	spaFS, _ := fs.Sub(wwwFS, "embed-dist")

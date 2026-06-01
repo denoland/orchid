@@ -22,8 +22,6 @@ The dashboard is a row of tabs in the header:
   writes (cache reads excluded).
 - **Memory** — a tree browser over the swarm's shared knowledge base, with
   search, markdown rendering, and backlinks. See [Memory](/docs/memory).
-- **Integrations** — connect GitHub (one-time device flow) and onboard
-  agent accounts.
 - **Settings** — every `swarm.hcl` field, editable in place.
 
 **Composer** — file inbox issues without leaving the browser; fans out

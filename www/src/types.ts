@@ -73,10 +73,6 @@ export interface Quota {
   throttle?: Throttle
 }
 
-export interface ConnectStatus {
-  github: { connected: boolean; login?: string }
-}
-
 export interface Governor {
   enabled: boolean
   effective_cap: number // -1 == uncapped
@@ -102,7 +98,6 @@ export interface State {
   vms: VM[]
   inbox: string
   quota?: Quota
-  connect?: ConnectStatus
   governor?: Governor
   agents?: Record<string, AgentMeter>
 }

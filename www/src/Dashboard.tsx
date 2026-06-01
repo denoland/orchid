@@ -134,7 +134,6 @@ function DashboardInner({ state: rawState, relay }: Props) {
       <TopBar
         count={jobs.filter((j) => !j.closed_state).length}
         vmCount={new Set((state.vms ?? []).map((v) => v.host)).size}
-        intgCount={(state.connect?.github.connected ? 1 : 0) + Object.values(state.agents ?? {}).filter((m) => m?.quota).length}
         tab={tab}
         setTab={setTab}
         q={q}
@@ -155,20 +154,16 @@ function DashboardInner({ state: rawState, relay }: Props) {
           <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)] bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
             <MachinesPage state={state} />
           </div>
-        ) : tab === 'integrations' ? (
-          <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)] bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
-            <IntegrationsPage state={state} />
-          </div>
         ) : tab !== 'sessions' ? (
           <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)]">
-            <SettingsPage key={tab} jobs={jobs} state={state} relay={relay} initialSection={TAB_SECTION[tab as Exclude<Tab, 'sessions' | 'memory' | 'analytics' | 'machines' | 'integrations'>]} onClose={() => setTab('sessions')} />
+            <SettingsPage key={tab} jobs={jobs} state={state} relay={relay} initialSection={TAB_SECTION[tab as Exclude<Tab, 'sessions' | 'memory' | 'analytics' | 'machines'>]} onClose={() => setTab('sessions')} />
           </div>
         ) : (
           <>
             <div className="flex-1 min-w-0 flex flex-col">
+              <FirstJoinBanner relay={relay} />
               <WarningStack
-                stateLoaded={state.connect !== undefined}
-                githubConnected={!!state.connect?.github.connected}
+                stateLoaded={state.inbox !== undefined}
                 inbox={state.inbox}
                 openSettings={openSettings}
               />
@@ -280,11 +275,10 @@ function Sidebar({ state, open, onClose }: { state: State; open: boolean; onClos
 }
 
 function TopBar({
-  count, vmCount, intgCount, tab, setTab, q, setQ, onOpenCapture, onToggleStats,
+  count, vmCount, tab, setTab, q, setQ, onOpenCapture, onToggleStats,
 }: {
   count: number
   vmCount: number
-  intgCount: number
   tab: Tab
   setTab: (t: Tab) => void
   q: string
@@ -297,7 +291,6 @@ function TopBar({
     { id: 'machines', label: 'Machines', count: vmCount },
     { id: 'analytics', label: 'Analytics' },
     { id: 'memory', label: 'Memory' },
-    { id: 'integrations', label: 'Integrations', count: intgCount },
     { id: 'settings', label: 'Settings' },
   ]
   return (
@@ -694,10 +687,9 @@ function DocsButton() {
 // by a close button — keeps the dashboard honest about whether orchid
 // can actually do anything.
 function WarningStack({
-  stateLoaded, githubConnected, inbox, openSettings,
+  stateLoaded, inbox, openSettings,
 }: {
   stateLoaded: boolean
-  githubConnected: boolean
   inbox?: string
   openSettings: (section: SectionId) => void
 }) {
@@ -719,13 +711,6 @@ function WarningStack({
   }, [dismissed])
 
   const rows: { label: string; cta: string; onClick: () => void }[] = []
-  if (!githubConnected) {
-    rows.push({
-      label: 'GitHub not connected — sessions are paused.',
-      cta: 'Connect',
-      onClick: () => openSettings('integrations'),
-    })
-  }
   if (targetsOK === false) {
     rows.push({
       label: 'No targets configured — issues won’t match any repo.',
@@ -779,147 +764,6 @@ function WarningStack({
             </div>
           ))}
         </div>
-      </div>
-    </div>
-  )
-}
-
-function GitHubIntegration({ state }: { state: State }) {
-  const connected = !!state.connect?.github.connected
-  const login = state.connect?.github.login
-  const [flow, setFlow] = useState<null | { user_code: string; verification_uri: string; expires_at: number }>(null)
-  const [polling, setPolling] = useState(false)
-  const [error, setError] = useState<string>('')
-
-  useEffect(() => {
-    if (!flow || !polling) return
-    let alive = true
-    const id = setInterval(async () => {
-      try {
-        const r = await fetch('/api/connect/github/poll', { method: 'POST', credentials: 'include' })
-        const j = await r.json()
-        if (!alive) return
-        if (j.state === 'connected') {
-          setPolling(false); setFlow(null)
-          // Bounce the page so /api/state refresh picks up the new login.
-          location.reload()
-        } else if (j.state === 'error') {
-          setError(j.error || 'failed'); setPolling(false)
-        }
-      } catch { /* keep polling */ }
-    }, 3000)
-    return () => { alive = false; clearInterval(id) }
-  }, [flow, polling])
-
-  const start = async () => {
-    setError('')
-    const r = await fetch('/api/connect/github/start', { method: 'POST', credentials: 'include' })
-    if (!r.ok) { setError(await r.text()); return }
-    const j = await r.json()
-    setFlow(j)
-    setPolling(true)
-  }
-
-  return (
-    <div className="px-3 py-3">
-      <div className="flex items-center gap-3">
-        <svg width={18} height={18} viewBox="0 0 16 16" className="flex-shrink-0 text-zinc-700 dark:text-zinc-300" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-[13px] font-medium text-zinc-900 dark:text-zinc-100">GitHub</span>
-            {connected
-              ? <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">connected · {login}</span>
-              : <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-zinc-200 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">not connected</span>}
-          </div>
-          <div className="text-[12px] text-zinc-500 dark:text-zinc-400 truncate">Reads inbox issues, pushes branches — one-time device-flow login.</div>
-        </div>
-        {!flow && (
-          <button onClick={start}
-            className="mono text-[11.5px] px-3 py-1.5 rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 hover:opacity-90 flex-shrink-0">{connected ? 'Reconnect' : 'Connect'}</button>
-        )}
-      </div>
-      {flow && polling && (
-        <div className="rounded-md border border-zinc-200 dark:border-zinc-800 p-3 mt-3 bg-zinc-50 dark:bg-zinc-900/40">
-          <div className="text-[12px] text-zinc-500 dark:text-zinc-400">Go to <a href={flow.verification_uri} target="_blank" rel="noreferrer" className="mono text-blue-600 dark:text-blue-400 underline">{flow.verification_uri}</a> and enter:</div>
-          <div className="mono text-[20px] tracking-widest text-zinc-900 dark:text-zinc-100 select-all mt-1">{flow.user_code}</div>
-          <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-2">Waiting for approval…</div>
-        </div>
-      )}
-      {error && (
-        <div className="rounded-md ring-1 ring-rose-300 dark:ring-rose-700/60 bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-300 text-[12px] px-3 py-2 mt-3">{error}</div>
-      )}
-    </div>
-  )
-}
-
-function ComingSoonIntegration({ name, account, blurb }: { name: string; account?: string; blurb: string }) {
-  return (
-    <div className="px-3 py-3 flex items-center gap-3 opacity-60">
-      <span className="w-[18px] flex-shrink-0 flex justify-center">
-        {account ? <AgentLogo account={account} size={16} className="text-zinc-500 dark:text-zinc-400" /> : null}
-      </span>
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="text-[13px] font-medium text-zinc-900 dark:text-zinc-100">{name}</span>
-          <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-zinc-200 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">coming soon</span>
-        </div>
-        <div className="text-[12px] text-zinc-500 dark:text-zinc-400 truncate">{blurb}</div>
-      </div>
-    </div>
-  )
-}
-
-// IntegrationsPage — full-bleed top-level tab. Compact table of external
-// services orchid talks to (GitHub today; Claude/Codex onboarding next).
-interface CredAcct { account: string; agent: string; connected: boolean }
-
-function IntegrationsPage({ state }: { state: State }) {
-  const [accts, setAccts] = useState<CredAcct[]>([])
-  const [provider, setProvider] = useState('')
-  useEffect(() => {
-    fetch('/api/credentials', { credentials: 'include', cache: 'no-store' })
-      .then((r) => r.json())
-      .then((d) => { setAccts(d.accounts || []); setProvider(d.provider || '') })
-      .catch(() => {})
-  }, [])
-  const connBadge = (ok: boolean, label?: string) => ok
-    ? <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 whitespace-nowrap">connected{label ? ' · ' + label : ''}</span>
-    : <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-zinc-200 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">not connected</span>
-
-  return (
-    <div className="flex-1 min-w-0 w-full max-w-screen-xl mx-auto p-4 sm:p-6 flex flex-col gap-4">
-      <div className="flex items-center gap-3">
-        <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Connections</h1>
-        <span className="text-[12px] text-zinc-500 dark:text-zinc-400">What the daemon and spawned sessions authenticate to.</span>
-        {provider && <span className="mono text-[10px] text-zinc-400 ml-auto">agent creds: {provider}</span>}
-      </div>
-
-      {/* One uniform list. GitHub is connectable inline (orch's own auth);
-          agent accounts are provider-managed, so status-only. */}
-      <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden bg-white dark:bg-zinc-950 divide-y divide-zinc-100 dark:divide-zinc-800/70">
-        <GitHubIntegration state={state} />
-        {accts.map((a) => (
-          <div key={a.account} className="px-3 py-3 flex items-center gap-3">
-            <AgentLogo account={a.agent} size={18} className="text-zinc-500 dark:text-zinc-400 flex-shrink-0" />
-            <div className="flex-1 min-w-0">
-              <div className="text-[13px] font-medium text-zinc-900 dark:text-zinc-100 truncate">{a.account}</div>
-              <div className="text-[12px] text-zinc-500 dark:text-zinc-400 truncate">{a.agent} account — managed by the <span className="mono">{provider || 'local'}</span> credential provider.</div>
-            </div>
-            {connBadge(a.connected)}
-          </div>
-        ))}
-      </div>
-
-      {/* How to add another account — connect is out-of-band on purpose. */}
-      <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 px-4 py-3">
-        <div className="text-[12px] text-zinc-500 dark:text-zinc-400 mb-2">
-          Add an account on the orchestrator host (then point a VM at it with <span className="mono">account = "&lt;name&gt;"</span>):
-        </div>
-        <pre className="mono text-[12px] text-zinc-800 dark:text-zinc-200 bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-2 overflow-x-auto whitespace-pre">{`# claude account (read ~/.claude)
-orch creds import <account> --agent claude --from /home/orchid
-
-# codex account (read its CODEX_HOME)
-orch creds import <account> --agent codex --from /home/orchid/.codex`}</pre>
       </div>
     </div>
   )
@@ -1174,7 +1018,7 @@ function timeAgo(iso?: string | null): string {
   return `${Math.floor(mo / 12)}y`
 }
 
-type SectionId = 'orch' | 'integrations' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
+type SectionId = 'orch' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
 
 interface MemNote { name: string; file: string; target: string; summary: string; links: string[]; backlinks: string[] }
 interface MemTreeNode { name: string; path: string; note?: MemNote; children: MemTreeNode[] }
@@ -1455,12 +1299,12 @@ function MemoryPage() {
 // Top-level tabs. Sessions is the list; the rest open SettingsPage focused on a
 // section — Machines (VMs), Analytics (usage), Integrations get their own tab;
 // Settings holds the rest (orch/access/capture/targets/danger) via its own nav.
-type Tab = 'sessions' | 'machines' | 'analytics' | 'memory' | 'integrations' | 'settings'
-const TAB_SECTION: Record<Exclude<Tab, 'sessions' | 'memory' | 'analytics' | 'machines' | 'integrations'>, SectionId> = {
+type Tab = 'sessions' | 'machines' | 'analytics' | 'memory' | 'settings'
+const TAB_SECTION: Record<Exclude<Tab, 'sessions' | 'memory' | 'analytics' | 'machines'>, SectionId> = {
   settings: 'orch',
 }
 function sectionToTab(s: SectionId): Tab {
-  return s === 'vms' ? 'machines' : s === 'usage' ? 'analytics' : s === 'integrations' ? 'integrations' : 'settings'
+  return s === 'vms' ? 'machines' : s === 'usage' ? 'analytics' : 'settings'
 }
 
 function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
@@ -1488,7 +1332,6 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
   const vis = (id: SectionId) => flat ? FLAT_IDS.includes(id) : initialSection === id
   const pageTitle = initialSection === 'vms' ? 'Machines'
     : initialSection === 'usage' ? 'Analytics'
-    : initialSection === 'integrations' ? 'Integrations'
     : 'Settings'
 
   useEffect(() => {
@@ -1601,7 +1444,6 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
 
   const navItems: { id: SectionId; label: string }[] = [
     { id: 'orch',         label: 'Orchestrator' },
-    { id: 'integrations', label: 'Integrations' },
     { id: 'access',       label: 'Access' },
     { id: 'capture',      label: 'Capture' },
     { id: 'vms',          label: 'VMs' },
@@ -1621,7 +1463,7 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
 
       <div className="flex-1 min-h-0 flex flex-col">
         <main className="flex-1 min-w-0 overflow-auto">
-          <div className="max-w-[860px] mx-auto px-4 sm:px-6 py-5 space-y-6">
+          <div className="w-full max-w-screen-xl mx-auto p-4 sm:p-6 space-y-6">
             {vis('orch') && (
               <>
                 <Section title="GitHub">
@@ -1746,25 +1588,6 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
                 subtitle="Inbox labels → work repos. Add a repo and the label defaults to its name (override if you want)."
               >
                 <TargetsList targets={targets} setTargets={setTargets} repos={repos} reposError={reposError} />
-              </Section>
-            )}
-
-            {vis('integrations') && (
-              <Section
-                title="Integrations"
-                subtitle="Connect orchid to the services the daemon and the spawned sessions talk to."
-              >
-                <div className="space-y-4">
-                  <GitHubIntegration state={state} />
-                  <ComingSoonIntegration
-                    name="Claude"
-                    blurb="Paste an Anthropic API key so spawned sessions can use claude without per-VM login."
-                  />
-                  <ComingSoonIntegration
-                    name="Codex"
-                    blurb="OpenAI codex agent — onboard once per orchid instance."
-                  />
-                </div>
               </Section>
             )}
 
@@ -2888,6 +2711,23 @@ function UsageTable({ jobs, quota, governor }: { jobs: Job[]; quota?: State['quo
           })}
         </div>
       </div>
+    </div>
+  )
+}
+
+// Shown inline at the top of the Sessions tab until this orch dials into the
+// relay. Replaces the old full-screen InstallModal — same install/join
+// commands, no art, no overlay.
+function FirstJoinBanner({ relay }: { relay: RelayInfo | null }) {
+  if (!relay || relay.connected || !relay.login || !relay.token) return null
+  return (
+    <div className="border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/95 dark:bg-zinc-900/95 p-4 sm:p-6">
+      <div className="flex items-center gap-2.5 mb-4">
+        <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+        <h2 className="text-[15px] font-semibold text-zinc-900 dark:text-zinc-100">Connect your orchid</h2>
+        <span className="text-[12.5px] text-zinc-500 dark:text-zinc-400 hidden sm:inline">— run these on your box to bring it online.</span>
+      </div>
+      <JoinCommandCard info={relay} />
     </div>
   )
 }

@@ -122,12 +122,7 @@ type OrchBlock struct {
 	Capture       *CaptureBlock     `hcl:"capture,block" json:"capture,omitempty"`
 	Throttle      *ThrottleBlock    `hcl:"throttle,block" json:"throttle,omitempty"`
 	Memory        *MemoryBlock      `hcl:"memory,block" json:"memory,omitempty"`
-	Credentials   *CredentialsBlock `hcl:"credentials,block" json:"credentials,omitempty"`
 }
-
-// credProvider is the process-wide active credential provider, built in Main.
-// startSession calls it to authenticate each agent on its VM before launch.
-var credProvider CredentialProvider
 
 type CaptureBlock struct {
 	AuthToken     string   `hcl:"auth_token" json:"auth_token"`

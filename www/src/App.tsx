@@ -1,7 +1,6 @@
 import { createContext, useEffect, useRef, useState } from 'react'
 import { Dashboard } from './Dashboard'
 import { Docs } from './Docs'
-import { InstallModal } from './InstallModal'
 import type { State } from './types'
 
 export interface RelayInfo {
@@ -153,7 +152,6 @@ function DashboardApp() {
   return (
     <WSBusContext.Provider value={bus}>
       <Dashboard state={state} relay={relay} />
-      <InstallModal relay={relay} />
     </WSBusContext.Provider>
   )
 }
