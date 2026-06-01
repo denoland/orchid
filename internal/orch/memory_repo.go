@@ -141,12 +141,44 @@ git rev-parse --short HEAD 2>/dev/null || true
 `, memoryRepoDir(vm), repo, memBranch(cfg), memoryStoreDir(cfg, vm), vmBotIdentityLogin(cfg, vm), vmBotIdentityEmail(cfg, vm), vm.SessionHome)
 }
 
-// memorySyncOnce runs the sync script on the memory VM.
+// aggregateRemoteMemory pulls each REMOTE box's memory subtree into the local
+// memory clone so the single synced clone is the UNION of every box's notes.
+// The sync loop only runs on the local memory VM (memoryStore); without this,
+// agents on remote boxes (gcp/mac) write to their own <session_home>/.orch/
+// memory-repo dirs that are never committed or pushed, and their notes strand
+// per-box. Best-effort: an unreachable box is logged and skipped, never fatal;
+// -u never clobbers a newer local copy and there is no --delete, so a remote
+// box can only ever ADD notes to the union.
+func aggregateRemoteMemory(cfg *Config, localVM *VMBlock) {
+	localDir := memoryStoreDir(cfg, localVM)
+	seen := map[string]bool{}
+	for i := range cfg.VMs {
+		vm := &cfg.VMs[i]
+		if isLocal(*vm) || vmAgent(*vm).name != "claude" || vm.SessionHome == "" {
+			continue
+		}
+		if seen[vm.Host] { // one memory-repo per box; dedupe claude+codex etc.
+			continue
+		}
+		seen[vm.Host] = true
+		sshOpt := "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -i " + expand(vm.Key)
+		src := fmt.Sprintf("%s@%s:%s/", vm.User, vm.Host, memoryStoreDir(cfg, vm))
+		// -rtu: recurse, preserve times, skip files newer on the receiver. No
+		// owner/group/perms (uids differ across boxes; the sync script chowns).
+		if _, errStr, err := run("rsync", "-rtu", "--timeout=30", "-e", sshOpt, src, localDir+"/"); err != nil {
+			log.Printf("memory: aggregate from %s skipped: %v: %s", vm.Host, err, strings.TrimSpace(errStr))
+		}
+	}
+}
+
+// memorySyncOnce pulls remote boxes' notes into the local clone, then runs the
+// commit+push sync script on the memory VM.
 func memorySyncOnce(cfg *Config) (string, error) {
 	vm, _ := memoryStore(cfg)
 	if vm == nil {
 		return "", fmt.Errorf("no memory VM")
 	}
+	aggregateRemoteMemory(cfg, vm)
 	out, errStr, err := sshExecIn(*vm, memorySyncScript(cfg, vm), "bash -s")
 	if err != nil {
 		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(errStr))
