@@ -108,6 +108,10 @@ gh pr create --repo {{target.repo}} \
 Reference the inbox issue in the PR body: "Closes {{inbox.repo}}#{{issue.number}}"
 (cross-repo closes don't auto-link, the orchestrator handles teardown).
 
+If your fix needs a change in an upstream/dependency repo, open that PR too and
+reference it in this PR's description (e.g. "Upstream: owner/repo#123"). The
+orchestrator tracks linked upstream PRs and relays their reviews/CI back to you.
+
 Then stop and wait. The orchestrator sends a follow-up when reviews, comments,
 or CI results arrive. Address them, push fixes, stop again.
 The session ends automatically when the PR merges or closes.
