@@ -1021,6 +1021,15 @@ func Main() {
 		}
 	}()
 
+	// Shutdown context — created BEFORE the long-lived goroutines (tailers, relay)
+	// so SIGTERM/SIGINT cancels them. Critically, the per-VM `ssh … tail -F`
+	// streams run under this ctx via exec.CommandContext, so on `systemctl
+	// restart` they get SIGKILL'd instead of orphaned — orphaned ssh children
+	// pile up across restarts and eventually max a worker's MaxStartups, taking
+	// the box unreachable.
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	if *relayURL != "" {
 		if *relayToken == "" {
 			log.Fatalf("-relay requires -relay-token (issued by the relay on signup)")
@@ -1039,7 +1048,7 @@ func Main() {
 			return st.store.PutSnap(body)
 		}
 		allowedLoginsProvider = func() []string { return append([]string(nil), cfg.Orch.AllowedLogins...) }
-		go runRelayAgent(context.Background(), RelayDeps{
+		go runRelayAgent(ctx, RelayDeps{
 			URL:           *relayURL,
 			Token:         *relayToken,
 			HTTPSecret:    cfg.Orch.HTTPSecret,
@@ -1073,12 +1082,12 @@ func Main() {
 		// hook, codex via its rotating session rollouts. Both feed the per-agent
 		// quota buckets the governor paces against.
 		if vmAgent(vm).name == "codex" {
-			go tailCodexUsage(context.Background(), vm, st.Bcast)
+			go tailCodexUsage(ctx, vm, st.Bcast)
 		} else {
-			go tailStatusLine(context.Background(), vm, st.Bcast)
+			go tailStatusLine(ctx, vm, st.Bcast)
 			// Reliable needs-input detection from claude's Notification /
 			// UserPromptSubmit hooks (notify.jsonl), + ntfy on the rising edge.
-			go tailNotify(context.Background(), vm, cfg.Orch.NtfyTopic, st.Bcast)
+			go tailNotify(ctx, vm, cfg.Orch.NtfyTopic, st.Bcast)
 		}
 	}
 
@@ -1087,7 +1096,7 @@ func Main() {
 		if !isLocal(vm) {
 			continue
 		}
-		go runUsageScanLoop(context.Background(), projectsRootFor(vm), st.store, 5*time.Minute)
+		go runUsageScanLoop(ctx, projectsRootFor(vm), st.store, 5*time.Minute)
 	}
 
 	// Quota sampler: persist a reading of both rate-limit buckets every
@@ -1095,12 +1104,10 @@ func Main() {
 	// has a time-series. Runs unconditionally (the sample is cheap and the
 	// estimator only consumes it when the governor is enabled) so enabling the
 	// governor later has immediate history to work from.
-	go runQuotaSampleLoop(context.Background(), st.store, &cfg)
+	go runQuotaSampleLoop(ctx, st.store, &cfg)
 	// At-a-glance list signal: per-session git WIP stats (branch diff vs base).
-	go runWipLoop(context.Background(), &cfg, st)
+	go runWipLoop(ctx, &cfg, st)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	if cfg.Orch.Mentions != nil {
 		if _, err := fetchMaintainers(cfg.Orch.Mentions.Org); err != nil {
