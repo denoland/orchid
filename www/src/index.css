@@ -326,8 +326,8 @@ html.dark .docs-page {
    so define its palette vars here (the marketing block doesn't reach it) and
    give code blocks dark-aware colors. Without this, dark mode renders code
    blocks as var(--ink) = near-white bg with light text (invisible). */
-.docs-prose { --line: #e4e4e7; --muted: #71717a; --orchid-deep: #7c3aed; }
-html.dark .docs-prose { --line: #27272a; --muted: #a1a1aa; --orchid-deep: #a78bfa; }
+.docs-prose { --ink: #18181b; --line: #e4e4e7; --muted: #71717a; --orchid-deep: #7c3aed; }
+html.dark .docs-prose { --ink: #e4e4e7; --line: #27272a; --muted: #a1a1aa; --orchid-deep: #a78bfa; }
 html.dark .docs-prose code { background: #27272a; color: #e4e4e7; }
 html.dark .docs-prose pre { background: #18181b; color: #e4e4e7; }
 html.dark .docs-prose pre code { background: transparent; color: inherit; }

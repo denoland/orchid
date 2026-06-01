@@ -1196,7 +1196,7 @@ function MemoryPage() {
         <div className="text-sm text-zinc-400">No memories yet — the store is empty. Notes appear as sessions learn.</div>
       ) : searching ? (
         // flat search results
-        <div className="mono text-[12.5px] border-t border-zinc-100 dark:border-zinc-900/60">
+        <div className="mono text-[12.5px] rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 overflow-hidden divide-y divide-zinc-100 dark:divide-zinc-800/70">
           {filtered.length === 0 ? <div className="text-zinc-400 py-3">no matches.</div> : filtered.map((n) => (
             <button key={n.file} onClick={() => { setSel(n); setQ('') }}
               className="w-full flex flex-col items-start px-2 py-1.5 text-left hover:bg-zinc-50 dark:hover:bg-zinc-900/60 border-b border-zinc-100 dark:border-zinc-900/60">
@@ -1217,10 +1217,10 @@ function MemoryPage() {
             <a href={ghBlob(sel.file)} target="_blank" rel="noreferrer" className="text-zinc-400 hover:text-violet-500">plain ↗</a>
           </div>
 
-          {view === 'about' && <article className="docs-prose" dangerouslySetInnerHTML={{ __html: html }} />}
+          {view === 'about' && <article className="docs-prose rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4 sm:p-6" dangerouslySetInnerHTML={{ __html: html }} />}
 
           {view === 'log' && (
-            <div className="mono text-[12px]">
+            <div className="mono text-[12px] rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-3 py-2">
               {log === null && <div className="text-zinc-400 py-3">loading…</div>}
               {log && log.length === 0 && <div className="text-zinc-400 py-3">no history.</div>}
               {log && log.map((c) => (
@@ -1255,7 +1255,7 @@ function MemoryPage() {
         }
         return (
           <div className="flex flex-col gap-4">
-            <div className="mono text-[12.5px] border-y border-zinc-100 dark:border-zinc-900/60 divide-y divide-zinc-100 dark:divide-zinc-900/60">
+            <div className="mono text-[12.5px] rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 overflow-hidden divide-y divide-zinc-100 dark:divide-zinc-800/70">
               {dirSel && (
                 <button onClick={() => setDirSel(dirSel.split('/').slice(0, -1).join('/'))} className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-zinc-50 dark:hover:bg-zinc-900/60 text-zinc-500">
                   <span className="w-4 text-center">..</span><span>/</span>
@@ -1275,7 +1275,7 @@ function MemoryPage() {
               ))}
               {childDirs.size === 0 && childFiles.length === 0 && <div className="text-zinc-400 px-2 py-3">empty.</div>}
             </div>
-            {html && <article className="docs-prose" dangerouslySetInnerHTML={{ __html: html }} />}
+            {html && <article className="docs-prose rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4 sm:p-6" dangerouslySetInnerHTML={{ __html: html }} />}
           </div>
         )
       })()}
@@ -2335,6 +2335,28 @@ interface ActivityResp {
   today_sessions: number; today_prs: number
 }
 
+// Bar chart with an instant hover tooltip (replaces the slow native title).
+function BarChart({ data, max, footer }: { data: { date: string; v: number; tip: string }[]; max: number; footer?: React.ReactNode }) {
+  const [hi, setHi] = useState<number | null>(null)
+  return (
+    <div className="relative">
+      {hi !== null && data[hi] && (
+        <div className="absolute -top-1 z-10 -translate-x-1/2 -translate-y-full pointer-events-none" style={{ left: `${((hi + 0.5) / data.length) * 100}%` }}>
+          <div className="mono text-[10.5px] whitespace-nowrap rounded bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 px-1.5 py-0.5 shadow-lg">{data[hi].tip}</div>
+        </div>
+      )}
+      <div className="flex items-end gap-[2px] h-20" onMouseLeave={() => setHi(null)}>
+        {data.map((d, i) => (
+          <div key={d.date} onMouseEnter={() => setHi(i)}
+            className={'flex-1 min-w-0 rounded-sm transition-colors ' + (hi === i ? 'bg-violet-500' : 'bg-violet-500/60')}
+            style={{ height: `${Math.max(2, (d.v / max) * 100)}%` }} />
+        ))}
+      </div>
+      {footer}
+    </div>
+  )
+}
+
 function AnalyticsPage({ state }: { state: State }) {
   const [days, setDays] = useState(30)
   const [act, setAct] = useState<ActivityResp | null>(null)
@@ -2430,16 +2452,9 @@ function AnalyticsPage({ state }: { state: State }) {
         {section('Tokens', <span className="mono text-[10px] text-zinc-400">in + out + cache-write · cache-reads excluded</span>)}
         <div className="mb-3"><UsageRollups rows={hist} /></div>
         <div className={card + ' px-3 py-3 mb-3'}>
-          <div className="flex items-end gap-[2px] h-20">
-            {tokByDay.map((d) => (
-              <div key={d.date} title={`${d.date}: ${fmtTok(d.v)}`}
-                className="flex-1 min-w-0 bg-violet-500/60 hover:bg-violet-500 rounded-sm transition-colors"
-                style={{ height: `${Math.max(2, (d.v / tokMax) * 100)}%` }} />
-            ))}
-          </div>
-          <div className="flex justify-between mono text-[10px] text-zinc-400 mt-1.5">
-            <span>{tokByDay[0]?.date.slice(5)}</span><span>peak {fmtTok(tokMax)}/d</span><span>{tokToday.slice(5)}</span>
-          </div>
+          <BarChart max={tokMax}
+            data={tokByDay.map((d) => ({ date: d.date, v: d.v, tip: `${d.date.slice(5)} · ${fmtTok(d.v)}` }))}
+            footer={<div className="flex justify-between mono text-[10px] text-zinc-400 mt-1.5"><span>{tokByDay[0]?.date.slice(5)}</span><span>peak {fmtTok(tokMax)}/d</span><span>{tokToday.slice(5)}</span></div>} />
         </div>
         {byModel.length > 0 && (
           <div className={card + ' divide-y divide-zinc-100 dark:divide-zinc-800/70'}>
@@ -2465,16 +2480,9 @@ function AnalyticsPage({ state }: { state: State }) {
           {stat(`PRs · ${days}d`, act?.total_prs ?? 0, 'pull requests opened')}
         </div>
         <div className={card + ' px-3 py-3'}>
-          <div className="flex items-end gap-[2px] h-20">
-            {rows.map((d) => (
-              <div key={d.date} title={`${d.date}: ${d.sessions} sessions, ${d.prs} PRs`}
-                className="flex-1 min-w-0 bg-violet-500/60 hover:bg-violet-500 rounded-sm transition-colors"
-                style={{ height: `${Math.max(2, (d.sessions / dayMax) * 100)}%` }} />
-            ))}
-          </div>
-          <div className="flex justify-between mono text-[10px] text-zinc-400 mt-1.5">
-            <span>{rows[0]?.date.slice(5)}</span><span>peak {dayMax}/d</span><span>{today.slice(5)}</span>
-          </div>
+          <BarChart max={dayMax}
+            data={rows.map((d) => ({ date: d.date, v: d.sessions, tip: `${d.date.slice(5)} · ${d.sessions} sessions · ${d.prs} PRs` }))}
+            footer={<div className="flex justify-between mono text-[10px] text-zinc-400 mt-1.5"><span>{rows[0]?.date.slice(5)}</span><span>peak {dayMax}/d</span><span>{today.slice(5)}</span></div>} />
         </div>
       </div>
 
