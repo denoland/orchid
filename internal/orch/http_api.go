@@ -608,18 +608,6 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		})
 	}))
 
-	// GET /api/memory/blame?note=<file.md> — per-line git-blame provenance.
-	mux.HandleFunc("/api/memory/blame", auth(func(w http.ResponseWriter, r *http.Request) {
-		lines, repo, err := memoryBlame(cfg, r.URL.Query().Get("note"))
-		if err != nil {
-			http.Error(w, "blame: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-cache")
-		_ = json.NewEncoder(w).Encode(map[string]any{"lines": lines, "repo": repo, "branch": memBranch(cfg)})
-	}))
-
 	// GET /api/memory/log?note=<file.md> — commit history of a note (cgit log).
 	mux.HandleFunc("/api/memory/log", auth(func(w http.ResponseWriter, r *http.Request) {
 		entries, repo, err := memoryLog(cfg, r.URL.Query().Get("note"))

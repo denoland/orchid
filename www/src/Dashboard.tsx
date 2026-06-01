@@ -1027,7 +1027,6 @@ function timeAgo(iso?: string | null): string {
 type SectionId = 'orch' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
 
 interface MemNote { name: string; file: string; target: string; summary: string; links: string[]; backlinks: string[] }
-interface BlameLine { n: number; text: string; commit: string; short: string; author: string; email: string; date: string; summary: string }
 interface LogEntry { commit: string; short: string; author: string; date: string; subject: string }
 interface MemTreeNode { name: string; path: string; note?: MemNote; children: MemTreeNode[] }
 
@@ -1090,33 +1089,24 @@ function MemoryPage() {
   const [raw, setRaw] = useState('')
   const [loading, setLoading] = useState(true)
   const [q, setQ] = useState('')
-  // cgit-style note view: about (rendered) | log (commits) | blame (per-line).
-  const [view, setView] = useState<'about' | 'log' | 'blame'>('about')
-  const [blame, setBlame] = useState<BlameLine[] | null>(null)
+  // cgit-style note view: about (rendered) | log (commits).
+  const [view, setView] = useState<'about' | 'log'>('about')
   const [log, setLog] = useState<LogEntry[] | null>(null)
   const [memRepo, setMemRepo] = useState('')
 
   // Reset to the rendered view + drop cached git data when the open note changes.
-  useEffect(() => { setView('about'); setBlame(null); setLog(null) }, [sel])
+  useEffect(() => { setView('about'); setLog(null) }, [sel])
 
-  // Lazy-fetch blame / log when their tab is opened.
+  // Lazy-fetch the commit log when its tab is opened.
   useEffect(() => {
-    if (!sel) return
+    if (!sel || view !== 'log' || log !== null) return
     let live = true
-    if (view === 'blame' && blame === null) {
-      fetch('/api/memory/blame?note=' + encodeURIComponent(sel.file), { credentials: 'include', cache: 'no-store' })
-        .then((r) => (r.ok ? r.json() : Promise.reject()))
-        .then((d) => { if (live) { setBlame(d.lines || []); setMemRepo(d.repo || '') } })
-        .catch(() => { if (live) setBlame([]) })
-    }
-    if (view === 'log' && log === null) {
-      fetch('/api/memory/log?note=' + encodeURIComponent(sel.file), { credentials: 'include', cache: 'no-store' })
-        .then((r) => (r.ok ? r.json() : Promise.reject()))
-        .then((d) => { if (live) { setLog(d.entries || []); setMemRepo(d.repo || '') } })
-        .catch(() => { if (live) setLog([]) })
-    }
+    fetch('/api/memory/log?note=' + encodeURIComponent(sel.file), { credentials: 'include', cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => { if (live) { setLog(d.entries || []); setMemRepo(d.repo || '') } })
+      .catch(() => { if (live) setLog([]) })
     return () => { live = false }
-  }, [sel, view, blame, log])
+  }, [sel, view, log])
 
   useEffect(() => {
     fetch('/api/memory', { credentials: 'include', cache: 'no-store' })
@@ -1216,10 +1206,10 @@ function MemoryPage() {
           ))}
         </div>
       ) : sel ? (
-        // file view: about/log/blame
+        // file view: about/log
         <div className="flex flex-col gap-4">
           <div className="flex items-center gap-3 mono text-[12px] border-b border-zinc-200 dark:border-zinc-800 pb-2">
-            {(['about', 'log', 'blame'] as const).map((v) => (
+            {(['about', 'log'] as const).map((v) => (
               <button key={v} onClick={() => setView(v)}
                 className={view === v ? 'text-violet-600 dark:text-violet-400 font-semibold' : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}>{v}</button>
             ))}
@@ -1239,22 +1229,6 @@ function MemoryPage() {
                   <span className="text-zinc-400 tabular-nums w-[78px] flex-shrink-0">{c.date}</span>
                   <span className="text-zinc-500 dark:text-zinc-400 w-24 flex-shrink-0 truncate">{c.author}</span>
                   <span className="text-zinc-700 dark:text-zinc-300 truncate flex-1 min-w-0">{c.subject}</span>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {view === 'blame' && (
-            <div className="mono text-[12px] overflow-x-auto">
-              {blame === null && <div className="text-zinc-400 py-3">loading…</div>}
-              {blame && blame.length === 0 && <div className="text-zinc-400 py-3">not committed yet.</div>}
-              {blame && blame.map((l) => (
-                <div key={l.n} className="flex items-baseline gap-3 leading-[1.55] hover:bg-zinc-50 dark:hover:bg-zinc-900/40">
-                  <a href={commitURL(l.commit)} target="_blank" rel="noreferrer" title={`${l.summary} — ${l.author} ${l.date}`}
-                    className="text-violet-500 hover:underline w-14 flex-shrink-0">{l.short}</a>
-                  <span className="text-zinc-400 tabular-nums w-[78px] flex-shrink-0">{l.date}</span>
-                  <span className="text-zinc-300 dark:text-zinc-600 tabular-nums w-8 text-right flex-shrink-0 select-none">{l.n}</span>
-                  <span className="text-zinc-700 dark:text-zinc-300 whitespace-pre flex-1 min-w-0">{l.text || ' '}</span>
                 </div>
               ))}
             </div>
