@@ -116,6 +116,25 @@ func setAgentQuota(agent string, five, seven RateLimit, plan string, credits *fl
 	}
 }
 
+// seedAgentQuotaFromDB primes the in-memory agentQuota map with each account's
+// most-recent persisted reading on startup, so the dashboard shows the
+// last-known quota across restarts instead of going blank until a fresh live
+// sample arrives.
+func seedAgentQuotaFromDB(cfg *Config, store *Store) {
+	for _, acct := range configuredAccounts(cfg) {
+		samples, err := store.LoadQuotaSamples(acct, 0)
+		if err != nil || len(samples) == 0 {
+			continue
+		}
+		q := samples[len(samples)-1] // newest (rows come back ts ASC)
+		setAgentQuota(acct,
+			RateLimit{UsedPct: q.FivePct, ResetsAt: q.FiveReset},
+			RateLimit{UsedPct: q.SevenPct, ResetsAt: q.SevenReset}, "", nil)
+		log.Printf("usage: seeded %s quota from db (5h %.0f%% / 7d %.0f%%, %s old)",
+			acct, q.FivePct, q.SevenPct, time.Since(time.Unix(q.Ts, 0)).Round(time.Minute))
+	}
+}
+
 // latestAgentQuota returns the full latest reading for an agent (for display).
 func latestAgentQuota(agent string) (agentQuotaState, bool) {
 	agentQuotaMu.RLock()
