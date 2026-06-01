@@ -25,7 +25,28 @@ export const WSBusContext = createContext<WSBus | null>(null)
 
 export default function App() {
   if (location.pathname.startsWith('/docs')) return <Docs />
-  return <DashboardApp />
+  return <RootGate />
+}
+
+// "/" has no marketing landing: signed-in users get the dashboard, everyone
+// else gets the docs (with a Sign in button). We probe /api/state once to
+// decide — ok ⇒ dashboard, 401/403/unreachable ⇒ docs.
+function RootGate() {
+  const [authed, setAuthed] = useState<boolean | null>(null)
+  useEffect(() => {
+    let alive = true
+    fetch('/api/state', { credentials: 'include' })
+      .then((r) => {
+        // A real signed-in response is JSON; vite dev / SPA fallback returns
+        // HTML with 200, which must NOT count as authed.
+        const json = r.headers.get('content-type')?.includes('application/json')
+        if (alive) setAuthed(r.ok && !!json)
+      })
+      .catch(() => { if (alive) setAuthed(false) })
+    return () => { alive = false }
+  }, [])
+  if (authed === null) return null
+  return authed ? <DashboardApp /> : <Docs />
 }
 
 function DashboardApp() {

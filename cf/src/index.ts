@@ -254,12 +254,12 @@ app.use('*', async (c, next) => {
 })
 
 // ─── apex routes (orchid.littledivy.com) ───
-// Apex always serves the landing page — even for logged-in users. The
-// "go to dashboard" hop lives behind the nav's sign-in button so the
-// marketing page stays addressable.
+// Apex "/" serves the SPA shell. There is no separate landing page: the app's
+// root gate renders the docs (with a Sign in button) for signed-out visitors
+// and the dashboard for signed-in users.
 app.get('/', async (c) => {
   const u = new URL(c.req.url)
-  u.pathname = '/landing.html'
+  u.pathname = '/index.html'
   return c.env.ASSETS.fetch(new Request(u, c.req.raw))
 })
 
