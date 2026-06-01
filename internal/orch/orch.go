@@ -245,6 +245,15 @@ type Job struct {
 	SpawnedAt   time.Time `json:"spawned_at,omitempty"`
 	LastPokeAt  time.Time `json:"last_poke_at,omitempty"`
 	LastClearAt time.Time `json:"last_clear_at,omitempty"`
+
+	// Review/CI resilience (see tick.go). An outstanding CHANGES_REQUESTED review
+	// or failing CI is "addressed" only when a new commit is pushed — until then
+	// orch keeps re-surfacing it (so a poke that landed in a stuck/dead pane is
+	// retried, not silently dropped). RelayHead is the PR head OID when we last
+	// re-surfaced an outstanding item; RelayPokes counts those re-surfaces so we
+	// escalate to a human instead of looping forever.
+	RelayHead  string `json:"relay_head,omitempty"`
+	RelayPokes int    `json:"relay_pokes,omitempty"`
 }
 
 type State struct {
@@ -1934,6 +1943,27 @@ func markPRSeen(t *prTracker, v *PRView, vr, sr, vt, st, vi, si []string) {
 func summarizeExternal(repo string, num int, v *PRView, nr, ntc, nic []string, pushed bool, checks []string, mergeable string) string {
 	body := strings.TrimPrefix(summarize(v, nr, ntc, nic, pushed, checks, mergeable), "PR update from orchestrator:\n\n")
 	return fmt.Sprintf("Upstream PR update — %s#%d (a dependency PR you opened):\n\n%s", repo, num, body)
+}
+
+// maxReviewRepokes caps how many times orch re-surfaces an unaddressed review /
+// failing CI before escalating to a human (ntfy) and backing off — so a session
+// that genuinely can't act doesn't get nudged forever.
+const maxReviewRepokes = 4
+
+// resurfaceMsg is the reminder orch re-sends when a CHANGES_REQUESTED review or
+// failing CI is still unaddressed (no new commit since it was raised) — the
+// resilience net for a poke that landed in a stuck/dead pane and got dropped.
+func resurfaceMsg(reviewBlocking bool, failingChecks []string) string {
+	var b strings.Builder
+	b.WriteString("Reminder from the orchestrator — this PR has unaddressed items and no new commits since they were raised:\n\n")
+	if reviewBlocking {
+		b.WriteString("- A reviewer requested CHANGES. Re-read the review, make the requested changes, and push.\n")
+	}
+	if len(failingChecks) > 0 {
+		b.WriteString(fmt.Sprintf("- CI is failing: %s. Reproduce locally, fix, and push.\n", strings.Join(failingChecks, ", ")))
+	}
+	b.WriteString("\nIf you genuinely cannot act (out of scope, needs a human decision, or blocked on something you don't control — e.g. a PR title only the maintainer sets), say so in one line and stop. Otherwise address it and push.")
+	return b.String()
 }
 
 func summarize(v *PRView, nr, ntc, nic []string, pushed bool, checks []string, mergeable string) string {

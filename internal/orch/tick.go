@@ -762,6 +762,35 @@ func tick(cfg *Config, st *State) {
 		hasSilent := len(sr) > 0 || len(st_) > 0 || len(si) > 0
 		primaryVisible := len(vr) > 0 || len(vt) > 0 || len(vi) > 0 || pushed || len(checks) > 0 || mergeable != ""
 
+		// Resilience: a CHANGES_REQUESTED review or currently-failing CI is
+		// "addressed" only when a new commit lands. A push since we last
+		// re-surfaced (head moved) means the agent acted → reset. Otherwise the
+		// item is still outstanding and we keep re-surfacing it (debounced) so a
+		// poke that landed in a stuck/dead/paused pane gets retried, not silently
+		// dropped — up to maxReviewRepokes, then escalate to a human.
+		if j.RelayHead != "" && j.RelayHead != v.HeadRefOid {
+			j.RelayHead = ""
+			j.RelayPokes = 0
+		}
+		var failingChecks []string
+		{
+			latest := map[string]string{}
+			latestAt := map[string]string{}
+			for _, c := range v.StatusCheckRollup {
+				if c.Status == "COMPLETED" && c.CompletedAt >= latestAt[c.Name] {
+					latestAt[c.Name] = c.CompletedAt
+					latest[c.Name] = c.Conclusion
+				}
+			}
+			for name, concl := range latest {
+				if isActionableCheck(concl) {
+					failingChecks = append(failingChecks, name)
+				}
+			}
+		}
+		reviewBlocking := v.ReviewDecision == "CHANGES_REQUESTED"
+		outstanding := (reviewBlocking || len(failingChecks) > 0) && j.RelayPokes < maxReviewRepokes
+
 		// Upstream/dependency PRs this session opened (issue #1): discover new
 		// ones from the primary PR body, then diff each tracked one. We rebuild
 		// j.ExtraPRs as keepExtra so unauthored / merged / closed ones drop out.
@@ -812,7 +841,7 @@ func tick(cfg *Config, st *State) {
 		}
 		j.ExtraPRs = keepExtra
 
-		if !primaryVisible && len(extResults) == 0 {
+		if !primaryVisible && len(extResults) == 0 && !outstanding {
 			j.LastHeadOID = v.HeadRefOid
 			if v.Mergeable != "" && v.Mergeable != "UNKNOWN" {
 				j.LastMergeable = v.Mergeable
@@ -825,6 +854,7 @@ func tick(cfg *Config, st *State) {
 			saveStateLogged(st) // persist discovery / validation / dropped-extra changes
 			continue
 		}
+		resurface := outstanding && !primaryVisible && len(extResults) == 0
 		idle, detected, err := tmuxIdle(*vm, j.Tmux)
 		if err != nil {
 			log.Printf("issue #%d: idle check failed: %v", n, err)
@@ -890,6 +920,9 @@ func tick(cfg *Config, st *State) {
 		for _, r := range extResults {
 			parts = append(parts, r.msg)
 		}
+		if resurface {
+			parts = append(parts, resurfaceMsg(reviewBlocking, failingChecks))
+		}
 		msg := strings.Join(parts, "\n\n")
 		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
 			log.Printf("issue #%d: poke failed: %v", n, err)
@@ -900,10 +933,30 @@ func tick(cfg *Config, st *State) {
 			markPRSeen(&j.ExtraPRs[r.idx].prTracker, r.v, r.vr, r.sr, r.vt, r.st_, r.vi, r.si)
 		}
 		j.LastPokeAt = time.Now()
+		// Resilience bookkeeping. New visible activity gives the agent fresh info
+		// (reset the counter); a pure re-surface counts toward the escalation cap.
+		if outstanding {
+			j.RelayHead = v.HeadRefOid
+			if primaryVisible || len(extResults) > 0 {
+				j.RelayPokes = 0
+			} else {
+				j.RelayPokes++
+				if j.RelayPokes >= maxReviewRepokes {
+					log.Printf("issue #%d: PR #%d review/CI unaddressed after %d nudges — escalating to human", n, j.PR, j.RelayPokes)
+					ntfyNotify(cfg.Orch.NtfyTopic,
+						fmt.Sprintf("needs human: issue #%d", n),
+						fmt.Sprintf("PR #%d has an unaddressed review/CI after %d nudges", j.PR, j.RelayPokes),
+						fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR))
+				}
+			}
+		}
 		saveStateLogged(st)
-		if len(extResults) > 0 {
+		switch {
+		case resurface:
+			log.Printf("issue #%d: re-surfaced unaddressed review/CI on PR #%d (nudge %d/%d)", n, j.PR, j.RelayPokes, maxReviewRepokes)
+		case len(extResults) > 0:
 			log.Printf("issue #%d: poked PR #%d (+%d upstream)", n, j.PR, len(extResults))
-		} else {
+		default:
 			log.Printf("issue #%d: poked PR #%d", n, j.PR)
 		}
 	}
