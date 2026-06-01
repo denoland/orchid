@@ -808,6 +808,102 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		})
 	}))
 
+	// /api/activity?days=N — honest activity counts (sessions started + PRs
+	// opened) per day over the window, from the live job snapshot + the full
+	// closed_jobs table (NOT the 7d/200 cap /api/state uses). Bucketed by each
+	// job's SpawnedAt (falling back to close time for old rows). One row per
+	// issue, so resumes/cycles of the same issue count once.
+	mux.HandleFunc("/api/activity", auth(func(w http.ResponseWriter, r *http.Request) {
+		days := atoiClamp(r.URL.Query().Get("days"), 30, 1, 365)
+		now := time.Now().UTC()
+		since := now.AddDate(0, 0, -(days - 1)).Truncate(24 * time.Hour)
+		type bucket struct {
+			Sessions int `json:"sessions"`
+			PRs      int `json:"prs"`
+		}
+		byDay := map[string]*bucket{}
+		byRepo := map[string]*bucket{}
+		bump := func(spawned time.Time, pr int, repo string) {
+			if spawned.IsZero() || spawned.Before(since) {
+				return
+			}
+			d := spawned.UTC().Format("2006-01-02")
+			b := byDay[d]
+			if b == nil {
+				b = &bucket{}
+				byDay[d] = b
+			}
+			b.Sessions++
+			if pr > 0 {
+				b.PRs++
+			}
+			rk := repo
+			if i := strings.LastIndex(rk, "/"); i >= 0 {
+				rk = rk[i+1:]
+			}
+			if rk == "" {
+				rk = "—"
+			}
+			rb := byRepo[rk]
+			if rb == nil {
+				rb = &bucket{}
+				byRepo[rk] = rb
+			}
+			rb.Sessions++
+			if pr > 0 {
+				rb.PRs++
+			}
+		}
+		seen := map[int]bool{}
+		if v := st.httpSnap.Load(); v != nil {
+			for issue, j := range v.(map[int]Job) {
+				bump(j.SpawnedAt, j.PR, j.TargetRepo)
+				seen[issue] = true
+			}
+		}
+		closed, _ := st.store.RecentClosedJobs(int64(days)*24*60*60, 100000)
+		for _, c := range closed {
+			if c.Job == nil || seen[c.Issue] {
+				continue
+			}
+			sp := c.Job.SpawnedAt
+			if sp.IsZero() {
+				sp = time.Unix(c.ClosedAt, 0).UTC()
+			}
+			bump(sp, c.Job.PR, c.Job.TargetRepo)
+		}
+		rows := make([]map[string]any, 0, days)
+		totS, totP := 0, 0
+		for i := days - 1; i >= 0; i-- {
+			d := now.AddDate(0, 0, -i).Format("2006-01-02")
+			b := byDay[d]
+			s, p := 0, 0
+			if b != nil {
+				s, p = b.Sessions, b.PRs
+			}
+			rows = append(rows, map[string]any{"date": d, "sessions": s, "prs": p})
+			totS += s
+			totP += p
+		}
+		todayKey := now.Format("2006-01-02")
+		tS, tP := 0, 0
+		if b := byDay[todayKey]; b != nil {
+			tS, tP = b.Sessions, b.PRs
+		}
+		repos := make([]map[string]any, 0, len(byRepo))
+		for k, b := range byRepo {
+			repos = append(repos, map[string]any{"repo": k, "sessions": b.Sessions, "prs": b.PRs})
+		}
+		sort.Slice(repos, func(a, b int) bool { return repos[a]["sessions"].(int) > repos[b]["sessions"].(int) })
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"days": days, "rows": rows, "by_repo": repos,
+			"total_sessions": totS, "total_prs": totP,
+			"today_sessions": tS, "today_prs": tP,
+		})
+	}))
+
 	mux.HandleFunc("/api/snap", auth(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
