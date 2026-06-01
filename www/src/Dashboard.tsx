@@ -2510,6 +2510,52 @@ function AnalyticsPage({ state, jobs }: { state: State; jobs: Job[] }) {
 
 // MachinesPage — full-bleed top-level tab (like Sessions/Memory/Analytics). A
 // roster of worker VMs: health, agent, host, and a load bar (running/capacity).
+// A host runs several worker slots (one VM block per agent/account), named
+// like "mac-mini" / "mac-codex" / "mac-codex-mini". Derive a friendly machine
+// name from their longest common prefix → "mac"; fall back to the host.
+function machineName(slots: VM[]): string {
+  const names = slots.map((s) => s.name)
+  if (names.length === 1) return names[0]
+  let p = names[0] ?? ''
+  for (const n of names.slice(1)) {
+    let i = 0
+    while (i < p.length && i < n.length && p[i] === n[i]) i++
+    p = p.slice(0, i)
+  }
+  p = p.replace(/[-_.\s]+$/, '')
+  return p || slots[0]?.host || '—'
+}
+
+function MachineRowMenu({ address, name }: { address: string; name: string }) {
+  const [open, setOpen] = useState(false)
+  const [copied, setCopied] = useState<string | null>(null)
+  const copy = (text: string, what: string) => {
+    navigator.clipboard.writeText(text).catch(() => {})
+    setCopied(what)
+    setTimeout(() => { setCopied(null); setOpen(false) }, 900)
+  }
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        title="Machine actions"
+        className="w-7 h-7 rounded-md flex items-center justify-center text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
+      >
+        <svg width={16} height={16} viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" /></svg>
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 top-8 z-20 w-44 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-xl py-1 text-[13px]">
+            <button onClick={() => copy(address, 'addr')} className="w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200">{copied === 'addr' ? 'Copied' : 'Copy address'}</button>
+            <button onClick={() => copy(name, 'name')} className="w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200">{copied === 'name' ? 'Copied' : 'Copy name'}</button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 function MachinesPage({ state }: { state: State }) {
   const vms = state.vms ?? []
   // Group the config's VM blocks by physical host — each host runs several
@@ -2537,12 +2583,14 @@ function MachinesPage({ state }: { state: State }) {
       {hosts.length === 0 ? (
         <div className="text-sm text-zinc-400">No VMs configured.</div>
       ) : (
-        <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden bg-white dark:bg-zinc-950">
+        <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 overflow-hidden bg-white dark:bg-zinc-950">
           {/* column header (Tailscale-style) */}
-          <div className="hidden sm:flex items-center gap-3 px-3 py-2 bg-zinc-50 dark:bg-zinc-900/60 border-b border-zinc-200 dark:border-zinc-800 text-[10px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
-            <span className="flex-1">Machine</span>
-            <span className="w-64 flex-shrink-0">Worker slots</span>
-            <span className="w-40 flex-shrink-0">Load</span>
+          <div className="hidden md:flex items-center gap-4 px-5 py-2.5 bg-zinc-50 dark:bg-zinc-900/60 border-b border-zinc-200 dark:border-zinc-800 text-[10px] font-medium uppercase tracking-[0.12em] text-zinc-500 dark:text-zinc-400">
+            <span className="flex-1 min-w-0">Machine</span>
+            <span className="w-40 flex-shrink-0">Address</span>
+            <span className="w-60 flex-shrink-0">Agents</span>
+            <span className="w-32 flex-shrink-0">Sessions</span>
+            <span className="w-8 flex-shrink-0" />
           </div>
           <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
             {hosts.map(({ host, slots }) => {
@@ -2552,35 +2600,49 @@ function MachinesPage({ state }: { state: State }) {
               const load = c ? Math.min(100, (u / c) * 100) : 0
               const hot = load >= 90
               const err = slots.map((v) => v.last_err).find(Boolean)
+              const owner = slots.map((v) => v.bot).find(Boolean)
+              const name = machineName(slots)
               return (
-                <div key={host} className="flex items-center gap-3 px-3 py-2.5 hover:bg-zinc-50 dark:hover:bg-zinc-900/40 transition-colors">
-                  {/* Machine: status dot + host + slot names */}
-                  <div className="flex items-center gap-2.5 flex-1 min-w-0">
-                    <span className={'w-2 h-2 rounded-full flex-shrink-0 ' + (off ? 'bg-zinc-400 dark:bg-zinc-600' : 'bg-emerald-500')} title={off ? 'offline' : 'online'} />
+                <div key={host} className="flex flex-col md:flex-row md:items-center gap-3 md:gap-4 px-4 sm:px-5 py-4 hover:bg-zinc-50 dark:hover:bg-zinc-900/40 transition-colors">
+                  {/* Machine: status dot + name + owner + status pill */}
+                  <div className="flex items-start gap-3 flex-1 min-w-0">
+                    <span className={'mt-1.5 w-2.5 h-2.5 rounded-full flex-shrink-0 ' + (off ? 'bg-zinc-300 dark:bg-zinc-600' : 'bg-emerald-500')} title={off ? 'offline' : 'online'} />
                     <div className="min-w-0">
-                      <div className={'text-[13px] font-medium truncate ' + (off ? 'text-zinc-400 dark:text-zinc-500' : 'text-zinc-900 dark:text-zinc-100')}>
-                        {host}
-                        {off && <span className="mono text-[10px] text-zinc-400 ml-1.5">offline</span>}
-                        {err && <span className="mono text-[10px] text-rose-500 ml-1.5 truncate" title={err}>· {err}</span>}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className={'text-[14px] font-semibold truncate ' + (off ? 'text-zinc-400 dark:text-zinc-500' : 'text-zinc-900 dark:text-zinc-100')}>{name}</span>
+                        <span className={'inline-flex items-center gap-1 text-[11px] font-medium ' + (off ? 'text-zinc-400 dark:text-zinc-500' : 'text-emerald-600 dark:text-emerald-400')}>
+                          <span className={'w-1.5 h-1.5 rounded-full ' + (off ? 'bg-zinc-300 dark:bg-zinc-600' : 'bg-emerald-500')} />
+                          {off ? 'Offline' : 'Connected'}
+                        </span>
+                        {err && <span className="mono text-[10px] px-1.5 py-0.5 rounded bg-rose-50 text-rose-600 dark:bg-rose-500/15 dark:text-rose-300 truncate max-w-[220px]" title={err}>{err}</span>}
                       </div>
-                      <div className="mono text-[11px] text-zinc-500 dark:text-zinc-400 truncate">{slots.map((v) => v.name).join(' · ')}</div>
+                      <div className="text-[12px] text-zinc-500 dark:text-zinc-400 truncate mt-0.5">
+                        {owner ? <>{owner}<span className="text-zinc-300 dark:text-zinc-600"> · </span></> : null}
+                        {slots.length} slot{slots.length === 1 ? '' : 's'}
+                      </div>
                     </div>
                   </div>
-                  {/* Worker slots: a chip per block (agent ×capacity) */}
-                  <div className="w-64 flex-shrink-0 flex flex-wrap gap-1">
+                  {/* Address */}
+                  <div className="w-40 flex-shrink-0 mono text-[12px] text-zinc-600 dark:text-zinc-300 truncate pl-5 md:pl-0" title={host}>{host}</div>
+                  {/* Agents: a chip per slot (agent ×capacity) */}
+                  <div className="w-60 flex-shrink-0 flex flex-wrap gap-1.5 pl-5 md:pl-0">
                     {slots.map((v) => (
-                      <span key={v.name} title={v.name} className="inline-flex items-center gap-1 mono text-[10px] px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300">
+                      <span key={v.name} title={v.name} className="inline-flex items-center gap-1 mono text-[10.5px] px-1.5 py-0.5 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300">
                         <AgentLogo account={v.agent ?? 'claude'} size={11} className="text-zinc-500 dark:text-zinc-400" />
                         {v.agent ?? 'claude'} ×{v.capacity || '∞'}
                       </span>
                     ))}
                   </div>
-                  {/* Load: aggregate across the host's slots */}
-                  <div className="w-40 flex-shrink-0 flex items-center gap-2">
+                  {/* Sessions: used/cap + load bar */}
+                  <div className="w-32 flex-shrink-0 flex items-center gap-2 pl-5 md:pl-0">
                     <div className="relative h-1.5 flex-1 rounded-full overflow-hidden bg-zinc-200 dark:bg-zinc-800">
                       <div className={'absolute inset-y-0 left-0 ' + (hot ? 'bg-rose-500/80' : 'bg-emerald-500/80')} style={{ width: `${load}%` }} />
                     </div>
-                    <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums w-12 text-right">{u}/{c || '∞'}</span>
+                    <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums">{u}/{c || '∞'}</span>
+                  </div>
+                  {/* Action menu */}
+                  <div className="w-8 flex-shrink-0 hidden md:flex justify-end">
+                    <MachineRowMenu address={host} name={name} />
                   </div>
                 </div>
               )
