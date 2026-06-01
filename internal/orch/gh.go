@@ -98,15 +98,49 @@ func ghBranchAhead(repo, branch string) (bool, error) {
 	return n > 0, nil
 }
 
+// prTitleFromBranch returns the subject line of the branch's first commit
+// against main, or "" if it can't be read. Agents write conventional-commit
+// messages, so this is the natural, lint-passing PR title.
+func prTitleFromBranch(repo, branch string) string {
+	out, _, err := run("gh", "api",
+		fmt.Sprintf("repos/%s/compare/main...%s", repo, branch),
+		"--jq", ".commits[0].commit.message")
+	if err != nil {
+		return ""
+	}
+	subj := strings.TrimSpace(out)
+	if i := strings.IndexByte(subj, '\n'); i >= 0 {
+		subj = strings.TrimSpace(subj[:i])
+	}
+	return subj
+}
+
+// cleanIssueTitle strips a leading "[owner/repo#N] " bracket that orch inbox
+// issues carry, so the fallback PR title isn't obviously non-conventional.
+func cleanIssueTitle(t string) string {
+	if strings.HasPrefix(t, "[") {
+		if i := strings.Index(t, "] "); i >= 0 {
+			return strings.TrimSpace(t[i+2:])
+		}
+	}
+	return t
+}
+
 func ghAutoCreatePR(cfg *Config, n int, j *Job, is Issue) (int, error) {
 	ahead, err := ghBranchAhead(j.TargetRepo, j.Branch)
 	if err != nil || !ahead {
 		return 0, err
 	}
+	// Title from the branch's commit subject — NOT the raw issue title, which
+	// is often "[denoland/deno#NNNNN] <issue text>" and fails lint-title CI.
+	title := prTitleFromBranch(j.TargetRepo, j.Branch)
+	if title == "" {
+		title = cleanIssueTitle(is.Title)
+	}
 	body := fmt.Sprintf("Closes %s#%d", cfg.GitHub.InboxRepo, n)
 	out, errStr, err := run("gh", "pr", "create",
 		"--repo", j.TargetRepo, "--head", j.Branch, "--base", "main",
-		"--title", is.Title, "--body", body)
+		"--title", title, "--body", body)
 	if err != nil {
 		return 0, fmt.Errorf("gh pr create: %v: %s", err, errStr)
 	}
