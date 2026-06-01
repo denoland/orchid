@@ -1027,6 +1027,7 @@ function timeAgo(iso?: string | null): string {
 type SectionId = 'orch' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
 
 interface MemNote { name: string; file: string; target: string; summary: string; links: string[]; backlinks: string[] }
+interface BlameLine { n: number; text: string; commit: string; short: string; author: string; email: string; date: string; summary: string }
 interface MemTreeNode { name: string; path: string; note?: MemNote; children: MemTreeNode[] }
 
 // buildMemTree turns note paths (memory/<owner>/<repo>/note.md) into a real
@@ -1089,6 +1090,23 @@ function MemoryPage() {
   const [loading, setLoading] = useState(true)
   const [q, setQ] = useState('')
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  const [prov, setProv] = useState(false) // provenance (git-blame) view of the open note
+  const [blame, setBlame] = useState<BlameLine[] | null>(null)
+  const [blameRepo, setBlameRepo] = useState('')
+  const [openLine, setOpenLine] = useState<number | null>(null)
+
+  // Per-line provenance via git blame — fetched lazily when the Provenance view
+  // is on. Each line carries the commit that introduced it.
+  useEffect(() => {
+    if (!sel || !prov) { setBlame(null); setOpenLine(null); return }
+    let live = true
+    setBlame(null); setOpenLine(null)
+    fetch('/api/memory/blame?note=' + encodeURIComponent(sel.file), { credentials: 'include', cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => { if (live) { setBlame(d.lines || []); setBlameRepo(d.repo || '') } })
+      .catch(() => { if (live) setBlame([]) })
+    return () => { live = false }
+  }, [sel, prov])
 
   useEffect(() => {
     fetch('/api/memory', { credentials: 'include', cache: 'no-store' })
@@ -1229,7 +1247,53 @@ function MemoryPage() {
                     </div>
                   )}
                 </div>
-                <article className="docs-prose rounded-lg border border-zinc-200 dark:border-zinc-800 p-4 sm:p-6 bg-white dark:bg-zinc-950" dangerouslySetInnerHTML={{ __html: html }} />
+
+                {/* View toggle: rendered markdown vs per-line provenance (git blame) */}
+                <div className="flex items-center gap-1">
+                  <span className="text-[11px] text-zinc-400 mr-1">View</span>
+                  <button onClick={() => setProv(false)} className={'mono text-[11px] px-2 py-0.5 rounded ' + (!prov ? 'bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-900' : 'text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800')}>Rendered</button>
+                  <button onClick={() => setProv(true)} className={'mono text-[11px] px-2 py-0.5 rounded ' + (prov ? 'bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-900' : 'text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800')}>Provenance</button>
+                  {prov && <span className="text-[11px] text-zinc-400 ml-1">— click a line for its source</span>}
+                </div>
+
+                {!prov ? (
+                  <article className="docs-prose rounded-lg border border-zinc-200 dark:border-zinc-800 p-4 sm:p-6 bg-white dark:bg-zinc-950" dangerouslySetInnerHTML={{ __html: html }} />
+                ) : (
+                  <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 overflow-hidden">
+                    {blame === null && <div className="px-4 py-6 text-sm text-zinc-400">Loading provenance…</div>}
+                    {blame && blame.length === 0 && <div className="px-4 py-6 text-sm text-zinc-400">No blame — this note isn't committed to git yet.</div>}
+                    {blame && blame.map((l) => {
+                      const agent = /divybot|\bbot\b|\[bot\]/i.test(l.author) || /users\.noreply/i.test(l.email)
+                      const open = openLine === l.n
+                      const commitURL = blameRepo && l.commit ? `https://github.com/${blameRepo}/commit/${l.commit}` : ''
+                      return (
+                        <div key={l.n} className={open ? 'bg-zinc-50 dark:bg-zinc-900/40' : ''}>
+                          <button onClick={() => setOpenLine(open ? null : l.n)}
+                            className="w-full flex items-baseline gap-2 px-3 py-[3px] text-left hover:bg-zinc-50 dark:hover:bg-zinc-900/50 border-l-2 border-transparent hover:border-violet-400">
+                            <span className="mono text-[11px] text-violet-500 w-12 flex-shrink-0">{l.short}</span>
+                            <span className="mono text-[11px] text-zinc-400 tabular-nums w-[78px] flex-shrink-0">{l.date}</span>
+                            <span className={'text-[10px] px-1 rounded flex-shrink-0 w-12 text-center ' + (agent ? 'bg-violet-100 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300')}>{agent ? 'swarm' : 'human'}</span>
+                            <span className="mono text-[12px] text-zinc-700 dark:text-zinc-300 truncate flex-1 min-w-0">{l.text || ' '}</span>
+                          </button>
+                          {open && (
+                            <div className="px-4 py-3 border-y border-zinc-100 dark:border-zinc-800 text-[12px] space-y-3">
+                              <div>
+                                <div className="text-[10px] uppercase tracking-wide text-zinc-400 mb-1">Source</div>
+                                <div className="text-zinc-700 dark:text-zinc-200">{l.summary || '(no commit subject)'}</div>
+                                <div className="text-zinc-500 dark:text-zinc-400 mt-0.5">{agent ? 'Written by the swarm' : 'Human edit'} · {l.author} · {l.date}</div>
+                                {commitURL && <a href={commitURL} target="_blank" rel="noreferrer" className="mono text-[11px] text-violet-500 hover:underline inline-block mt-1">commit {l.short} ↗</a>}
+                              </div>
+                              <div>
+                                <div className="text-[10px] uppercase tracking-wide text-zinc-400 mb-1">Used in</div>
+                                <div className="text-zinc-400 dark:text-zinc-500 italic">Per-fact usage isn't tracked yet — every session reads the whole shared store at startup.</div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
                 {(sel.backlinks?.length > 0 || sel.links?.length > 0) && (
                   <div className="flex flex-col gap-3 rounded-lg border border-zinc-200 dark:border-zinc-800 p-4">
                     {sel.backlinks?.length > 0 && (
