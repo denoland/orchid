@@ -103,7 +103,7 @@ SESSION_HOME=%q
 
 git config --global --add safe.directory "$REPODIR" 2>/dev/null || true
 # Same auth path as tmuxStart: prefer the bot's ssh key, fall back to gh https.
-if ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | grep -q 'successfully authenticated'; then
+if ssh -n -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | grep -q 'successfully authenticated'; then
   URL="git@github.com:$REPO.git"
 else
   gh auth setup-git -h github.com >/dev/null 2>&1 || true
