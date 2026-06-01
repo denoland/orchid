@@ -2582,7 +2582,7 @@ function MachinesPage({ state }: { state: State }) {
         <span className="mono text-[11px] text-zinc-400 tabular-nums">{vms.length} slots · {used}/{cap || '∞'} sessions</span>
       </div>
       {hosts.length === 0 ? (
-        <div className="text-sm text-zinc-400">No VMs configured.</div>
+        <div className="text-sm text-zinc-400">No machines connected yet.</div>
       ) : (
         <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 overflow-hidden bg-white dark:bg-zinc-950">
           {/* column header (Tailscale-style) */}
@@ -2796,7 +2796,7 @@ function FirstJoinSetup({ relay }: { relay: RelayInfo | null }) {
         <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
         <span className="mono text-[10.5px] uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Waiting for your first machine</span>
       </div>
-      <h1 className="text-[22px] sm:text-[26px] font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">Bring a machine online</h1>
+      <h1 className="text-[22px] sm:text-[26px] font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">Connect your machine</h1>
       <p className="mt-2.5 text-[13.5px] leading-relaxed text-zinc-500 dark:text-zinc-400 max-w-xl">
         Orchid runs the swarm on machines you own. Run these two commands on the
         box that should host it — a Linux server or your Mac. The moment it dials
@@ -2824,7 +2824,7 @@ function JoinCommandCard({ info }: { info: RelayInfo | null | 'unavailable' }) {
   if (info === null) {
     return (
       <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 p-6">
-        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-3">Add a VM</div>
+        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-3">Connect a machine</div>
         <div className="text-[12.5px] text-zinc-500 dark:text-zinc-400">Loading…</div>
       </div>
     )
@@ -2832,7 +2832,7 @@ function JoinCommandCard({ info }: { info: RelayInfo | null | 'unavailable' }) {
   if (info === 'unavailable' || !info.login || !info.token) {
     return (
       <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 p-6 space-y-3">
-        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Add a VM</div>
+        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Connect a machine</div>
         <div className="text-[13px] text-zinc-700 dark:text-zinc-300 leading-relaxed">
           This orch is running standalone — there's no relay endpoint for a
           new VM to join through.
@@ -2859,7 +2859,7 @@ function JoinCommandCard({ info }: { info: RelayInfo | null | 'unavailable' }) {
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 p-6 space-y-5">
       <div className="flex items-center justify-between">
-        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Add a VM</div>
+        <div className="text-[12px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Connect a machine</div>
         <div className="text-[11.5px] text-zinc-500 dark:text-zinc-400">SSH into the new box as root</div>
       </div>
       <JoinStep n={1} label="Install orch">
