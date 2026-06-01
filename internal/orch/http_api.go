@@ -572,6 +572,36 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		_, _ = w.Write(body)
 	}))
 
+	// Agent credentials (local provider). GET lists each account the swarm uses
+	// and whether orch has creds stored for it; POST /import seeds an account
+	// from auth files on the central host (same as `orch creds import`).
+	mux.HandleFunc("/api/credentials", auth(func(w http.ResponseWriter, r *http.Request) {
+		lc := &localCreds{kv: st.store}
+		type acct struct {
+			Account   string `json:"account"`
+			Agent     string `json:"agent"`
+			Connected bool   `json:"connected"`
+		}
+		seen := map[string]bool{}
+		out := []acct{}
+		for _, vm := range cfg.VMs {
+			a := vmAccount(vm)
+			if seen[a] {
+				continue
+			}
+			seen[a] = true
+			out = append(out, acct{Account: a, Agent: vmAgent(vm).name, Connected: lc.HasCreds(a)})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-cache")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"provider": credProviderName(),
+			"accounts": out,
+		})
+	}))
+	// Connecting agent accounts is done out-of-band (`orch creds import`, or the
+	// credential provider's own flow) — the dashboard is status-only on purpose.
+
 	// Shared swarm memory (read-only). GET /api/memory -> parsed MEMORY.md index;
 	// GET /api/memory?note=<file.md> -> raw markdown of one topic note.
 	mux.HandleFunc("/api/memory", auth(func(w http.ResponseWriter, r *http.Request) {

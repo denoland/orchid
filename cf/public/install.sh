@@ -85,7 +85,7 @@ TAG=""
 gh release download $TAG \
   --repo denoland/orchid \
   --pattern "orch-linux-${ARCH}.tar.gz" \
-  --dir "$TMPDIR" --clobber
+  --dir "$TMPDIR"
 tar -xzf "$TMPDIR/orch-linux-${ARCH}.tar.gz" -C "$TMPDIR"
 $SUDO install -m 0755 "$TMPDIR/orch" "$ORCHID_BIN"
 

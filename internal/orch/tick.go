@@ -1,6 +1,7 @@
 package orch
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"log"
@@ -30,6 +31,13 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 	if vmAgent(*vm).name == "claude" && vm.SessionCmd != "" {
 		if flags := claudeFlagsFromFrontmatter(is.Body); flags != "" {
 			sessionCmdOverride = vm.SessionCmd + flags
+		}
+	}
+	// Authenticate the agent on this VM (write/refresh auth from the configured
+	// credential provider) before launching — replaces hand-copying creds.
+	if credProvider != nil {
+		if err := credProvider.Provision(context.Background(), vm, vmAgent(*vm).name); err != nil {
+			log.Printf("issue #%d: credential provision (%s) on %s: %v", is.Number, credProvider.Name(), vm.Name, err)
 		}
 	}
 	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, sessionCmdOverride, botLogin, botEmail, memoryStoreArg(cfg, vm)); err != nil {

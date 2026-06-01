@@ -1,7 +1,7 @@
 
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { marked } from 'marked'
-import type { Job, State } from './types'
+import type { Job, State, AgentMeter, VM } from './types'
 import { attention, ciStatus, LEVEL_COLOR, type AttentionLevel } from './attention'
 import { Pane } from './Pane'
 import { Composer } from './Composer'
@@ -133,7 +133,7 @@ function DashboardInner({ state: rawState, relay }: Props) {
     <div className="min-h-screen w-full overflow-x-hidden flex flex-col bg-zinc-50 dark:bg-zinc-950">
       <TopBar
         count={jobs.filter((j) => !j.closed_state).length}
-        vmCount={(state.vms ?? []).length}
+        vmCount={new Set((state.vms ?? []).map((v) => v.host)).size}
         intgCount={(state.connect?.github.connected ? 1 : 0) + Object.values(state.agents ?? {}).filter((m) => m?.quota).length}
         tab={tab}
         setTab={setTab}
@@ -147,9 +147,21 @@ function DashboardInner({ state: rawState, relay }: Props) {
           <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)] bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
             <MemoryPage />
           </div>
+        ) : tab === 'analytics' ? (
+          <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)] bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
+            <AnalyticsPage state={state} jobs={jobs} />
+          </div>
+        ) : tab === 'machines' ? (
+          <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)] bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
+            <MachinesPage state={state} />
+          </div>
+        ) : tab === 'integrations' ? (
+          <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)] bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
+            <IntegrationsPage state={state} />
+          </div>
         ) : tab !== 'sessions' ? (
           <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)]">
-            <SettingsPage key={tab} jobs={jobs} state={state} relay={relay} initialSection={TAB_SECTION[tab as Exclude<Tab, 'sessions' | 'memory'>]} onClose={() => setTab('sessions')} />
+            <SettingsPage key={tab} jobs={jobs} state={state} relay={relay} initialSection={TAB_SECTION[tab as Exclude<Tab, 'sessions' | 'memory' | 'analytics' | 'machines' | 'integrations'>]} onClose={() => setTab('sessions')} />
           </div>
         ) : (
           <>
@@ -230,28 +242,25 @@ function Sidebar({ state, open, onClose }: { state: State; open: boolean; onClos
 
         <div className="border-t border-zinc-200 dark:border-zinc-800 pt-4 flex flex-col gap-2">
           <h2 className="mono text-[10px] uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">
-            VMs
+            Machines
           </h2>
-          {state.vms.map((vm) => (
-            <div key={vm.name} className="flex items-center gap-2 text-[12px]">
-              <span
-                className={
-                  'w-1.5 h-1.5 rounded-full flex-shrink-0 ' +
-                  (vm.online === false ? 'bg-zinc-400 dark:bg-zinc-600' : 'bg-emerald-500')
-                }
-                title={vm.online === false ? 'offline' : 'online'}
-              />
-              <span className="mono text-zinc-700 dark:text-zinc-300 flex-1 truncate">{vm.name}</span>
-              {vm.agent && vm.agent !== 'claude' && (
-                <span className="mono text-[10px] px-1 rounded bg-zinc-200/70 dark:bg-zinc-700/70 text-zinc-500 dark:text-zinc-400">
-                  {vm.agent}
-                </span>
-              )}
-              <span className="mono text-zinc-500 dark:text-zinc-400 tabular-nums">
-                {vm.used}/{vm.capacity || '∞'}
-              </span>
-            </div>
-          ))}
+          {[...new Set(state.vms.map((v) => v.host))].map((host) => {
+            const slots = state.vms.filter((v) => v.host === host)
+            const off = slots.every((v) => v.online === false)
+            const u = slots.reduce((a, v) => a + (v.used ?? 0), 0)
+            const c = slots.reduce((a, v) => a + (v.capacity ?? 0), 0)
+            return (
+              <div key={host} className="flex items-center gap-2 text-[12px]">
+                <span
+                  className={'w-1.5 h-1.5 rounded-full flex-shrink-0 ' + (off ? 'bg-zinc-400 dark:bg-zinc-600' : 'bg-emerald-500')}
+                  title={off ? 'offline' : 'online'}
+                />
+                <span className="mono text-zinc-700 dark:text-zinc-300 flex-1 truncate">{host}</span>
+                <span className="mono text-[10px] text-zinc-400">{slots.length} slots</span>
+                <span className="mono text-zinc-500 dark:text-zinc-400 tabular-nums">{u}/{c || '∞'}</span>
+              </div>
+            )
+          })}
         </div>
       </div>
       <OrchidArt
@@ -295,7 +304,10 @@ function TopBar({
     <div className="flex-shrink-0 sticky top-0 z-40 border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950">
       {/* Row 1: logo · search (GitHub-style) · actions */}
       <div className="flex items-center gap-4 h-12 px-4 sm:px-6">
-        <img src="/favicon.svg" alt="Orchid" className="w-6 h-6 flex-shrink-0" />
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          <img src="/favicon.svg" alt="Orchid" className="w-6 h-6 flex-shrink-0" />
+          <span className="text-[18px] font-semibold tracking-tight text-zinc-800 dark:text-zinc-100 hidden sm:block">Orchid</span>
+        </div>
         <div className="hidden sm:block flex-1" />
         <div className="relative flex-1 max-w-none sm:max-w-md">
           <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400" width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
@@ -809,47 +821,106 @@ function GitHubIntegration({ state }: { state: State }) {
   }
 
   return (
-    <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5">
-      <div className="flex items-center gap-3 mb-3">
-        <span className="serif italic text-[18px] text-zinc-900 dark:text-zinc-100">GitHub</span>
-        {connected
-          ? <span className="mono text-[11px] px-2 py-0.5 rounded ring-1 ring-emerald-300 dark:ring-emerald-700/60 text-emerald-700 dark:text-emerald-300">connected as {login}</span>
-          : <span className="mono text-[11px] px-2 py-0.5 rounded ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-500">not connected</span>}
-      </div>
-      <div className="text-[13px] text-zinc-600 dark:text-zinc-400 mb-3">
-        Orchid uses gh to read inbox issues and push branches. Connecting opens a one-time GitHub device-flow code; the daemon stores the token in <code className="mono text-[11px]">/var/lib/orchid/.config/gh/hosts.yml</code> and uses it for every subsequent call.
+    <div className="px-3 py-3">
+      <div className="flex items-center gap-3">
+        <svg width={18} height={18} viewBox="0 0 16 16" className="flex-shrink-0 text-zinc-700 dark:text-zinc-300" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-[13px] font-medium text-zinc-900 dark:text-zinc-100">GitHub</span>
+            {connected
+              ? <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">connected · {login}</span>
+              : <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-zinc-200 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">not connected</span>}
+          </div>
+          <div className="text-[12px] text-zinc-500 dark:text-zinc-400 truncate">Reads inbox issues, pushes branches — one-time device-flow login.</div>
+        </div>
+        {!flow && (
+          <button onClick={start}
+            className="mono text-[11.5px] px-3 py-1.5 rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 hover:opacity-90 flex-shrink-0">{connected ? 'Reconnect' : 'Connect'}</button>
+        )}
       </div>
       {flow && polling && (
-        <div className="rounded-md ring-1 ring-zinc-200 dark:ring-zinc-800 p-4 mb-3 bg-zinc-50 dark:bg-zinc-900/40">
-          <div className="text-[12px] text-zinc-500 dark:text-zinc-400 mb-2">Go to:</div>
-          <a href={flow.verification_uri} target="_blank" rel="noreferrer"
-             className="mono text-[13px] text-blue-600 dark:text-blue-400 underline">{flow.verification_uri}</a>
-          <div className="text-[12px] text-zinc-500 dark:text-zinc-400 mt-3 mb-1">Enter code:</div>
-          <div className="mono text-[20px] tracking-widest text-zinc-900 dark:text-zinc-100 select-all">{flow.user_code}</div>
-          <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-3">Waiting for approval…</div>
+        <div className="rounded-md border border-zinc-200 dark:border-zinc-800 p-3 mt-3 bg-zinc-50 dark:bg-zinc-900/40">
+          <div className="text-[12px] text-zinc-500 dark:text-zinc-400">Go to <a href={flow.verification_uri} target="_blank" rel="noreferrer" className="mono text-blue-600 dark:text-blue-400 underline">{flow.verification_uri}</a> and enter:</div>
+          <div className="mono text-[20px] tracking-widest text-zinc-900 dark:text-zinc-100 select-all mt-1">{flow.user_code}</div>
+          <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-2">Waiting for approval…</div>
         </div>
       )}
       {error && (
-        <div className="rounded-md ring-1 ring-rose-300 dark:ring-rose-700/60 bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-300 text-[12px] px-3 py-2 mb-3">{error}</div>
-      )}
-      {!flow && (
-        <button
-          onClick={start}
-          className="mono text-[12px] px-3 py-1.5 rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 hover:opacity-90"
-        >{connected ? 'Reconnect' : 'Connect GitHub'}</button>
+        <div className="rounded-md ring-1 ring-rose-300 dark:ring-rose-700/60 bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-300 text-[12px] px-3 py-2 mt-3">{error}</div>
       )}
     </div>
   )
 }
 
-function ComingSoonIntegration({ name, blurb }: { name: string; blurb: string }) {
+function ComingSoonIntegration({ name, account, blurb }: { name: string; account?: string; blurb: string }) {
   return (
-    <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 p-5 opacity-60">
-      <div className="flex items-center gap-3 mb-2">
-        <span className="serif italic text-[18px] text-zinc-900 dark:text-zinc-100">{name}</span>
-        <span className="mono text-[11px] px-2 py-0.5 rounded ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-500">coming soon</span>
+    <div className="px-3 py-3 flex items-center gap-3 opacity-60">
+      <span className="w-[18px] flex-shrink-0 flex justify-center">
+        {account ? <AgentLogo account={account} size={16} className="text-zinc-500 dark:text-zinc-400" /> : null}
+      </span>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-[13px] font-medium text-zinc-900 dark:text-zinc-100">{name}</span>
+          <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-zinc-200 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">coming soon</span>
+        </div>
+        <div className="text-[12px] text-zinc-500 dark:text-zinc-400 truncate">{blurb}</div>
       </div>
-      <div className="text-[13px] text-zinc-600 dark:text-zinc-400">{blurb}</div>
+    </div>
+  )
+}
+
+// IntegrationsPage — full-bleed top-level tab. Compact table of external
+// services orchid talks to (GitHub today; Claude/Codex onboarding next).
+interface CredAcct { account: string; agent: string; connected: boolean }
+
+function IntegrationsPage({ state }: { state: State }) {
+  const [accts, setAccts] = useState<CredAcct[]>([])
+  const [provider, setProvider] = useState('')
+  useEffect(() => {
+    fetch('/api/credentials', { credentials: 'include', cache: 'no-store' })
+      .then((r) => r.json())
+      .then((d) => { setAccts(d.accounts || []); setProvider(d.provider || '') })
+      .catch(() => {})
+  }, [])
+  const connBadge = (ok: boolean, label?: string) => ok
+    ? <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 whitespace-nowrap">connected{label ? ' · ' + label : ''}</span>
+    : <span className="mono text-[10px] px-1.5 py-0.5 rounded-full bg-zinc-200 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">not connected</span>
+
+  return (
+    <div className="flex-1 min-w-0 w-full max-w-screen-xl mx-auto p-4 sm:p-6 flex flex-col gap-4">
+      <div className="flex items-center gap-3">
+        <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Connections</h1>
+        <span className="text-[12px] text-zinc-500 dark:text-zinc-400">What the daemon and spawned sessions authenticate to.</span>
+        {provider && <span className="mono text-[10px] text-zinc-400 ml-auto">agent creds: {provider}</span>}
+      </div>
+
+      {/* One uniform list. GitHub is connectable inline (orch's own auth);
+          agent accounts are provider-managed, so status-only. */}
+      <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden bg-white dark:bg-zinc-950 divide-y divide-zinc-100 dark:divide-zinc-800/70">
+        <GitHubIntegration state={state} />
+        {accts.map((a) => (
+          <div key={a.account} className="px-3 py-3 flex items-center gap-3">
+            <AgentLogo account={a.agent} size={18} className="text-zinc-500 dark:text-zinc-400 flex-shrink-0" />
+            <div className="flex-1 min-w-0">
+              <div className="text-[13px] font-medium text-zinc-900 dark:text-zinc-100 truncate">{a.account}</div>
+              <div className="text-[12px] text-zinc-500 dark:text-zinc-400 truncate">{a.agent} account — managed by the <span className="mono">{provider || 'local'}</span> credential provider.</div>
+            </div>
+            {connBadge(a.connected)}
+          </div>
+        ))}
+      </div>
+
+      {/* How to add another account — connect is out-of-band on purpose. */}
+      <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 px-4 py-3">
+        <div className="text-[12px] text-zinc-500 dark:text-zinc-400 mb-2">
+          Add an account on the orchestrator host (then point a VM at it with <span className="mono">account = "&lt;name&gt;"</span>):
+        </div>
+        <pre className="mono text-[12px] text-zinc-800 dark:text-zinc-200 bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-2 overflow-x-auto whitespace-pre">{`# claude account (read ~/.claude)
+orch creds import <account> --agent claude --from /home/orchid
+
+# codex account (read its CODEX_HOME)
+orch creds import <account> --agent codex --from /home/orchid/.codex`}</pre>
+      </div>
     </div>
   )
 }
@@ -1261,7 +1332,7 @@ function MemoryPage() {
   )
 
   return (
-    <div className="flex-1 min-w-0 p-4 sm:p-6">
+    <div className="flex-1 min-w-0 w-full max-w-screen-xl mx-auto p-4 sm:p-6">
       <div className="flex items-center gap-3 mb-3">
         <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Memory</h1>
         <span className="mono text-[11px] px-1.5 py-0.5 rounded-full bg-zinc-200/80 dark:bg-zinc-700/70 text-zinc-600 dark:text-zinc-300 tabular-nums">{notes.length}</span>
@@ -1385,8 +1456,8 @@ function MemoryPage() {
 // section — Machines (VMs), Analytics (usage), Integrations get their own tab;
 // Settings holds the rest (orch/access/capture/targets/danger) via its own nav.
 type Tab = 'sessions' | 'machines' | 'analytics' | 'memory' | 'integrations' | 'settings'
-const TAB_SECTION: Record<Exclude<Tab, 'sessions' | 'memory'>, SectionId> = {
-  machines: 'vms', analytics: 'usage', integrations: 'integrations', settings: 'orch',
+const TAB_SECTION: Record<Exclude<Tab, 'sessions' | 'memory' | 'analytics' | 'machines' | 'integrations'>, SectionId> = {
+  settings: 'orch',
 }
 function sectionToTab(s: SectionId): Tab {
   return s === 'vms' ? 'machines' : s === 'usage' ? 'analytics' : s === 'integrations' ? 'integrations' : 'settings'
@@ -1550,7 +1621,7 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
 
       <div className="flex-1 min-h-0 flex flex-col">
         <main className="flex-1 min-w-0 overflow-auto">
-          <div className="max-w-[820px] mx-auto px-4 sm:px-8 md:px-10 py-6 md:py-10 space-y-8">
+          <div className="max-w-[860px] mx-auto px-4 sm:px-6 py-5 space-y-6">
             {vis('orch') && (
               <>
                 <Section title="GitHub">
@@ -1749,12 +1820,12 @@ function Td({ children, align }: { children: React.ReactNode; align?: 'right' | 
 
 function Section({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
   return (
-    <section>
-      <div className="mb-5">
-        <h3 className="serif italic text-[28px] leading-none text-zinc-900 dark:text-zinc-100">{title}</h3>
-        {subtitle && <p className="text-[13px] text-zinc-500 dark:text-zinc-400 mt-2 max-w-[640px]">{subtitle}</p>}
+    <section className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4">
+      <div className="mb-3">
+        <h3 className="text-[13px] font-semibold text-zinc-900 dark:text-zinc-100">{title}</h3>
+        {subtitle && <p className="text-[12px] text-zinc-500 dark:text-zinc-400 mt-0.5 max-w-[640px]">{subtitle}</p>}
       </div>
-      <div className="space-y-4">{children}</div>
+      <div className="space-y-3">{children}</div>
     </section>
   )
 }
@@ -2437,6 +2508,258 @@ function UsageRollups({ rows }: { rows: UsageHistoryRow[] }) {
       {card('Today',   1)}
       {card('7 days',  7)}
       {card('30 days', 30)}
+    </div>
+  )
+}
+
+// AnalyticsPage — full-bleed top-level tab (like Sessions/Memory), compact and
+// honest. Leads with per-account QUOTA (the real constraint on a subscription),
+// then throughput in tok() (input+output+cache-writes; cache_read excluded — it
+// re-counts the same prefix every turn and would read as billions). No dollar
+// figures: subscriptions aren't billed per-token, so $ is noise here.
+function AnalyticsPage({ state, jobs }: { state: State; jobs: Job[] }) {
+  const [history, setHistory] = useState<UsageHistoryRow[] | null>(null)
+  const [days, setDays] = useState(30)
+  useEffect(() => {
+    let alive = true
+    const load = () => fetch(`/api/usage_history?days=${days}`, { credentials: 'include', cache: 'no-store' })
+      .then((r) => r.ok ? r.json() : null).then((j) => { if (alive) setHistory(j?.rows ?? []) }).catch(() => { if (alive) setHistory([]) })
+    load(); const id = setInterval(load, 60_000)
+    return () => { alive = false; clearInterval(id) }
+  }, [days])
+
+  const rows = history ?? []
+  const today = new Date().toISOString().slice(0, 10)
+  // window of d days INCLUDING today (fixes the old off-by-one where "Today"
+  // summed today + yesterday and read ~2x).
+  const sinceISO = (d: number) => new Date(Date.now() - (d - 1) * 86400_000).toISOString().slice(0, 10)
+  const sumWin = (d: number) => rows.filter((r) => r.date >= sinceISO(d) && r.date <= today).reduce((a, r) => a + tok(r), 0)
+
+  // per-account quota (real constraint). Fall back to top-level quota as "claude".
+  const accounts: [string, AgentMeter][] = state.agents && Object.keys(state.agents).length
+    ? Object.entries(state.agents)
+    : (state.quota ? [['claude', { quota: state.quota, governor: state.governor }]] : [])
+
+  // daily throughput for the trend (last `days`, oldest→newest)
+  const byDay = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const r of rows) m.set(r.date, (m.get(r.date) ?? 0) + tok(r))
+    const out: { date: string; v: number }[] = []
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 86400_000).toISOString().slice(0, 10)
+      out.push({ date: d, v: m.get(d) ?? 0 })
+    }
+    return out
+  }, [rows, days])
+  const dayMax = Math.max(1, ...byDay.map((d) => d.v))
+
+  // by model (always accurate) over the window
+  const issueRepo = useMemo(() => new Map(jobs.filter((j) => j.issue).map((j) => [j.issue, j.target_repo ? j.target_repo.split('/')[1] : (j.target || '')])), [jobs])
+  const winRows = rows.filter((r) => r.date >= sinceISO(days) && r.date <= today)
+  const byKey = (keyfn: (r: UsageHistoryRow) => string) => {
+    const m = new Map<string, number>()
+    for (const r of winRows) { const k = keyfn(r) || '—'; m.set(k, (m.get(k) ?? 0) + tok(r)) }
+    return [...m.entries()].sort((a, b) => b[1] - a[1])
+  }
+  const byModel = byKey((r) => (r.model || '').replace(/^claude-/, '').replace(/-\d{8}$/, ''))
+  const byRepo = byKey((r) => issueRepo.get(r.issue ?? -1) || 'other')
+  const winTotal = winRows.reduce((a, r) => a + tok(r), 0)
+
+  const live = jobs.filter((j) => j.usage).slice().sort((a, b) => (b.usage?.context_pct ?? 0) - (a.usage?.context_pct ?? 0))
+
+  const section = (title: string, right?: React.ReactNode) => (
+    <div className="flex items-center gap-2 mb-2">
+      <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">{title}</span>
+      <div className="flex-1" />{right}
+    </div>
+  )
+  const card = 'rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950'
+
+  const barList = (entries: [string, number][], max: number) => (
+    <div className={card + ' divide-y divide-zinc-100 dark:divide-zinc-800/70'}>
+      {entries.length === 0 && <div className="px-3 py-2.5 text-[12.5px] text-zinc-400">No data.</div>}
+      {entries.slice(0, 8).map(([k, v]) => (
+        <div key={k} className="flex items-center gap-3 px-3 py-1.5">
+          <span className="text-[12.5px] text-zinc-700 dark:text-zinc-300 truncate w-40 flex-shrink-0">{k}</span>
+          <div className="relative h-1.5 flex-1 rounded-full overflow-hidden bg-zinc-100 dark:bg-zinc-800">
+            <div className="absolute inset-y-0 left-0 bg-violet-500/70" style={{ width: `${(v / max) * 100}%` }} />
+          </div>
+          <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums w-12 text-right">{fmtTok(v)}</span>
+        </div>
+      ))}
+    </div>
+  )
+
+  return (
+    <div className="flex-1 min-w-0 w-full max-w-screen-xl mx-auto p-4 sm:p-6 flex flex-col gap-6">
+      <div className="flex items-center gap-3">
+        <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Analytics</h1>
+        <span className="mono text-[11px] px-1.5 py-0.5 rounded-full bg-zinc-200/80 dark:bg-zinc-700/70 text-zinc-600 dark:text-zinc-300 tabular-nums">{live.length} live</span>
+        <div className="flex-1" />
+        <div className="flex items-center gap-1">
+          {[7, 30, 90].map((d) => (
+            <button key={d} onClick={() => setDays(d)}
+              className={'mono text-[11px] px-2 py-1 rounded ' + (days === d
+                ? 'bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-900'
+                : 'text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800')}>{d}d</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Accounts — quota is the real constraint; same glance cards as the main page */}
+      <div>
+        {section('Accounts')}
+        {accounts.length === 0
+          ? <div className={card + ' px-3 py-2.5 text-[12.5px] text-zinc-400'}>No quota reported by this plan.</div>
+          : <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {accounts.filter(([, m]) => m.quota).map(([name, m]) => (
+                <QuotaStrip key={name} quota={m.quota!} governor={m.governor} label={name} stacked />
+              ))}
+            </div>}
+      </div>
+
+      {/* Throughput — honest tok(), today window fixed */}
+      <div>
+        {section('Throughput', <span className="mono text-[10px] text-zinc-400">tokens in+out+cache-write · cache-reads excluded</span>)}
+        <div className="grid grid-cols-3 gap-3 mb-3">
+          {([['Today', 1], ['7 days', 7], ['30 days', 30]] as const).map(([label, d]) => (
+            <div key={label} className={card + ' px-3 py-2.5'}>
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-0.5">{label}</div>
+              <div className="mono text-[19px] text-zinc-900 dark:text-zinc-100 tabular-nums">{fmtTok(sumWin(d))}</div>
+            </div>
+          ))}
+        </div>
+        <div className={card + ' px-3 py-3'}>
+          <div className="flex items-end gap-[2px] h-20">
+            {byDay.map((d) => (
+              <div key={d.date} title={`${d.date}: ${fmtTok(d.v)}`}
+                className="flex-1 min-w-0 bg-violet-500/60 hover:bg-violet-500 rounded-sm transition-colors"
+                style={{ height: `${Math.max(2, (d.v / dayMax) * 100)}%` }} />
+            ))}
+          </div>
+          <div className="flex justify-between mono text-[10px] text-zinc-400 mt-1.5">
+            <span>{byDay[0]?.date.slice(5)}</span><span>peak {fmtTok(dayMax)}/d</span><span>{today.slice(5)}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Breakdowns */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <div>{section('By model', <span className="mono text-[10px] text-zinc-400">{fmtTok(winTotal)} · {days}d</span>)}{barList(byModel, byModel[0]?.[1] ?? 1)}</div>
+        <div>{section('By repo')}{barList(byRepo, byRepo[0]?.[1] ?? 1)}</div>
+      </div>
+
+      {/* Live context window */}
+      <div>
+        {section('Live context window', <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums">{live.length} active</span>)}
+        <div className={card + ' divide-y divide-zinc-100 dark:divide-zinc-800/70'}>
+          {live.length === 0 && <div className="px-3 py-2.5 text-[12.5px] text-zinc-400">No statusline samples yet.</div>}
+          {live.map((j) => {
+            const ctx = j.usage?.context_pct
+            const repo = j.target_repo ? j.target_repo.split('/')[1] : j.target || '—'
+            return (
+              <div key={j.tmux} className="flex items-center gap-3 px-3 py-2">
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13px] text-zinc-900 dark:text-zinc-100 truncate">{j.issue_title || j.tmux}</div>
+                  <div className="mono text-[11px] text-zinc-500 dark:text-zinc-400 truncate">{repo} · {j.tmux}{j.usage?.model ? ' · ' + j.usage.model : ''}</div>
+                </div>
+                {typeof ctx === 'number' && (
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    <div className="relative h-1.5 w-16 rounded-full overflow-hidden bg-zinc-200 dark:bg-zinc-800">
+                      <div className={'absolute inset-y-0 left-0 ' + (ctx > 80 ? 'bg-rose-500/80' : 'bg-violet-500/80')} style={{ width: `${Math.min(100, Math.max(0, ctx))}%` }} />
+                    </div>
+                    <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums w-8 text-right">{Math.round(ctx)}%</span>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// MachinesPage — full-bleed top-level tab (like Sessions/Memory/Analytics). A
+// roster of worker VMs: health, agent, host, and a load bar (running/capacity).
+function MachinesPage({ state }: { state: State }) {
+  const vms = state.vms ?? []
+  // Group the config's VM blocks by physical host — each host runs several
+  // worker "slots" (one block per agent/account). Operators think in machines.
+  const hosts = useMemo(() => {
+    const m = new Map<string, VM[]>()
+    for (const v of vms) (m.get(v.host) ?? m.set(v.host, []).get(v.host)!).push(v)
+    return [...m.entries()]
+      .map(([host, slots]) => ({ host, slots: slots.slice().sort((a, b) => a.name.localeCompare(b.name)) }))
+      .sort((a, b) => {
+        const ao = a.slots.every((v) => v.online === false), bo = b.slots.every((v) => v.online === false)
+        return (ao ? 1 : 0) - (bo ? 1 : 0) || a.host.localeCompare(b.host)
+      })
+  }, [vms])
+  const onlineHosts = hosts.filter((h) => h.slots.some((v) => v.online !== false)).length
+  const used = vms.reduce((a, v) => a + (v.used ?? 0), 0)
+  const cap = vms.reduce((a, v) => a + (v.capacity ?? 0), 0)
+  return (
+    <div className="flex-1 min-w-0 w-full max-w-screen-xl mx-auto p-4 sm:p-6 flex flex-col gap-4">
+      <div className="flex items-center gap-3">
+        <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Machines</h1>
+        <span className="mono text-[11px] px-1.5 py-0.5 rounded-full bg-zinc-200/80 dark:bg-zinc-700/70 text-zinc-600 dark:text-zinc-300 tabular-nums">{onlineHosts}/{hosts.length} online</span>
+        <span className="mono text-[11px] text-zinc-400 tabular-nums">{vms.length} slots · {used}/{cap || '∞'} sessions</span>
+      </div>
+      {hosts.length === 0 ? (
+        <div className="text-sm text-zinc-400">No VMs configured.</div>
+      ) : (
+        <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden bg-white dark:bg-zinc-950">
+          {/* column header (Tailscale-style) */}
+          <div className="hidden sm:flex items-center gap-3 px-3 py-2 bg-zinc-50 dark:bg-zinc-900/60 border-b border-zinc-200 dark:border-zinc-800 text-[10px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+            <span className="flex-1">Machine</span>
+            <span className="w-64 flex-shrink-0">Worker slots</span>
+            <span className="w-40 flex-shrink-0">Load</span>
+          </div>
+          <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+            {hosts.map(({ host, slots }) => {
+              const off = slots.every((v) => v.online === false)
+              const u = slots.reduce((a, v) => a + (v.used ?? 0), 0)
+              const c = slots.reduce((a, v) => a + (v.capacity ?? 0), 0)
+              const load = c ? Math.min(100, (u / c) * 100) : 0
+              const hot = load >= 90
+              const err = slots.map((v) => v.last_err).find(Boolean)
+              return (
+                <div key={host} className="flex items-center gap-3 px-3 py-2.5 hover:bg-zinc-50 dark:hover:bg-zinc-900/40 transition-colors">
+                  {/* Machine: status dot + host + slot names */}
+                  <div className="flex items-center gap-2.5 flex-1 min-w-0">
+                    <span className={'w-2 h-2 rounded-full flex-shrink-0 ' + (off ? 'bg-zinc-400 dark:bg-zinc-600' : 'bg-emerald-500')} title={off ? 'offline' : 'online'} />
+                    <div className="min-w-0">
+                      <div className={'text-[13px] font-medium truncate ' + (off ? 'text-zinc-400 dark:text-zinc-500' : 'text-zinc-900 dark:text-zinc-100')}>
+                        {host}
+                        {off && <span className="mono text-[10px] text-zinc-400 ml-1.5">offline</span>}
+                        {err && <span className="mono text-[10px] text-rose-500 ml-1.5 truncate" title={err}>· {err}</span>}
+                      </div>
+                      <div className="mono text-[11px] text-zinc-500 dark:text-zinc-400 truncate">{slots.map((v) => v.name).join(' · ')}</div>
+                    </div>
+                  </div>
+                  {/* Worker slots: a chip per block (agent ×capacity) */}
+                  <div className="w-64 flex-shrink-0 flex flex-wrap gap-1">
+                    {slots.map((v) => (
+                      <span key={v.name} title={v.name} className="inline-flex items-center gap-1 mono text-[10px] px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300">
+                        <AgentLogo account={v.agent ?? 'claude'} size={11} className="text-zinc-500 dark:text-zinc-400" />
+                        {v.agent ?? 'claude'} ×{v.capacity || '∞'}
+                      </span>
+                    ))}
+                  </div>
+                  {/* Load: aggregate across the host's slots */}
+                  <div className="w-40 flex-shrink-0 flex items-center gap-2">
+                    <div className="relative h-1.5 flex-1 rounded-full overflow-hidden bg-zinc-200 dark:bg-zinc-800">
+                      <div className={'absolute inset-y-0 left-0 ' + (hot ? 'bg-rose-500/80' : 'bg-emerald-500/80')} style={{ width: `${load}%` }} />
+                    </div>
+                    <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums w-12 text-right">{u}/{c || '∞'}</span>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
