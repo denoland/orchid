@@ -128,10 +128,11 @@ type StatusCheck struct {
 }
 
 type PRView struct {
-	State      string                 `json:"state"`
-	HeadRefOid string                 `json:"headRefOid"`
-	Author     struct{ Login string } `json:"author"`
-	Body       string                 `json:"body"`
+	State          string                 `json:"state"`
+	HeadRefOid     string                 `json:"headRefOid"`
+	ReviewDecision string                 `json:"reviewDecision"` // "CHANGES_REQUESTED" | "APPROVED" | "REVIEW_REQUIRED" | ""
+	Author         struct{ Login string } `json:"author"`
+	Body           string                 `json:"body"`
 	Reviews    []struct {
 		ID     string                 `json:"id"`
 		Author struct{ Login string } `json:"author"`
@@ -164,7 +165,7 @@ type PRView struct {
 
 func ghPRView(repo string, n int) (*PRView, error) {
 	v, err := ghJSON[PRView]("pr", "view", fmt.Sprint(n), "--repo", repo,
-		"--json", "state,headRefOid,author,body,reviews,comments,statusCheckRollup,mergeable,commits")
+		"--json", "state,headRefOid,reviewDecision,author,body,reviews,comments,statusCheckRollup,mergeable,commits")
 	if err != nil {
 		return nil, err
 	}
