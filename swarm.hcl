@@ -23,6 +23,15 @@ orchestrator {
     dir           = "memory"
     sync_interval = "5m"
   }
+
+  # Where agent (claude/codex) auth comes from. Pluggable provider:
+  #   "local" (default) — orch holds the creds and writes the auth files onto
+  #     each VM at spawn (no more hand-copying ~/.claude / ~/.codex per box).
+  #   "clawpatrol" — VMs route through a clawpatrol gateway that injects OAuth
+  #     at the wire; creds never touch the worker. (added via a provider plugin)
+  credentials {
+    provider = "local"
+  }
 }
 
 # Each target maps an issue label (in the inbox repo) to a work repo.
@@ -70,6 +79,14 @@ Git remote `origin` is already authenticated via SSH.
 {{issue.body}}
 --- end issue body ---
 
+## Memory — check it FIRST
+
+Past sessions on this repo left notes in your memory (build/test recipes,
+environment quirks, maintainer preferences, dead-ends). Before reading the
+codebase or building, CONSULT YOUR MEMORY — don't re-derive what's already known.
+When you learn something durable and reusable, SAVE it so the next session
+inherits it.
+
 ## Your job
 
 Implement this fully. Read the codebase, understand it deeply, make the change.
@@ -105,11 +122,14 @@ or CI results arrive. Address them, push fixes, stop again.
 The session ends automatically when the PR merges or closes.
 EOT
 
-vm "local" {
+machine "local" {
   host         = "localhost"
-  capacity     = 30
-  session_cmd  = "runuser -u orchid -- env XDG_RUNTIME_DIR=/run/user/1001 GIT_AUTHOR_NAME=divybot GIT_AUTHOR_EMAIL=divybot@users.noreply.github.com GIT_COMMITTER_NAME=divybot GIT_COMMITTER_EMAIL=divybot@users.noreply.github.com claude --dangerously-skip-permissions"
   session_home = "/home/orchid"
+
+  agent "claude" {
+    capacity    = 30
+    session_cmd = "runuser -u orchid -- env XDG_RUNTIME_DIR=/run/user/1001 GIT_AUTHOR_NAME=divybot GIT_AUTHOR_EMAIL=divybot@users.noreply.github.com GIT_COMMITTER_NAME=divybot GIT_COMMITTER_EMAIL=divybot@users.noreply.github.com claude --dangerously-skip-permissions"
+  }
 }
 
 target "deno_core" {

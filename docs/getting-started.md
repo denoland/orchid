@@ -63,6 +63,7 @@ running pane so Claude can address it.
 ## What next
 
 - [Configuration](/docs/configuration) — the `swarm.hcl` reference
-- [Workers](/docs/workers) — scale to multiple VMs
+- [VMs](/docs/vms) — scale to multiple VMs
 - [Targets](/docs/targets) — route different labels to different repos
+- [Memory](/docs/memory) — the shared knowledge base the swarm builds up
 - [Supervision](/docs/supervision) — chat with your orchid from Telegram

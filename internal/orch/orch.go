@@ -24,8 +24,76 @@ type Config struct {
 	Orch                OrchBlock     `hcl:"orchestrator,block" json:"orchestrator"`
 	BootstrapPrompt     string        `hcl:"bootstrap_prompt" json:"bootstrap_prompt"`
 	CronBootstrapPrompt string        `hcl:"cron_bootstrap_prompt,optional" json:"cron_bootstrap_prompt,omitempty"`
-	Targets             []TargetBlock `hcl:"target,block" json:"targets"`
-	VMs                 []VMBlock     `hcl:"vm,block" json:"vms"`
+	Targets             []TargetBlock  `hcl:"target,block" json:"targets"`
+	VMs                 []VMBlock      `hcl:"vm,block" json:"vms"`
+	Machines            []MachineBlock `hcl:"machine,block" json:"machines,omitempty"`
+}
+
+// MachineBlock is a physical host that runs one or more agent "slots". It's
+// sugar over VMBlock: a machine with N `agent` blocks expands (at load, via
+// expandMachines) into N VMBlocks sharing the host/ssh/home, so you define a box
+// once instead of one `vm` block per agent+account. Plain `vm` blocks still work.
+type MachineBlock struct {
+	Name        string         `hcl:",label" json:"name"`
+	Host        string         `hcl:"host" json:"host"`
+	User        string         `hcl:"user,optional" json:"user,omitempty"`
+	Key         string         `hcl:"key,optional" json:"key,omitempty"`
+	SessionHome string         `hcl:"session_home,optional" json:"session_home,omitempty"`
+	WorkdirRoot string         `hcl:"workdir_root,optional" json:"workdir_root,omitempty"`
+	BotLogin    string         `hcl:"bot_login,optional" json:"bot_login,omitempty"`
+	BotEmail    string         `hcl:"bot_email,optional" json:"bot_email,omitempty"`
+	Sccache     bool           `hcl:"sccache,optional" json:"sccache,omitempty"`
+	SccacheDir  string         `hcl:"sccache_dir,optional" json:"sccache_dir,omitempty"`
+	JoinManaged bool           `hcl:"join_managed,optional" json:"join_managed,omitempty"`
+	Agents      []MachineAgent `hcl:"agent,block" json:"agents"`
+}
+
+// MachineAgent is one agent slot on a machine. The label is the agent type
+// (claude|codex); account defaults to the agent (set it to run a second account
+// of the same agent, e.g. codex + codex-mini).
+type MachineAgent struct {
+	Agent      string `hcl:",label" json:"agent"`
+	Name       string `hcl:"name,optional" json:"name,omitempty"` // override expanded VM name (default <machine>-<account>); set it to keep a name stable across a migration
+	Account    string `hcl:"account,optional" json:"account,omitempty"`
+	Capacity   int    `hcl:"capacity,optional" json:"capacity,omitempty"`
+	CodexHome  string `hcl:"codex_home,optional" json:"codex_home,omitempty"`
+	SessionCmd string `hcl:"session_cmd,optional" json:"session_cmd,omitempty"`
+}
+
+// expandMachines desugars `machine` blocks into VMBlocks appended to cfg.VMs.
+// Each agent slot becomes a VM named "<machine>-<account>" (account defaults to
+// the agent type). Idempotent-ish: call once after each config decode.
+func expandMachines(cfg *Config) {
+	for _, m := range cfg.Machines {
+		for _, a := range m.Agents {
+			acct := a.Account
+			if acct == "" {
+				acct = a.Agent
+			}
+			name := a.Name
+			if name == "" {
+				name = m.Name + "-" + acct
+			}
+			cfg.VMs = append(cfg.VMs, VMBlock{
+				Name:        name,
+				Host:        m.Host,
+				User:        m.User,
+				Key:         m.Key,
+				Capacity:    a.Capacity,
+				Sccache:     m.Sccache,
+				SccacheDir:  m.SccacheDir,
+				SessionCmd:  a.SessionCmd,
+				SessionHome: m.SessionHome,
+				WorkdirRoot: m.WorkdirRoot,
+				BotLogin:    m.BotLogin,
+				BotEmail:    m.BotEmail,
+				Agent:       a.Agent,
+				Account:     a.Account,
+				CodexHome:   a.CodexHome,
+				JoinManaged: m.JoinManaged,
+			})
+		}
+	}
 }
 
 type GitHubBlock struct {
@@ -39,22 +107,27 @@ type TargetBlock struct {
 }
 
 type OrchBlock struct {
-	PollInterval  string         `hcl:"poll_interval" json:"poll_interval"`
-	StateDB       string         `hcl:"state_db" json:"state_db"`
-	BranchPrefix  string         `hcl:"branch_prefix" json:"branch_prefix"`
-	WorkdirRoot   string         `hcl:"workdir_root" json:"workdir_root"`
-	HTTPAddr      string         `hcl:"http_addr,optional" json:"http_addr,omitempty"`
-	HTTPSecret    string         `hcl:"http_secret,optional" json:"http_secret,omitempty"`
-	AllowedLogins []string       `hcl:"allowed_logins,optional" json:"allowed_logins,omitempty"`
-	BotLogin      string         `hcl:"bot_login,optional" json:"bot_login,omitempty"`
-	BotEmail      string         `hcl:"bot_email,optional" json:"bot_email,omitempty"`
-	NtfyTopic     string         `hcl:"ntfy_topic,optional" json:"ntfy_topic,omitempty"`
-	BotGithubKey  string         `hcl:"bot_github_key,optional" json:"bot_github_key,omitempty"`
-	Mentions      *MentionsBlock `hcl:"mentions,block" json:"mentions,omitempty"`
-	Capture       *CaptureBlock  `hcl:"capture,block" json:"capture,omitempty"`
-	Throttle      *ThrottleBlock `hcl:"throttle,block" json:"throttle,omitempty"`
-	Memory        *MemoryBlock   `hcl:"memory,block" json:"memory,omitempty"`
+	PollInterval  string            `hcl:"poll_interval" json:"poll_interval"`
+	StateDB       string            `hcl:"state_db" json:"state_db"`
+	BranchPrefix  string            `hcl:"branch_prefix" json:"branch_prefix"`
+	WorkdirRoot   string            `hcl:"workdir_root" json:"workdir_root"`
+	HTTPAddr      string            `hcl:"http_addr,optional" json:"http_addr,omitempty"`
+	HTTPSecret    string            `hcl:"http_secret,optional" json:"http_secret,omitempty"`
+	AllowedLogins []string          `hcl:"allowed_logins,optional" json:"allowed_logins,omitempty"`
+	BotLogin      string            `hcl:"bot_login,optional" json:"bot_login,omitempty"`
+	BotEmail      string            `hcl:"bot_email,optional" json:"bot_email,omitempty"`
+	NtfyTopic     string            `hcl:"ntfy_topic,optional" json:"ntfy_topic,omitempty"`
+	BotGithubKey  string            `hcl:"bot_github_key,optional" json:"bot_github_key,omitempty"`
+	Mentions      *MentionsBlock    `hcl:"mentions,block" json:"mentions,omitempty"`
+	Capture       *CaptureBlock     `hcl:"capture,block" json:"capture,omitempty"`
+	Throttle      *ThrottleBlock    `hcl:"throttle,block" json:"throttle,omitempty"`
+	Memory        *MemoryBlock      `hcl:"memory,block" json:"memory,omitempty"`
+	Credentials   *CredentialsBlock `hcl:"credentials,block" json:"credentials,omitempty"`
 }
+
+// credProvider is the process-wide active credential provider, built in Main.
+// startSession calls it to authenticate each agent on its VM before launch.
+var credProvider CredentialProvider
 
 type CaptureBlock struct {
 	AuthToken     string   `hcl:"auth_token" json:"auth_token"`

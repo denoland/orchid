@@ -7,18 +7,30 @@ Each orchid user has a personal dashboard at
 served by the relay; the data behind it streams over a single
 WebSocket per tab.
 
-## Layout
+## Tabs
 
-- **Canvas** — every active session shows up as a card. Drag to
-  rearrange; cards persist across reloads. The view doubles as a
-  whiteboard: drop notes, ink strokes, link cards, GitHub snippets.
-- **List view** — same data, dense table. Toggle with the icon in
-  the header.
-- **Composer** — file inbox issues without leaving the browser; fans
-  out across multiple targets in one click.
-- **Pane viewer** — click a card to see the live tmux pane. Frames
-  are gzipped and streamed over the same WS; off-screen panes pause
-  automatically to save bandwidth.
+The dashboard is a row of tabs in the header:
+
+- **Sessions** — the live list: one row per session with PR / CI status,
+  repo, agent, and a left-edge accent when a session is blocked on you.
+- **Machines** — worker VMs as a table: health, agent, host, and a load
+  bar (running / capacity). See [VMs](/docs/vms).
+- **Analytics** — per-account quota (5h + weekly burn — the real
+  constraint), token throughput over time, by-model / by-repo splits, and
+  a live context-window readout. Subscriptions aren't billed per token, so
+  there are no dollar figures; throughput counts input + output + cache
+  writes (cache reads excluded).
+- **Memory** — a tree browser over the swarm's shared knowledge base, with
+  search, markdown rendering, and backlinks. See [Memory](/docs/memory).
+- **Integrations** — connect GitHub (one-time device flow) and onboard
+  agent accounts.
+- **Settings** — every `swarm.hcl` field, editable in place.
+
+**Composer** — file inbox issues without leaving the browser; fans out
+across multiple targets in one click.
+
+**Pane viewer** — click a session to see the live tmux pane. Frames are
+gzipped and streamed over the WS; off-screen panes pause to save bandwidth.
 
 ## Card states
 
@@ -35,16 +47,17 @@ WebSocket per tab.
 
 {{mockup:settings}}
 
-The gear icon opens Settings. Highlights:
+The **Settings** tab edits everything in `swarm.hcl`:
 
+- **GitHub / Orchestrator** — inbox repo, poll interval, bot identity,
+  pacing.
 - **Access** — extra GitHub logins allowed to view your dashboard.
   Hot-applies, no restart.
-- **VMs** — worker hosts, capacity, join tokens. See
-  [Workers](/docs/workers).
 - **Targets** — label-to-repo routing. See [Targets](/docs/targets).
+- **VMs** — worker hosts, capacity, join tokens. See [VMs](/docs/vms).
 - **Capture** — the macOS / iOS draft intake token + endpoint URL.
-- **Usage** — daily/weekly/monthly cost charts, per-session and
-  per-repo donuts. Pulls from local Claude statusline JSONL.
+
+Most changes need an `orch restart`; `allowed_logins` hot-applies.
 
 ## Keyboard shortcuts
 
@@ -52,14 +65,12 @@ The gear icon opens Settings. Highlights:
 |-----|--------|
 | `?` | Open shortcut help. |
 | `/` | Focus the Composer. |
-| `s` | Open Settings. |
-| `v` | Toggle canvas / list view. |
 | `Esc` | Close any open modal. |
 
 ## Mobile
 
-The dashboard reflows for phones — header chips replace the side
-nav, cards stack, the canvas falls back to list mode below 640px.
+The dashboard reflows for phones — the tab row stays, the title hides,
+rows and tables stack below 640px.
 
 ## Multi-user
 

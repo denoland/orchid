@@ -79,6 +79,9 @@ vm "fra1" {
 | `bot_email` | derived | Commit email. |
 | `bot_github_key` | inherited | SSH key the bot uses to push. |
 | `bootstrap_prompt` | orch global | Per-VM system prompt override. |
+| `agent` | `claude` | Which CLI runs in the pane: `claude` or `codex`. |
+| `account` | = `agent` | Billing/metering identity this VM paces against. Set it to run two accounts of the same agent (e.g. `codex` and `codex-mini`), each governed independently. |
+| `codex_home` | `~/.codex` | `CODEX_HOME` for this VM — isolates a second codex login's auth + telemetry. |
 
 ## Bootstrap
 

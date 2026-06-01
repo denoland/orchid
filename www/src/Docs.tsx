@@ -28,6 +28,20 @@ const PAGES: Page[] = [
     lede: 'Every field in swarm.hcl, what it does, when to change it.',
   },
   {
+    slug: 'throttling',
+    title: 'Throttling & pacing',
+    file: 'throttling.md',
+    section: 'configure',
+    lede: 'Spend the weekly quota evenly — hard gate, adaptive governor, duty-cycling, priority.',
+  },
+  {
+    slug: 'credentials',
+    title: 'Credentials',
+    file: 'credentials.md',
+    section: 'configure',
+    lede: 'Per-account agent auth via a pluggable provider — no per-VM logins or copying.',
+  },
+  {
     slug: 'targets',
     title: 'Targets',
     file: 'targets.md',
@@ -54,6 +68,13 @@ const PAGES: Page[] = [
     file: 'tailscale.md',
     section: 'configure',
     lede: 'Run orch without public IPs using your own tailnet.',
+  },
+  {
+    slug: 'memory',
+    title: 'Memory',
+    file: 'memory.md',
+    section: 'integrate',
+    lede: 'Shared, git-backed knowledge base the swarm accumulates across sessions.',
   },
   {
     slug: 'capture',

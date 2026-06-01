@@ -62,25 +62,49 @@ target "clawpatrol" {
 Issue in the inbox labeled `clawpatrol` → orch clones `denoland/clawpatrol`,
 Claude opens the PR there. See [Targets](/docs/targets).
 
-## VMs
+## Machines
 
-Each `vm` block declares a host with capacity:
+A `machine` block declares one host and the agent slots that run on it.
+Each nested `agent` block becomes a runnable VM slot (capacity, account,
+auth). Host-level fields (`host`, `user`, `key`, `session_home`,
+`workdir_root`, `join_managed`, `sccache`) are shared by every slot — you
+write them once instead of repeating a `vm` block per agent:
 
 ```hcl
-vm "local" {
-  host         = "localhost"
-  capacity     = 20
-  session_cmd  = "runuser -u orchid -- claude --dangerously-skip-permissions"
-  session_home = "/home/orchid"
-}
+machine "mac-mini" {
+  host         = "0.0.0.0"
+  user         = "divy"
+  key          = "/root/orch/vm-keys/mac-mini"
+  session_home = "~"
+  workdir_root = "/Users/divy/orch-work"
+  join_managed = true
 
-vm "worker-1" {
-  host = "user@worker.example.com"
-  capacity = 10
+  agent "claude" { capacity = 7 }
+  agent "codex"  { capacity = 2 }
+  agent "codex"  {                       # second codex on a different account
+    account    = "codex-mini"
+    capacity   = 1
+    codex_home = "$HOME/.codex-mini"
+  }
 }
 ```
 
-See [Workers](/docs/workers) for adding remote VMs via `orch join vm`.
+Each slot expands to a VM named `<machine>-<account>` (e.g. `mac-mini-claude`,
+`mac-mini-codex`, `mac-mini-codex-mini`). Set `name = "..."` on an `agent`
+block to pin a slot's VM name — useful when migrating an existing `vm`-block
+config so running sessions keep matching their slot.
+
+| Agent field | Meaning |
+|-------------|---------|
+| `account` | Credential account for this slot (default = the agent name). |
+| `capacity` | Max concurrent sessions on this slot. |
+| `codex_home` | `CODEX_HOME` for a codex slot (isolates a second codex account). |
+| `session_cmd` | Override the launch command for this slot. |
+| `name` | Pin the expanded VM name (default `<machine>-<account>`). |
+
+The older `vm "name" { ... }` block (one block per host+agent) is still
+supported and can be mixed with `machine` blocks. See [VMs](/docs/vms) for
+adding remote hosts via `orch join vm`.
 
 ## Bootstrap prompt
 
@@ -96,6 +120,74 @@ The system prompt pasted into each fresh Claude session lives in
 | `{{inbox.repo}}` | The inbox repo (for "Closes #N" references). |
 
 Use it to set tone, scoring rules, or your team's PR style guide.
+
+## Pacing (throttle + governor)
+
+On a metered plan an unthrottled swarm burns the weekly quota in days. The
+`throttle` block (inside `orchestrator`) paces work to land near your limit at
+reset instead of exhausting it early:
+
+```hcl
+orchestrator {
+  # …
+  throttle {
+    enabled           = true
+    governor_enabled  = true   # adaptive concurrency cap from measured burn rate
+    duty_cycle        = true   # pause lowest-priority sessions to shed load
+    max_active        = 20
+    poke_min_interval = "15m"  # debounce review/CI re-pokes (each is a full-context turn)
+  }
+}
+```
+
+The **governor** measures burn against a linear pace target and lowers the
+admission cap when you're ahead of pace; **duty-cycle** pauses (SIGSTOP) the
+lowest-priority running sessions and resumes them when there's headroom.
+Per-issue `priority = N` in an issue's toml frontmatter floats important work to
+the front of the queue. Each account (claude / codex) paces independently — the
+**Analytics** tab shows each account's 5h/weekly burn and projected
+end-of-week.
+
+See [Throttling & pacing](/docs/throttling) for the full mechanism and every knob.
+
+## Memory
+
+A git-backed shared knowledge base the swarm reads and writes across sessions.
+Add a `memory` block inside `orchestrator`:
+
+```hcl
+orchestrator {
+  # …
+  memory {
+    enabled       = true
+    repo          = "denoland/orchid"  # default: github.inbox_repo
+    branch        = "main"
+    dir           = "memory"
+    sync_interval = "5m"
+  }
+}
+```
+
+See [Memory](/docs/memory) for how it works and the Memory dashboard tab.
+
+## Credentials
+
+How agent (claude / codex) auth reaches each worker. A pluggable provider —
+default `local` keeps the creds in orch and writes them onto every VM at spawn,
+so you never log in per-box or copy `auth.json` around.
+
+```hcl
+orchestrator {
+  # …
+  credentials {
+    provider = "local"  # default; or a provider plugin like "clawpatrol"
+  }
+}
+```
+
+Creds are keyed by **account** (a VM's `account` field). Add one with
+`orch creds import <account> --agent <claude|codex> --from <dir>`. See
+[Credentials](/docs/credentials).
 
 ## Capture
 

@@ -670,8 +670,55 @@ func readBotGithubKey(configured string) (priv, pub string) {
 // remaining args. Centralised so adding a new top-level command means
 // adding one entry here — no chained `if os.Args[1] == ...` ladders.
 var subcommands = map[string]func([]string){
-	"join": runJoin,
-	"run":  runRun,
+	"join":  runJoin,
+	"run":   runRun,
+	"creds": runCreds,
+}
+
+// runCreds manages the credential store for the local provider. Creds are keyed
+// by ACCOUNT (a VM's `account` field, default = its `agent`):
+//
+//   orch creds import <account> --agent <claude|codex> --from <dir>
+//
+// --from is the agent's auth base: the home dir for claude (reads
+// .claude/.credentials.json + .claude.json), or the CODEX_HOME dir for codex
+// (reads auth.json + config.toml). The local provider then writes these onto
+// every VM that uses <account>, at spawn.
+func runCreds(args []string) {
+	if len(args) < 1 || args[0] != "import" {
+		fmt.Fprintln(os.Stderr, "usage: orch creds import <account> --agent <claude|codex> --from <dir> [--config PATH]")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("orch creds import", flag.ExitOnError)
+	cfgPath := fs.String("config", "swarm.hcl", "path to HCL config")
+	agent := fs.String("agent", "", "claude | codex (determines the file layout)")
+	from := fs.String("from", "", "auth base: home dir for claude, CODEX_HOME for codex")
+	// account is the first non-flag arg after "import"
+	rest := args[1:]
+	account := ""
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		account, rest = rest[0], rest[1:]
+	}
+	_ = fs.Parse(rest)
+	if account == "" || *agent == "" || *from == "" {
+		fmt.Fprintln(os.Stderr, "usage: orch creds import <account> --agent <claude|codex> --from <dir> [--config PATH]")
+		os.Exit(2)
+	}
+	var cfg Config
+	if err := hclsimple.DecodeFile(*cfgPath, nil, &cfg); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	expandMachines(&cfg)
+	store, err := openStore(cfg.Orch.StateDB)
+	if err != nil {
+		log.Fatalf("open store %s: %v", cfg.Orch.StateDB, err)
+	}
+	defer store.Close()
+	n, err := importCreds(store, account, *agent, *from)
+	if err != nil {
+		log.Fatalf("creds import: %v", err)
+	}
+	fmt.Printf("imported %d file(s) for account %q (%s) from %s → %s\n", n, account, *agent, *from, cfg.Orch.StateDB)
 }
 
 // workerEnvPath is where `orch join vm` saves enough state for later
@@ -786,6 +833,7 @@ func Main() {
 	if err := hclsimple.DecodeFile(*cfgPath, nil, &cfg); err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	expandMachines(&cfg)
 	// loadState opens the sqlite store. This is the only blocking I/O on the
 	// main goroutine BEFORE the HTTP server + tick loop start, so if it hangs
 	// the daemon serves nothing and (pre-this-guard) logged nothing — a silent
@@ -1055,6 +1103,11 @@ func Main() {
 			}
 		}
 	}()
+
+	// Active credential provider (default "local": orch writes agent auth onto
+	// each VM at spawn from its own store; pluggable, e.g. clawpatrol).
+	credProvider = activeCredProvider(&cfg, st.store)
+	log.Printf("credentials: provider=%s", credProvider.Name())
 
 	go runVMHealthLoop(ctx, &cfg, st)
 
