@@ -2412,13 +2412,37 @@ interface ActivityResp {
 function AnalyticsPage({ state }: { state: State }) {
   const [days, setDays] = useState(30)
   const [act, setAct] = useState<ActivityResp | null>(null)
+  const [hist, setHist] = useState<UsageHistoryRow[]>([])
   useEffect(() => {
     let alive = true
-    const load = () => fetch(`/api/activity?days=${days}`, { credentials: 'include', cache: 'no-store' })
-      .then((r) => r.ok ? r.json() : null).then((j) => { if (alive) setAct(j) }).catch(() => { if (alive) setAct(null) })
+    const load = () => {
+      fetch(`/api/activity?days=${days}`, { credentials: 'include', cache: 'no-store' })
+        .then((r) => r.ok ? r.json() : null).then((j) => { if (alive) setAct(j) }).catch(() => { if (alive) setAct(null) })
+      fetch(`/api/usage_history?days=${days}`, { credentials: 'include', cache: 'no-store' })
+        .then((r) => r.ok ? r.json() : null).then((j) => { if (alive) setHist(j?.rows ?? []) }).catch(() => { if (alive) setHist([]) })
+    }
     load(); const id = setInterval(load, 60_000)
     return () => { alive = false; clearInterval(id) }
   }, [days])
+
+  // token throughput (in+out+cache-write; cache_read excluded). Real volume —
+  // idle/throttled days read 0 because tokens are only spent on a turn.
+  const tokToday = new Date().toISOString().slice(0, 10)
+  const tokByDay = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const r of hist) m.set(r.date, (m.get(r.date) ?? 0) + tok(r))
+    const out: { date: string; v: number }[] = []
+    for (let i = days - 1; i >= 0; i--) out.push({ date: new Date(Date.now() - i * 86400_000).toISOString().slice(0, 10), v: 0 })
+    for (const o of out) o.v = m.get(o.date) ?? 0
+    return out
+  }, [hist, days])
+  const tokMax = Math.max(1, ...tokByDay.map((d) => d.v))
+  const byModel = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const r of hist) { const k = (r.model || '—').replace(/^claude-/, '').replace(/-\d{8}$/, ''); m.set(k, (m.get(k) ?? 0) + tok(r)) }
+    return [...m.entries()].sort((a, b) => b[1] - a[1])
+  }, [hist])
+  const modelMax = byModel[0]?.[1] ?? 1
 
   // per-account quota (the real constraint). Fall back to top-level quota as "claude".
   const accounts: [string, AgentMeter][] = state.agents && Object.keys(state.agents).length
@@ -2473,6 +2497,37 @@ function AnalyticsPage({ state }: { state: State }) {
                 <QuotaStrip key={name} quota={m.quota!} governor={m.governor} label={name} stacked />
               ))}
             </div>}
+      </div>
+
+      {/* Tokens — real throughput; cache-reads excluded. Idle/throttled days read 0. */}
+      <div>
+        {section('Tokens', <span className="mono text-[10px] text-zinc-400">in + out + cache-write · cache-reads excluded</span>)}
+        <div className="mb-3"><UsageRollups rows={hist} /></div>
+        <div className={card + ' px-3 py-3 mb-3'}>
+          <div className="flex items-end gap-[2px] h-20">
+            {tokByDay.map((d) => (
+              <div key={d.date} title={`${d.date}: ${fmtTok(d.v)}`}
+                className="flex-1 min-w-0 bg-violet-500/60 hover:bg-violet-500 rounded-sm transition-colors"
+                style={{ height: `${Math.max(2, (d.v / tokMax) * 100)}%` }} />
+            ))}
+          </div>
+          <div className="flex justify-between mono text-[10px] text-zinc-400 mt-1.5">
+            <span>{tokByDay[0]?.date.slice(5)}</span><span>peak {fmtTok(tokMax)}/d</span><span>{tokToday.slice(5)}</span>
+          </div>
+        </div>
+        {byModel.length > 0 && (
+          <div className={card + ' divide-y divide-zinc-100 dark:divide-zinc-800/70'}>
+            {byModel.slice(0, 6).map(([k, v]) => (
+              <div key={k} className="flex items-center gap-3 px-3 py-1.5">
+                <span className="text-[12.5px] text-zinc-700 dark:text-zinc-300 truncate w-40 flex-shrink-0">{k}</span>
+                <div className="relative h-1.5 flex-1 rounded-full overflow-hidden bg-zinc-100 dark:bg-zinc-800">
+                  <div className="absolute inset-y-0 left-0 bg-violet-500/70" style={{ width: `${(v / modelMax) * 100}%` }} />
+                </div>
+                <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums w-12 text-right">{fmtTok(v)}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Activity — sessions started + PRs opened (one row per issue) */}
