@@ -23,15 +23,6 @@ orchestrator {
     dir           = "memory"
     sync_interval = "5m"
   }
-
-  # Where agent (claude/codex) auth comes from. Pluggable provider:
-  #   "local" (default) — orch holds the creds and writes the auth files onto
-  #     each VM at spawn (no more hand-copying ~/.claude / ~/.codex per box).
-  #   "clawpatrol" — VMs route through a clawpatrol gateway that injects OAuth
-  #     at the wire; creds never touch the worker. (added via a provider plugin)
-  credentials {
-    provider = "local"
-  }
 }
 
 # Each target maps an issue label (in the inbox repo) to a work repo.

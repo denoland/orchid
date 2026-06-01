@@ -35,13 +35,6 @@ const PAGES: Page[] = [
     lede: 'Spend the weekly quota evenly — hard gate, adaptive governor, duty-cycling, priority.',
   },
   {
-    slug: 'credentials',
-    title: 'Credentials',
-    file: 'credentials.md',
-    section: 'configure',
-    lede: 'Per-account agent auth via a pluggable provider — no per-VM logins or copying.',
-  },
-  {
     slug: 'targets',
     title: 'Targets',
     file: 'targets.md',

@@ -170,24 +170,14 @@ orchestrator {
 
 See [Memory](/docs/memory) for how it works and the Memory dashboard tab.
 
-## Credentials
+## Agent & GitHub auth
 
-How agent (claude / codex) auth reaches each worker. A pluggable provider —
-default `local` keeps the creds in orch and writes them onto every VM at spawn,
-so you never log in per-box or copy `auth.json` around.
-
-```hcl
-orchestrator {
-  # …
-  credentials {
-    provider = "local"  # default; or a provider plugin like "clawpatrol"
-  }
-}
-```
-
-Creds are keyed by **account** (a VM's `account` field). Add one with
-`orch creds import <account> --agent <claude|codex> --from <dir>`. See
-[Credentials](/docs/credentials).
+Orchid does not broker credentials. Each VM logs into the agent account
+(claude / codex) it should run as — run `claude` / `codex` once on the box, or
+provision its auth files however you provision the rest of the box. GitHub auth
+is the same: give the box a `gh auth login` / token / deploy key so the bot can
+push and open PRs. A VM's `account` field only labels which login a slot uses;
+orchid never reads, stores, or ships those secrets.
 
 ## Capture
 
