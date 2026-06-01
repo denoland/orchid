@@ -105,6 +105,35 @@ function slugFromPath(): string | null {
   return m[1] || null
 }
 
+// Mirrors the dashboard ThemeToggle so /docs honors the same `orchid.theme`
+// and toggles html.dark — docs is a standalone route, nothing else applies it.
+function DocsThemeToggle() {
+  const [dark, setDark] = useState(() => {
+    if (typeof window === 'undefined') return false
+    const saved = localStorage.getItem('orchid.theme')
+    if (saved) return saved === 'dark'
+    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false
+  })
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', dark)
+    localStorage.setItem('orchid.theme', dark ? 'dark' : 'light')
+  }, [dark])
+  return (
+    <button className="docs-icon-btn" onClick={() => setDark((d) => !d)} title={dark ? 'switch to light' : 'switch to dark'}>
+      {dark ? (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+        </svg>
+      ) : (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+        </svg>
+      )}
+    </button>
+  )
+}
+
 export function Docs() {
   const [slug, setSlug] = useState(slugFromPath())
   const [body, setBody] = useState<string>('')
@@ -175,8 +204,16 @@ export function Docs() {
             <line x1="4" y1="17" x2="20" y2="17" />
           </svg>
         </button>
-        <a href="/" className="docs-brand"><em>Orchid</em></a>
-        <a className="docs-signin" href="/login">Sign in</a>
+        <a href="/docs" className="docs-brand" onClick={(e) => go(null, e)}>
+          <img src="/favicon.svg" alt="" />Orchid<span className="docs-crumb">Docs</span>
+        </a>
+        <div className="docs-nav-right">
+          <DocsThemeToggle />
+          <a className="docs-signin" href="/login">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.49c-2.23.48-2.7-.95-2.7-.95-.36-.93-.9-1.18-.9-1.18-.73-.5.06-.49.06-.49.81.06 1.24.83 1.24.83.72 1.24 1.9.88 2.36.67.07-.52.28-.88.5-1.08-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.66 7.66 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.74.54 1.5v2.22c0 .21.15.46.55.38A8 8 0 0 0 8 0z"/></svg>
+            Sign in
+          </a>
+        </div>
       </header>
       <div className="docs-scrim" onClick={() => setNavOpen(false)} />
       <div className="docs-layout">
@@ -211,7 +248,7 @@ export function Docs() {
         <main className="docs-main">
           {!slug && (
             <>
-              <h1 className="docs-hero-title"><em>Docs</em></h1>
+              <h1 className="docs-hero-title">Documentation</h1>
               <p className="docs-hero-lede">Everything orchid knows how to do — written down.</p>
               {SECTIONS.map((s) => {
                 const items = PAGES.filter((p) => p.section === s.id)
