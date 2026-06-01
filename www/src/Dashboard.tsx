@@ -1090,7 +1090,6 @@ function MemoryPage() {
   const [raw, setRaw] = useState('')
   const [loading, setLoading] = useState(true)
   const [q, setQ] = useState('')
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   // cgit-style note view: about (rendered) | log (commits) | blame (per-line).
   const [view, setView] = useState<'about' | 'log' | 'blame'>('about')
   const [blame, setBlame] = useState<BlameLine[] | null>(null)
@@ -1157,45 +1156,6 @@ function MemoryPage() {
       n.name.toLowerCase().includes(needle) ||
       n.summary.toLowerCase().includes(needle))
   }, [notes, q])
-  const tree = useMemo(() => buildMemTree(filtered), [filtered])
-
-  const toggle = (path: string) =>
-    setCollapsed((s) => { const n = new Set(s); n.has(path) ? n.delete(path) : n.add(path); return n })
-
-  // Recursive cgit-style rows. Dirs collapse/expand (force-open while searching);
-  // files select + render. Indent by depth.
-  const renderNode = (node: MemTreeNode, depth: number): React.ReactNode => {
-    const pad = { paddingLeft: depth * 13 + 4 }
-    if (node.note === undefined) {
-      const open = searching || !collapsed.has(node.path)
-      const onDir = !sel && dirSel === node.path
-      return (
-        <div key={node.path || '/'}>
-          {node.name && (
-            <div style={pad}
-              className={'w-full flex items-center gap-1 py-[3px] pr-1 text-[12.5px] rounded ' + (onDir
-                ? 'bg-violet-100 text-violet-800 dark:bg-violet-500/15 dark:text-violet-200'
-                : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900')}>
-              <span onClick={() => toggle(node.path)} className={'text-zinc-400 w-3 inline-block cursor-pointer transition-transform ' + (open ? 'rotate-90' : '')}>›</span>
-              <span onClick={() => { setSel(null); setDirSel(node.path); if (collapsed.has(node.path)) toggle(node.path) }} className="truncate font-medium cursor-pointer flex-1">{node.name}</span>
-            </div>
-          )}
-          {open && node.children.map((c) => renderNode(c, node.name ? depth + 1 : depth))}
-        </div>
-      )
-    }
-    const on = sel?.file === node.note.file
-    return (
-      <button key={node.path} onClick={() => setSel(node.note!)} style={pad}
-        className={'w-full flex items-center gap-1 py-[3px] pr-1 text-left text-[12.5px] rounded ' + (on
-          ? 'bg-violet-100 text-violet-800 dark:bg-violet-500/15 dark:text-violet-200'
-          : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900')}>
-        <span className="w-3 inline-block text-zinc-300 dark:text-zinc-600">·</span>
-        <span className="truncate">{node.name.replace(/\.md$/, '')}</span>
-      </button>
-    )
-  }
-
   const linkChips = (files: string[]) => (
     <div className="flex flex-wrap gap-1.5">
       {files.map((f) => {
@@ -1213,146 +1173,138 @@ function MemoryPage() {
 
   return (
     <div className="flex-1 min-w-0 w-full max-w-screen-xl mx-auto p-4 sm:p-6">
-      <div className="flex items-center gap-3 mb-3">
-        <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Memory</h1>
-        <span className="mono text-[11px] px-1.5 py-0.5 rounded-full bg-zinc-200/80 dark:bg-zinc-700/70 text-zinc-600 dark:text-zinc-300 tabular-nums">{notes.length}</span>
-        {ghTree && <a href={ghTree} target="_blank" rel="noreferrer" className="mono text-[11px] text-zinc-400 hover:text-violet-500 truncate">{gh!.repo}/{gh!.subdir} ↗</a>}
-      </div>
-      {loading ? (
-        <div className="text-sm text-zinc-400">Loading…</div>
-      ) : notes.length === 0 ? (
-        <div className="text-sm text-zinc-400">No memories yet — the store is empty. Notes appear here as sessions learn.</div>
-      ) : (
-        <div className="flex flex-col md:flex-row gap-5 items-start">
-          {/* Left: search + directory tree */}
-          <div className="w-full md:w-72 flex-shrink-0">
-            <input
-              value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…"
-              className="w-full mb-2 rounded-md border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:ring-1 focus:ring-violet-400"
-            />
-            {filtered.length === 0
-              ? <div className="text-[13px] text-zinc-400 px-1">No matches.</div>
-              : <div className="flex flex-col">{tree.children.map((c) => renderNode(c, 0))}</div>}
-          </div>
-
-          {/* Right: rendered note + backlinks/links */}
-          <div className="flex-1 min-w-0 w-full">
-            {sel ? (
-              <div className="flex flex-col gap-4">
-                {/* cgit-style: path · about/log/blame · plain */}
-                <div className="flex items-center gap-3 mono text-[12px] border-b border-zinc-200 dark:border-zinc-800 pb-2">
-                  <span className="font-semibold text-zinc-800 dark:text-zinc-100 truncate">{sel.file}</span>
-                  <div className="flex-1" />
-                  {(['about', 'log', 'blame'] as const).map((v) => (
-                    <button key={v} onClick={() => setView(v)}
-                      className={view === v ? 'text-violet-600 dark:text-violet-400 font-semibold' : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}>{v}</button>
-                  ))}
-                  <a href={ghBlob(sel.file)} target="_blank" rel="noreferrer" className="text-zinc-400 hover:text-violet-500">plain ↗</a>
-                </div>
-
-                {view === 'about' && (
-                  <article className="docs-prose" dangerouslySetInnerHTML={{ __html: html }} />
-                )}
-
-                {view === 'log' && (
-                  <div className="mono text-[12px]">
-                    {log === null && <div className="text-zinc-400 py-3">loading…</div>}
-                    {log && log.length === 0 && <div className="text-zinc-400 py-3">no history.</div>}
-                    {log && log.map((c) => (
-                      <div key={c.commit} className="flex items-baseline gap-3 py-[2px] border-b border-zinc-100 dark:border-zinc-900/80">
-                        <a href={commitURL(c.commit)} target="_blank" rel="noreferrer" className="text-violet-500 hover:underline w-14 flex-shrink-0">{c.short}</a>
-                        <span className="text-zinc-400 tabular-nums w-[78px] flex-shrink-0">{c.date}</span>
-                        <span className="text-zinc-500 dark:text-zinc-400 w-24 flex-shrink-0 truncate">{c.author}</span>
-                        <span className="text-zinc-700 dark:text-zinc-300 truncate flex-1 min-w-0">{c.subject}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {view === 'blame' && (
-                  <div className="mono text-[12px] overflow-x-auto">
-                    {blame === null && <div className="text-zinc-400 py-3">loading…</div>}
-                    {blame && blame.length === 0 && <div className="text-zinc-400 py-3">not committed yet.</div>}
-                    {blame && blame.map((l) => (
-                      <div key={l.n} className="flex items-baseline gap-3 leading-[1.55] hover:bg-zinc-50 dark:hover:bg-zinc-900/40">
-                        <a href={commitURL(l.commit)} target="_blank" rel="noreferrer" title={`${l.summary} — ${l.author} ${l.date}`}
-                          className="text-violet-500 hover:underline w-14 flex-shrink-0">{l.short}</a>
-                        <span className="text-zinc-400 tabular-nums w-[78px] flex-shrink-0">{l.date}</span>
-                        <span className="text-zinc-300 dark:text-zinc-600 tabular-nums w-8 text-right flex-shrink-0 select-none">{l.n}</span>
-                        <span className="text-zinc-700 dark:text-zinc-300 whitespace-pre flex-1 min-w-0">{l.text || ' '}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {(sel.backlinks?.length > 0 || sel.links?.length > 0) && (
-                  <div className="flex flex-col gap-3 rounded-lg border border-zinc-200 dark:border-zinc-800 p-4">
-                    {sel.backlinks?.length > 0 && (
-                      <div>
-                        <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1.5">← Backlinks ({sel.backlinks.length})</div>
-                        {linkChips(sel.backlinks)}
-                      </div>
-                    )}
-                    {sel.links?.length > 0 && (
-                      <div>
-                        <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1.5">→ Links ({sel.links.length})</div>
-                        {linkChips(sel.links)}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            ) : (() => {
-              // Folder view: breadcrumb + README (the dir's MEMORY.md, if any) +
-              // an auto-generated table of contents of its direct children.
-              const prefix = dirSel ? dirSel + '/' : ''
-              const childDirs = new Set<string>()
-              const childFiles: MemNote[] = []
-              for (const n of notes) {
-                if (!n.file.startsWith(prefix)) continue
-                const rest = n.file.slice(prefix.length)
-                const slash = rest.indexOf('/')
-                if (slash >= 0) childDirs.add(rest.slice(0, slash))
-                else childFiles.push(n)
-              }
-              const segs = dirSel ? dirSel.split('/') : []
+      {/* top: breadcrumb · count · search · repo (cgit nav, no sidebar) */}
+      <div className="flex items-center gap-2 mb-4 flex-wrap">
+        <div className="flex items-center gap-1.5 mono text-[13px] flex-1 min-w-0">
+          <button onClick={() => { setSel(null); setDirSel('') }} className="font-semibold text-zinc-800 dark:text-zinc-100 hover:text-violet-500">memory</button>
+          {(() => {
+            const loc = sel ? sel.file : dirSel
+            const segs = loc ? loc.split('/') : []
+            return segs.map((s, i) => {
+              const last = i === segs.length - 1
+              const isFile = !!sel && last
+              const dirPath = segs.slice(0, i + 1).join('/')
               return (
-                <div className="flex flex-col gap-4">
-                  <div className="flex items-center gap-1.5 text-[13px] flex-wrap">
-                    <button onClick={() => setDirSel('')} className={!dirSel ? 'font-semibold text-zinc-800 dark:text-zinc-100' : 'text-zinc-500 hover:text-violet-500'}>{gh?.subdir || 'memory'}</button>
-                    {segs.map((s, i) => (
-                      <span key={i} className="flex items-center gap-1.5">
-                        <span className="text-zinc-300 dark:text-zinc-600">/</span>
-                        <button onClick={() => setDirSel(segs.slice(0, i + 1).join('/'))} className={i === segs.length - 1 ? 'font-semibold text-zinc-800 dark:text-zinc-100' : 'text-zinc-500 hover:text-violet-500'}>{s}</button>
-                      </span>
-                    ))}
-                    {gh && <a href={ghTree + (dirSel ? '/' + dirSel : '')} target="_blank" rel="noreferrer" className="mono text-[11px] text-zinc-400 hover:text-violet-500 ml-1">↗</a>}
-                  </div>
-                  {html && <article className="docs-prose rounded-lg border border-zinc-200 dark:border-zinc-800 p-4 sm:p-6 bg-white dark:bg-zinc-950" dangerouslySetInnerHTML={{ __html: html }} />}
-                  {(childDirs.size > 0 || childFiles.length > 0) && (
-                    <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800/60">
-                      {[...childDirs].sort().map((d) => (
-                        <button key={d} onClick={() => setDirSel(prefix + d)} className="w-full flex items-center gap-2 px-4 py-2 text-left text-[13px] hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
-                          <span className="text-zinc-400">▸</span><span className="font-medium text-zinc-700 dark:text-zinc-200">{d}/</span>
-                        </button>
-                      ))}
-                      {childFiles.sort((a, b) => a.name.localeCompare(b.name)).map((n) => (
-                        <button key={n.file} onClick={() => setSel(n)} className="w-full flex flex-col items-start px-4 py-2 text-left hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
-                          <span className="text-[13px] font-medium text-zinc-800 dark:text-zinc-100">{n.name}</span>
-                          {n.summary && <span className="text-[12px] text-zinc-500 dark:text-zinc-400 line-clamp-1">{n.summary}</span>}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  {!html && childDirs.size === 0 && childFiles.length === 0 && (
-                    <div className="text-sm text-zinc-400 px-1 pt-2">Empty.</div>
-                  )}
-                </div>
+                <span key={i} className="flex items-center gap-1.5 min-w-0">
+                  <span className="text-zinc-300 dark:text-zinc-600">/</span>
+                  <button onClick={() => { if (isFile) return; setSel(null); setDirSel(dirPath) }}
+                    className={'truncate ' + (last ? 'font-semibold text-zinc-800 dark:text-zinc-100' : 'text-zinc-500 hover:text-violet-500')}>{s}</button>
+                </span>
               )
-            })()}
-          </div>
+            })
+          })()}
         </div>
-      )}
+        <span className="mono text-[11px] px-1.5 py-0.5 rounded-full bg-zinc-200/80 dark:bg-zinc-700/70 text-zinc-600 dark:text-zinc-300 tabular-nums">{notes.length}</span>
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search…"
+          className="mono text-[12px] rounded border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-2 py-1 w-36 focus:w-56 transition-all text-zinc-800 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:ring-1 focus:ring-violet-400" />
+        {ghTree && <a href={ghTree + (dirSel ? '/' + dirSel : '')} target="_blank" rel="noreferrer" className="mono text-[11px] text-zinc-400 hover:text-violet-500">↗</a>}
+      </div>
+
+      {loading ? (
+        <div className="text-sm text-zinc-400">loading…</div>
+      ) : notes.length === 0 ? (
+        <div className="text-sm text-zinc-400">No memories yet — the store is empty. Notes appear as sessions learn.</div>
+      ) : searching ? (
+        // flat search results
+        <div className="mono text-[12.5px] border-t border-zinc-100 dark:border-zinc-900/60">
+          {filtered.length === 0 ? <div className="text-zinc-400 py-3">no matches.</div> : filtered.map((n) => (
+            <button key={n.file} onClick={() => { setSel(n); setQ('') }}
+              className="w-full flex flex-col items-start px-2 py-1.5 text-left hover:bg-zinc-50 dark:hover:bg-zinc-900/60 border-b border-zinc-100 dark:border-zinc-900/60">
+              <span className="text-zinc-800 dark:text-zinc-100">{n.file}</span>
+              {n.summary && <span className="text-[12px] text-zinc-500 dark:text-zinc-400 line-clamp-1">{n.summary}</span>}
+            </button>
+          ))}
+        </div>
+      ) : sel ? (
+        // file view: about/log/blame
+        <div className="flex flex-col gap-4">
+          <div className="flex items-center gap-3 mono text-[12px] border-b border-zinc-200 dark:border-zinc-800 pb-2">
+            {(['about', 'log', 'blame'] as const).map((v) => (
+              <button key={v} onClick={() => setView(v)}
+                className={view === v ? 'text-violet-600 dark:text-violet-400 font-semibold' : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}>{v}</button>
+            ))}
+            <div className="flex-1" />
+            <a href={ghBlob(sel.file)} target="_blank" rel="noreferrer" className="text-zinc-400 hover:text-violet-500">plain ↗</a>
+          </div>
+
+          {view === 'about' && <article className="docs-prose" dangerouslySetInnerHTML={{ __html: html }} />}
+
+          {view === 'log' && (
+            <div className="mono text-[12px]">
+              {log === null && <div className="text-zinc-400 py-3">loading…</div>}
+              {log && log.length === 0 && <div className="text-zinc-400 py-3">no history.</div>}
+              {log && log.map((c) => (
+                <div key={c.commit} className="flex items-baseline gap-3 py-[2px] border-b border-zinc-100 dark:border-zinc-900/80">
+                  <a href={commitURL(c.commit)} target="_blank" rel="noreferrer" className="text-violet-500 hover:underline w-14 flex-shrink-0">{c.short}</a>
+                  <span className="text-zinc-400 tabular-nums w-[78px] flex-shrink-0">{c.date}</span>
+                  <span className="text-zinc-500 dark:text-zinc-400 w-24 flex-shrink-0 truncate">{c.author}</span>
+                  <span className="text-zinc-700 dark:text-zinc-300 truncate flex-1 min-w-0">{c.subject}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {view === 'blame' && (
+            <div className="mono text-[12px] overflow-x-auto">
+              {blame === null && <div className="text-zinc-400 py-3">loading…</div>}
+              {blame && blame.length === 0 && <div className="text-zinc-400 py-3">not committed yet.</div>}
+              {blame && blame.map((l) => (
+                <div key={l.n} className="flex items-baseline gap-3 leading-[1.55] hover:bg-zinc-50 dark:hover:bg-zinc-900/40">
+                  <a href={commitURL(l.commit)} target="_blank" rel="noreferrer" title={`${l.summary} — ${l.author} ${l.date}`}
+                    className="text-violet-500 hover:underline w-14 flex-shrink-0">{l.short}</a>
+                  <span className="text-zinc-400 tabular-nums w-[78px] flex-shrink-0">{l.date}</span>
+                  <span className="text-zinc-300 dark:text-zinc-600 tabular-nums w-8 text-right flex-shrink-0 select-none">{l.n}</span>
+                  <span className="text-zinc-700 dark:text-zinc-300 whitespace-pre flex-1 min-w-0">{l.text || ' '}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {(sel.backlinks?.length > 0 || sel.links?.length > 0) && (
+            <div className="flex flex-col gap-2 mono text-[12px] border-t border-zinc-100 dark:border-zinc-900/60 pt-3">
+              {sel.backlinks?.length > 0 && <div className="flex items-baseline gap-2"><span className="text-zinc-400 w-20 flex-shrink-0">backlinks</span>{linkChips(sel.backlinks)}</div>}
+              {sel.links?.length > 0 && <div className="flex items-baseline gap-2"><span className="text-zinc-400 w-20 flex-shrink-0">links</span>{linkChips(sel.links)}</div>}
+            </div>
+          )}
+        </div>
+      ) : (() => {
+        // tree view: the dir's README (if any) + a table of its children
+        const prefix = dirSel ? dirSel + '/' : ''
+        const childDirs = new Set<string>()
+        const childFiles: MemNote[] = []
+        for (const n of notes) {
+          if (!n.file.startsWith(prefix)) continue
+          const rest = n.file.slice(prefix.length)
+          const slash = rest.indexOf('/')
+          if (slash >= 0) childDirs.add(rest.slice(0, slash))
+          else childFiles.push(n)
+        }
+        return (
+          <div className="flex flex-col gap-4">
+            <div className="mono text-[12.5px] border-y border-zinc-100 dark:border-zinc-900/60 divide-y divide-zinc-100 dark:divide-zinc-900/60">
+              {dirSel && (
+                <button onClick={() => setDirSel(dirSel.split('/').slice(0, -1).join('/'))} className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-zinc-50 dark:hover:bg-zinc-900/60 text-zinc-500">
+                  <span className="w-4 text-center">..</span><span>/</span>
+                </button>
+              )}
+              {[...childDirs].sort().map((d) => (
+                <button key={d} onClick={() => setDirSel(prefix + d)} className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
+                  <span className="w-4 text-center text-zinc-400">▸</span><span className="font-medium text-zinc-700 dark:text-zinc-200">{d}/</span>
+                </button>
+              ))}
+              {childFiles.sort((a, b) => a.name.localeCompare(b.name)).map((n) => (
+                <button key={n.file} onClick={() => setSel(n)} className="w-full flex items-baseline gap-3 px-2 py-1.5 text-left hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
+                  <span className="w-4 text-center text-zinc-300 dark:text-zinc-600">·</span>
+                  <span className="text-zinc-800 dark:text-zinc-100 flex-shrink-0">{n.name}</span>
+                  {n.summary && <span className="text-zinc-400 dark:text-zinc-500 truncate flex-1 min-w-0">{n.summary}</span>}
+                </button>
+              ))}
+              {childDirs.size === 0 && childFiles.length === 0 && <div className="text-zinc-400 px-2 py-3">empty.</div>}
+            </div>
+            {html && <article className="docs-prose" dangerouslySetInnerHTML={{ __html: html }} />}
+          </div>
+        )
+      })()}
     </div>
   )
 }
