@@ -100,6 +100,33 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 
 // spawnResume restarts a dead session that had an open PR, using --resume so
 // claude recovers its conversation context, then pastes a short situation report.
+// dismissResumePrompt answers claude's interactive `--resume` choice dialog
+// ("Resume from summary / full / don't ask me again") by sending Enter, which
+// picks the preselected option 1 (resume from summary). Polls the pane up to
+// ~25s for the prompt to appear; returns early once it's answered or the live
+// prompt is already up (no dialog). Claude-only — codex has no such prompt.
+func dismissResumePrompt(vm VMBlock, session string) {
+	if vmAgent(vm).name != "claude" {
+		return
+	}
+	deadline := time.Now().Add(25 * time.Second)
+	for time.Now().Before(deadline) {
+		out, _, err := sshExec(vm, fmt.Sprintf("tmux capture-pane -t %s -p 2>/dev/null", session))
+		if err == nil {
+			if strings.Contains(out, "Resume from summary") || strings.Contains(out, "Resume full session") {
+				_, _, _ = sshExec(vm, fmt.Sprintf("tmux send-keys -t %s Enter", session))
+				time.Sleep(time.Second)
+				return
+			}
+			// Already at the live prompt — no resume dialog to dismiss.
+			if strings.Contains(out, "bypass permissions") {
+				return
+			}
+		}
+		time.Sleep(1500 * time.Millisecond)
+	}
+}
+
 func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 	session := sessionName(n, vmAgent(*vm).name)
 	if j.Tmux != session {
@@ -120,7 +147,13 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 	if err := tmuxStart(*vm, session, workdir, sharedDir, j.TargetRepo, j.Branch, resumeCmd, botLogin, botEmail, memoryStoreArg(cfg, vm)); err != nil {
 		return err
 	}
-	time.Sleep(3 * time.Second)
+	// claude's `--resume` opens an interactive "Resume from summary / full /
+	// don't ask" dialog (option 1 preselected). It renders during startup, so a
+	// single fixed-delay wake-keystroke misses it and the session hangs on the
+	// dialog forever. Poll for it and answer with Enter (picks the default
+	// summary) before the normal wake + idle wait.
+	dismissResumePrompt(*vm, session)
+	time.Sleep(2 * time.Second)
 	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s C-m", session))
 	deadline := time.Now().Add(3 * time.Minute)
 	resumeIdle := false
