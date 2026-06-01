@@ -2607,8 +2607,8 @@ function MachinesPage({ state }: { state: State }) {
               return (
                 <div key={host} className="flex flex-col md:flex-row md:items-center gap-3 md:gap-4 px-4 sm:px-5 py-4 hover:bg-zinc-50 dark:hover:bg-zinc-900/40 transition-colors">
                   {/* Machine: OS icon + name + owner + status pill */}
-                  <div className="flex items-start gap-3 flex-1 min-w-0">
-                    <OSIcon os={os} size={20} className={'mt-0.5 flex-shrink-0 ' + (off ? 'text-zinc-300 dark:text-zinc-600' : 'text-zinc-700 dark:text-zinc-200')} />
+                  <div className="flex items-center gap-3 flex-1 min-w-0">
+                    <OSIcon os={os} size={20} className={'flex-shrink-0 ' + (off ? 'text-zinc-300 dark:text-zinc-600' : 'text-zinc-700 dark:text-zinc-200')} />
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className={'text-[14px] font-semibold truncate ' + (off ? 'text-zinc-400 dark:text-zinc-500' : 'text-zinc-900 dark:text-zinc-100')}>{name}</span>
