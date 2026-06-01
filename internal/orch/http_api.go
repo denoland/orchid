@@ -95,6 +95,7 @@ type apiVMEntry struct {
 	Agent    string `json:"agent"`
 	Online   bool   `json:"online"`
 	LastErr  string `json:"last_err,omitempty"`
+	OS       string `json:"os,omitempty"` // "Darwin" / "Linux" — dashboard machine icon
 }
 
 type apiStateResp struct {
@@ -265,6 +266,7 @@ func buildAPIStateJSON(cfg *Config, st *State) []byte {
 			Agent:    vmAgent(vm).name,
 			Online:   vmOnline[vm.Name],
 			LastErr:  h.LastErr,
+			OS:       h.OS,
 		})
 	}
 	resp := apiStateResp{

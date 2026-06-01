@@ -8,6 +8,7 @@ import { Composer } from './Composer'
 import { mockJobs, mockVMs } from './mock'
 import { OrchidArt } from './OrchidArt'
 import { AgentLogo } from './AgentLogo'
+import { OSIcon } from './OSIcon'
 
 import type { RelayInfo } from './App'
 import { WSBusContext } from './App'
@@ -2602,11 +2603,12 @@ function MachinesPage({ state }: { state: State }) {
               const err = slots.map((v) => v.last_err).find(Boolean)
               const owner = slots.map((v) => v.bot).find(Boolean)
               const name = machineName(slots)
+              const os = slots.map((v) => v.os).find(Boolean) ?? (/mac|darwin|mini|book/i.test(name) ? 'Darwin' : 'Linux')
               return (
                 <div key={host} className="flex flex-col md:flex-row md:items-center gap-3 md:gap-4 px-4 sm:px-5 py-4 hover:bg-zinc-50 dark:hover:bg-zinc-900/40 transition-colors">
-                  {/* Machine: status dot + name + owner + status pill */}
+                  {/* Machine: OS icon + name + owner + status pill */}
                   <div className="flex items-start gap-3 flex-1 min-w-0">
-                    <span className={'mt-1.5 w-2.5 h-2.5 rounded-full flex-shrink-0 ' + (off ? 'bg-zinc-300 dark:bg-zinc-600' : 'bg-emerald-500')} title={off ? 'offline' : 'online'} />
+                    <OSIcon os={os} size={20} className={'mt-0.5 flex-shrink-0 ' + (off ? 'text-zinc-300 dark:text-zinc-600' : 'text-zinc-700 dark:text-zinc-200')} />
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className={'text-[14px] font-semibold truncate ' + (off ? 'text-zinc-400 dark:text-zinc-500' : 'text-zinc-900 dark:text-zinc-100')}>{name}</span>
@@ -2624,12 +2626,13 @@ function MachinesPage({ state }: { state: State }) {
                   </div>
                   {/* Address */}
                   <div className="w-40 flex-shrink-0 mono text-[12px] text-zinc-600 dark:text-zinc-300 truncate pl-5 md:pl-0" title={host}>{host}</div>
-                  {/* Agents: a chip per slot (agent ×capacity) */}
-                  <div className="w-60 flex-shrink-0 flex flex-wrap gap-1.5 pl-5 md:pl-0">
+                  {/* Agents: one clean chip per slot — provider mark · name · count */}
+                  <div className="w-60 flex-shrink-0 flex flex-wrap items-center gap-1.5 pl-5 md:pl-0">
                     {slots.map((v) => (
-                      <span key={v.name} title={v.name} className="inline-flex items-center gap-1 mono text-[10.5px] px-1.5 py-0.5 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300">
-                        <AgentLogo account={v.agent ?? 'claude'} size={11} className="text-zinc-500 dark:text-zinc-400" />
-                        {v.agent ?? 'claude'} ×{v.capacity || '∞'}
+                      <span key={v.name} title={`${v.name} · capacity ${v.capacity || '∞'}`} className="inline-flex items-center gap-1.5 text-[11.5px] pl-1.5 pr-1 py-0.5 rounded-full border border-zinc-200 dark:border-zinc-700/80 bg-white dark:bg-zinc-900">
+                        <AgentLogo account={v.agent ?? 'claude'} size={12} className="text-zinc-700 dark:text-zinc-200" />
+                        <span className="text-zinc-700 dark:text-zinc-200">{v.agent ?? 'claude'}</span>
+                        <span className="mono text-[10px] tabular-nums text-zinc-500 dark:text-zinc-400 bg-zinc-100 dark:bg-zinc-800 rounded-full px-1.5 min-w-[18px] text-center">{v.capacity || '∞'}</span>
                       </span>
                     ))}
                   </div>
