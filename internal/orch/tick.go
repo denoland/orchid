@@ -83,9 +83,9 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 		VM: vm.Name, Tmux: sessionName(is.Number, vmAgent(*vm).name),
 		Target: target.Name, TargetRepo: target.Repo,
 		Branch: branch, Lifecycle: "oneshot",
-		IssueTitle:           is.Title,
-		LastCheckConclusions: map[string]string{},
-		SpawnedAt:            time.Now(),
+		IssueTitle: is.Title,
+		prTracker:  prTracker{LastCheckConclusions: map[string]string{}},
+		SpawnedAt:  time.Now(),
 	}
 	log.Printf("issue #%d: spawned on %s/%s, target=%s (%s), branch=%s",
 		is.Number, vm.Name, sessionName(is.Number, vmAgent(*vm).name), target.Name, target.Repo, branch)
@@ -725,9 +725,61 @@ func tick(cfg *Config, st *State) {
 			continue
 		}
 		botLogin, _ := vmBotIdentity(cfg.Orch, *vm)
-		vr, vt, vi, sr, st_, si, pushed, checks, mergeable := diffPR(j, v, botLogin)
+		vr, vt, vi, sr, st_, si, pushed, checks, mergeable := diffPR(&j.prTracker, v, botLogin)
 		hasSilent := len(sr) > 0 || len(st_) > 0 || len(si) > 0
-		if len(vr) == 0 && len(vt) == 0 && len(vi) == 0 && !pushed && len(checks) == 0 && mergeable == "" {
+		primaryVisible := len(vr) > 0 || len(vt) > 0 || len(vi) > 0 || pushed || len(checks) > 0 || mergeable != ""
+
+		// Upstream/dependency PRs this session opened (issue #1): discover new
+		// ones from the primary PR body, then diff each tracked one. We rebuild
+		// j.ExtraPRs as keepExtra so unauthored / merged / closed ones drop out.
+		discoverExtraPRs(j, v, cfg)
+		type extResult struct {
+			idx                     int
+			v                       *PRView
+			msg                     string
+			vr, sr, vt, st_, vi, si []string
+		}
+		var extResults []extResult
+		var keepExtra []ExtraPR
+		for i := range j.ExtraPRs {
+			ep := j.ExtraPRs[i] // value copy; appended to keepExtra unless dropped
+			ev, eerr := ghPRView(ep.Repo, ep.Number)
+			if eerr != nil {
+				keepExtra = append(keepExtra, ep) // transient (or not-a-PR) — keep, retry later
+				continue
+			}
+			key := fmt.Sprintf("%s#%d", ep.Repo, ep.Number)
+			if !ep.Validated {
+				if botLogin != "" && ev.Author.Login != "" && ev.Author.Login != botLogin {
+					log.Printf("issue #%d: upstream %s not authored by %s — not tracking", n, key, botLogin)
+					j.IgnoredPRs = append(j.IgnoredPRs, key)
+					continue // drop: not our PR
+				}
+				ep.Validated = true
+			}
+			if ev.State == "MERGED" || ev.State == "CLOSED" {
+				log.Printf("issue #%d: upstream %s %s — stop tracking", n, key, strings.ToLower(ev.State))
+				j.IgnoredPRs = append(j.IgnoredPRs, key)
+				continue // drop: resolved
+			}
+			evr, evt, evi, esr, est, esi, epushed, echecks, emerge := diffPR(&ep.prTracker, ev, botLogin)
+			if len(evr) == 0 && len(evt) == 0 && len(evi) == 0 && !epushed && len(echecks) == 0 && emerge == "" {
+				if len(esr) > 0 || len(est) > 0 || len(esi) > 0 {
+					markPRSeen(&ep.prTracker, ev, nil, esr, nil, est, nil, esi)
+				}
+				keepExtra = append(keepExtra, ep)
+				continue
+			}
+			keepExtra = append(keepExtra, ep)
+			extResults = append(extResults, extResult{
+				idx: len(keepExtra) - 1, v: ev,
+				msg: summarizeExternal(ep.Repo, ep.Number, ev, evr, evt, evi, epushed, echecks, emerge),
+				vr:  evr, sr: esr, vt: evt, st_: est, vi: evi, si: esi,
+			})
+		}
+		j.ExtraPRs = keepExtra
+
+		if !primaryVisible && len(extResults) == 0 {
 			j.LastHeadOID = v.HeadRefOid
 			if v.Mergeable != "" && v.Mergeable != "UNKNOWN" {
 				j.LastMergeable = v.Mergeable
@@ -736,8 +788,8 @@ func tick(cfg *Config, st *State) {
 				j.SeenReviewIDs = append(j.SeenReviewIDs, sr...)
 				j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, st_...)
 				j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, si...)
-				saveStateLogged(st)
 			}
+			saveStateLogged(st) // persist discovery / validation / dropped-extra changes
 			continue
 		}
 		idle, detected, err := tmuxIdle(*vm, j.Tmux)
@@ -798,34 +850,29 @@ func tick(cfg *Config, st *State) {
 			log.Printf("issue #%d: poke debounced (last %s ago < %s)", n, time.Since(j.LastPokeAt).Round(time.Second), pokeMin)
 			continue
 		}
-		msg := summarize(v, vr, vt, vi, pushed, checks, mergeable)
+		parts := make([]string, 0, 1+len(extResults))
+		if primaryVisible {
+			parts = append(parts, summarize(v, vr, vt, vi, pushed, checks, mergeable))
+		}
+		for _, r := range extResults {
+			parts = append(parts, r.msg)
+		}
+		msg := strings.Join(parts, "\n\n")
 		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
 			log.Printf("issue #%d: poke failed: %v", n, err)
 			continue
 		}
-		j.SeenReviewIDs = append(j.SeenReviewIDs, vr...)
-		j.SeenReviewIDs = append(j.SeenReviewIDs, sr...)
-		j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, vt...)
-		j.SeenThreadCommentIDs = append(j.SeenThreadCommentIDs, st_...)
-		j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, vi...)
-		j.SeenIssueCommentIDs = append(j.SeenIssueCommentIDs, si...)
+		markPRSeen(&j.prTracker, v, vr, sr, vt, st_, vi, si)
+		for _, r := range extResults {
+			markPRSeen(&j.ExtraPRs[r.idx].prTracker, r.v, r.vr, r.sr, r.vt, r.st_, r.vi, r.si)
+		}
 		j.LastPokeAt = time.Now()
-		j.LastHeadOID = v.HeadRefOid
-		if v.Mergeable != "" && v.Mergeable != "UNKNOWN" {
-			j.LastMergeable = v.Mergeable
-		}
-		if j.LastCheckConclusions == nil {
-			j.LastCheckConclusions = map[string]string{}
-		}
-		latestAt := map[string]string{}
-		for _, c := range v.StatusCheckRollup {
-			if c.Status == "COMPLETED" && c.CompletedAt > latestAt[c.Name] {
-				latestAt[c.Name] = c.CompletedAt
-				j.LastCheckConclusions[c.Name] = c.Conclusion
-			}
-		}
 		saveStateLogged(st)
-		log.Printf("issue #%d: poked PR #%d", n, j.PR)
+		if len(extResults) > 0 {
+			log.Printf("issue #%d: poked PR #%d (+%d upstream)", n, j.PR, len(extResults))
+		} else {
+			log.Printf("issue #%d: poked PR #%d", n, j.PR)
+		}
 	}
 
 	// Duty-cycle pass, per agent: when an agent's governor is enabled with

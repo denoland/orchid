@@ -11,9 +11,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,10 +21,10 @@ import (
 )
 
 type Config struct {
-	GitHub              GitHubBlock   `hcl:"github,block" json:"github"`
-	Orch                OrchBlock     `hcl:"orchestrator,block" json:"orchestrator"`
-	BootstrapPrompt     string        `hcl:"bootstrap_prompt" json:"bootstrap_prompt"`
-	CronBootstrapPrompt string        `hcl:"cron_bootstrap_prompt,optional" json:"cron_bootstrap_prompt,omitempty"`
+	GitHub              GitHubBlock    `hcl:"github,block" json:"github"`
+	Orch                OrchBlock      `hcl:"orchestrator,block" json:"orchestrator"`
+	BootstrapPrompt     string         `hcl:"bootstrap_prompt" json:"bootstrap_prompt"`
+	CronBootstrapPrompt string         `hcl:"cron_bootstrap_prompt,optional" json:"cron_bootstrap_prompt,omitempty"`
 	Targets             []TargetBlock  `hcl:"target,block" json:"targets"`
 	VMs                 []VMBlock      `hcl:"vm,block" json:"vms"`
 	Machines            []MachineBlock `hcl:"machine,block" json:"machines,omitempty"`
@@ -108,21 +108,21 @@ type TargetBlock struct {
 }
 
 type OrchBlock struct {
-	PollInterval  string            `hcl:"poll_interval" json:"poll_interval"`
-	StateDB       string            `hcl:"state_db" json:"state_db"`
-	BranchPrefix  string            `hcl:"branch_prefix" json:"branch_prefix"`
-	WorkdirRoot   string            `hcl:"workdir_root" json:"workdir_root"`
-	HTTPAddr      string            `hcl:"http_addr,optional" json:"http_addr,omitempty"`
-	HTTPSecret    string            `hcl:"http_secret,optional" json:"http_secret,omitempty"`
-	AllowedLogins []string          `hcl:"allowed_logins,optional" json:"allowed_logins,omitempty"`
-	BotLogin      string            `hcl:"bot_login,optional" json:"bot_login,omitempty"`
-	BotEmail      string            `hcl:"bot_email,optional" json:"bot_email,omitempty"`
-	NtfyTopic     string            `hcl:"ntfy_topic,optional" json:"ntfy_topic,omitempty"`
-	BotGithubKey  string            `hcl:"bot_github_key,optional" json:"bot_github_key,omitempty"`
-	Mentions      *MentionsBlock    `hcl:"mentions,block" json:"mentions,omitempty"`
-	Capture       *CaptureBlock     `hcl:"capture,block" json:"capture,omitempty"`
-	Throttle      *ThrottleBlock    `hcl:"throttle,block" json:"throttle,omitempty"`
-	Memory        *MemoryBlock      `hcl:"memory,block" json:"memory,omitempty"`
+	PollInterval  string         `hcl:"poll_interval" json:"poll_interval"`
+	StateDB       string         `hcl:"state_db" json:"state_db"`
+	BranchPrefix  string         `hcl:"branch_prefix" json:"branch_prefix"`
+	WorkdirRoot   string         `hcl:"workdir_root" json:"workdir_root"`
+	HTTPAddr      string         `hcl:"http_addr,optional" json:"http_addr,omitempty"`
+	HTTPSecret    string         `hcl:"http_secret,optional" json:"http_secret,omitempty"`
+	AllowedLogins []string       `hcl:"allowed_logins,optional" json:"allowed_logins,omitempty"`
+	BotLogin      string         `hcl:"bot_login,optional" json:"bot_login,omitempty"`
+	BotEmail      string         `hcl:"bot_email,optional" json:"bot_email,omitempty"`
+	NtfyTopic     string         `hcl:"ntfy_topic,optional" json:"ntfy_topic,omitempty"`
+	BotGithubKey  string         `hcl:"bot_github_key,optional" json:"bot_github_key,omitempty"`
+	Mentions      *MentionsBlock `hcl:"mentions,block" json:"mentions,omitempty"`
+	Capture       *CaptureBlock  `hcl:"capture,block" json:"capture,omitempty"`
+	Throttle      *ThrottleBlock `hcl:"throttle,block" json:"throttle,omitempty"`
+	Memory        *MemoryBlock   `hcl:"memory,block" json:"memory,omitempty"`
 }
 
 type CaptureBlock struct {
@@ -178,25 +178,53 @@ type VMBlock struct {
 
 // Job lifecycle: "oneshot" (default) — issue → session → PR → teardown.
 // "cron" — issue stays open, ephemeral session fires every Schedule, no PR.
-type Job struct {
-	VM                   string            `json:"vm"`
-	Tmux                 string            `json:"tmux"`
-	Target               string            `json:"target"`
-	TargetRepo           string            `json:"target_repo"`
-	Branch               string            `json:"branch"`
-	IssueTitle           string            `json:"issue_title,omitempty"`
-	Lifecycle            string            `json:"lifecycle,omitempty"`
-	Schedule             string            `json:"schedule,omitempty"`
-	Timeout              string            `json:"timeout,omitempty"`
-	NextFireAt           time.Time         `json:"next_fire_at,omitempty"`
-	FireStartedAt        time.Time         `json:"fire_started_at,omitempty"`
-	PR                   int               `json:"pr,omitempty"`
+// prTracker holds the per-PR "what have we already relayed to the worker"
+// state used by diffPR. Shared by a job's primary PR and each upstream PR it
+// tracks. Embedded into Job anonymously so its fields stay top-level in the
+// persisted JSON (backward compatible with pre-ExtraPRs state.db rows).
+type prTracker struct {
 	SeenReviewIDs        []string          `json:"seen_review_ids,omitempty"`
 	SeenThreadCommentIDs []string          `json:"seen_thread_comment_ids,omitempty"`
 	SeenIssueCommentIDs  []string          `json:"seen_issue_comment_ids,omitempty"`
 	LastHeadOID          string            `json:"last_head_oid,omitempty"`
 	LastCheckConclusions map[string]string `json:"last_check_conclusions,omitempty"`
 	LastMergeable        string            `json:"last_mergeable,omitempty"`
+}
+
+// ExtraPR is an upstream / dependency PR (in a repo other than the job's
+// target) that a session opened as part of its work. orch watches it like the
+// primary PR — relaying new reviews/comments/CI back — but only after
+// confirming our bot authored it. Discovered from the primary PR body's
+// cross-repo links.
+type ExtraPR struct {
+	Repo      string `json:"repo"`   // owner/repo
+	Number    int    `json:"number"` // PR number in Repo
+	Validated bool   `json:"validated,omitempty"`
+	prTracker
+}
+
+type Job struct {
+	VM            string    `json:"vm"`
+	Tmux          string    `json:"tmux"`
+	Target        string    `json:"target"`
+	TargetRepo    string    `json:"target_repo"`
+	Branch        string    `json:"branch"`
+	IssueTitle    string    `json:"issue_title,omitempty"`
+	Lifecycle     string    `json:"lifecycle,omitempty"`
+	Schedule      string    `json:"schedule,omitempty"`
+	Timeout       string    `json:"timeout,omitempty"`
+	NextFireAt    time.Time `json:"next_fire_at,omitempty"`
+	FireStartedAt time.Time `json:"fire_started_at,omitempty"`
+	PR            int       `json:"pr,omitempty"`
+	prTracker               // seen review/comment IDs, last head OID, check conclusions, mergeable — flattened into Job's JSON, so existing state.db jobs deserialize unchanged
+	// ExtraPRs are upstream / dependency PRs this session opened in OTHER repos
+	// (e.g. a dprint PR backing a deno fix). orch watches them too and feeds
+	// their reviews/comments/CI back to the worker — see issue #1.
+	ExtraPRs []ExtraPR `json:"extra_prs,omitempty"`
+	// IgnoredPRs are cross-repo refs we discovered but stopped tracking (not
+	// authored by our bot, or already merged/closed). Kept so discoverExtraPRs
+	// doesn't re-add a ref that's still sitting in the PR body each tick.
+	IgnoredPRs []string `json:"ignored_prs,omitempty"`
 
 	// Proactive pacing governor fields (see governor.go). All persist for free
 	// via SaveState's json blob. Priority is parsed from the issue body's toml
@@ -1694,7 +1722,7 @@ func isActionableCheck(conclusion string) bool {
 	return true
 }
 
-func diffPR(j *Job, v *PRView, botLogin string) (
+func diffPR(t *prTracker, v *PRView, botLogin string) (
 	visibleReviews, visibleThread, visibleIssue []string,
 	silentReviews, silentThread, silentIssue []string,
 	pushed bool, checkChanges []string, mergeable string,
@@ -1709,7 +1737,7 @@ func diffPR(j *Job, v *PRView, botLogin string) (
 	isBot := func(login string) bool {
 		return botLogin != "" && login == botLogin
 	}
-	rs := seen(j.SeenReviewIDs)
+	rs := seen(t.SeenReviewIDs)
 	for _, r := range v.Reviews {
 		if rs[r.ID] {
 			continue
@@ -1720,7 +1748,7 @@ func diffPR(j *Job, v *PRView, botLogin string) (
 			visibleReviews = append(visibleReviews, r.ID)
 		}
 	}
-	tc := seen(j.SeenThreadCommentIDs)
+	tc := seen(t.SeenThreadCommentIDs)
 	for _, t := range v.ReviewThreads {
 		for _, c := range t.Comments {
 			if tc[c.ID] {
@@ -1733,7 +1761,7 @@ func diffPR(j *Job, v *PRView, botLogin string) (
 			}
 		}
 	}
-	ic := seen(j.SeenIssueCommentIDs)
+	ic := seen(t.SeenIssueCommentIDs)
 	for _, c := range v.Comments {
 		if ic[c.ID] {
 			continue
@@ -1744,7 +1772,7 @@ func diffPR(j *Job, v *PRView, botLogin string) (
 			visibleIssue = append(visibleIssue, c.ID)
 		}
 	}
-	if j.LastHeadOID != "" && j.LastHeadOID != v.HeadRefOid {
+	if t.LastHeadOID != "" && t.LastHeadOID != v.HeadRefOid {
 		pushed = true
 		if botLogin != "" {
 			for _, c := range v.Commits {
@@ -1773,13 +1801,13 @@ func diffPR(j *Job, v *PRView, botLogin string) (
 			latest[c.Name] = c.Conclusion
 		}
 	}
-	prev := j.LastCheckConclusions
+	prev := t.LastCheckConclusions
 	for name, conclusion := range latest {
 		if prev[name] != conclusion && isActionableCheck(conclusion) {
 			checkChanges = append(checkChanges, fmt.Sprintf("%s: %s", name, conclusion))
 		}
 	}
-	mergeable = mergeableTransition(j.LastMergeable, v.Mergeable)
+	mergeable = mergeableTransition(t.LastMergeable, v.Mergeable)
 	return
 }
 
@@ -1810,6 +1838,102 @@ func oneLine(s string, max int) string {
 		return s[:max] + "..."
 	}
 	return s
+}
+
+// extPRURLRe / extPRShortRe match cross-repo PR references in a PR body or
+// comment: a full PR URL, or the `owner/repo#N` shorthand. Issue refs in the
+// short form also match; they're filtered out later when ghPRView fails or the
+// author isn't our bot.
+var extPRURLRe = regexp.MustCompile(`https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)`)
+var extPRShortRe = regexp.MustCompile(`\b([\w.-]+/[\w.-]+)#(\d+)\b`)
+
+// extractExternalRefs pulls PR references that point at repos OTHER than the
+// ones in skip (the job's target + inbox) out of the given texts (a PR body +
+// comments). Deduped.
+func extractExternalRefs(skip map[string]bool, texts ...string) []ExtraPR {
+	seen := map[string]bool{}
+	var out []ExtraPR
+	add := func(repo, numStr string) {
+		repo = strings.ToLower(repo)
+		if skip[repo] {
+			return
+		}
+		num, err := strconv.Atoi(numStr)
+		if err != nil || num <= 0 {
+			return
+		}
+		key := fmt.Sprintf("%s#%d", repo, num)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, ExtraPR{Repo: repo, Number: num})
+	}
+	for _, t := range texts {
+		for _, m := range extPRURLRe.FindAllStringSubmatch(t, -1) {
+			add(m[1], m[2])
+		}
+		for _, m := range extPRShortRe.FindAllStringSubmatch(t, -1) {
+			add(m[1], m[2])
+		}
+	}
+	return out
+}
+
+// discoverExtraPRs scans the primary PR's body + comments for upstream PRs the
+// session opened in other repos and adds any new ones to j.ExtraPRs. Idempotent
+// (skips refs already tracked, the target repo, and the inbox).
+func discoverExtraPRs(j *Job, v *PRView, cfg *Config) {
+	skip := map[string]bool{strings.ToLower(j.TargetRepo): true}
+	if cfg.GitHub.InboxRepo != "" {
+		skip[strings.ToLower(cfg.GitHub.InboxRepo)] = true
+	}
+	have := map[string]bool{}
+	for _, e := range j.ExtraPRs {
+		have[fmt.Sprintf("%s#%d", e.Repo, e.Number)] = true
+	}
+	for _, k := range j.IgnoredPRs {
+		have[k] = true
+	}
+	texts := []string{v.Body}
+	for _, c := range v.Comments {
+		texts = append(texts, c.Body)
+	}
+	for _, ref := range extractExternalRefs(skip, texts...) {
+		if !have[fmt.Sprintf("%s#%d", ref.Repo, ref.Number)] {
+			j.ExtraPRs = append(j.ExtraPRs, ref)
+		}
+	}
+}
+
+// markPRSeen records that everything in this PRView (the just-relayed reviews/
+// comments/checks + head + mergeable) has been told to the worker, so diffPR
+// won't re-surface it. Shared by the primary PR and each tracked upstream PR.
+func markPRSeen(t *prTracker, v *PRView, vr, sr, vt, st, vi, si []string) {
+	t.SeenReviewIDs = append(append(t.SeenReviewIDs, vr...), sr...)
+	t.SeenThreadCommentIDs = append(append(t.SeenThreadCommentIDs, vt...), st...)
+	t.SeenIssueCommentIDs = append(append(t.SeenIssueCommentIDs, vi...), si...)
+	t.LastHeadOID = v.HeadRefOid
+	if v.Mergeable != "" && v.Mergeable != "UNKNOWN" {
+		t.LastMergeable = v.Mergeable
+	}
+	if t.LastCheckConclusions == nil {
+		t.LastCheckConclusions = map[string]string{}
+	}
+	latestAt := map[string]string{}
+	for _, c := range v.StatusCheckRollup {
+		if c.Status == "COMPLETED" && c.CompletedAt > latestAt[c.Name] {
+			latestAt[c.Name] = c.CompletedAt
+			t.LastCheckConclusions[c.Name] = c.Conclusion
+		}
+	}
+}
+
+// summarizeExternal is summarize with an upstream-PR header so the worker knows
+// the activity is on a dependency PR it opened, not its main PR.
+func summarizeExternal(repo string, num int, v *PRView, nr, ntc, nic []string, pushed bool, checks []string, mergeable string) string {
+	body := strings.TrimPrefix(summarize(v, nr, ntc, nic, pushed, checks, mergeable), "PR update from orchestrator:\n\n")
+	return fmt.Sprintf("Upstream PR update — %s#%d (a dependency PR you opened):\n\n%s", repo, num, body)
 }
 
 func summarize(v *PRView, nr, ntc, nic []string, pushed bool, checks []string, mergeable string) string {

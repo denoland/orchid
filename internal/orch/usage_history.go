@@ -57,8 +57,8 @@ type jsonlMessage struct {
 }
 
 type scanProgress struct {
-	mu   sync.Mutex
-	pos  map[string]int64
+	mu  sync.Mutex
+	pos map[string]int64
 }
 
 func newScanProgress() *scanProgress { return &scanProgress{pos: map[string]int64{}} }

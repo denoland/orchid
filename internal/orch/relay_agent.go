@@ -411,4 +411,3 @@ func (p *paneMux) runCapture(ctx context.Context, c *cfrelaytun.Client, id strin
 		}
 	}
 }
-
