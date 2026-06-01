@@ -11,6 +11,13 @@ import (
 // minimally dependent on the local clock.
 const weekWindow = 7 * 24 * time.Hour
 
+// fiveHourWindow is the length of the short (primary) rate-limit bucket that
+// both Claude and codex report. Used to pace the 5h window linearly, the same
+// way weekWindow paces the weekly bucket — so a fleet sharing one account
+// (e.g. 18 codex prolite sessions) can't drain the 5h budget in the first hour
+// and then idle until reset.
+const fiveHourWindow = 5 * time.Hour
+
 // Throttle defaults, applied lazily inside ThrottleDecide via
 // withDefaults so ThrottleDecide stays a pure function and there is no
 // startup normalization step to forget to call.
@@ -288,6 +295,34 @@ func ThrottleDecide(now time.Time, five, seven RateLimit, ok bool, cfg *Throttle
 		d.Mode = ModeThrottle
 		d.Reason = fmt.Sprintf("over pace: used %.0f%% > target %.0f%% + slack %.0f%%", seven.UsedPct, targetPct, c.SlackPct)
 		return d
+	}
+
+	// (3b) 5-hour linear pace — the same linear pacer applied to the SHORT
+	// window. The weekly bucket can sit at 10% while the 5h window blows to 100%
+	// in the first hour (a fleet sharing one account drains the short bucket far
+	// faster than the weekly one); this is the gate that was missing. Soft
+	// (ModeThrottle): re-evaluated every tick and self-clears as the window
+	// elapses, so it brakes new spawns just enough to make the 5h budget last
+	// the 5 hours instead of pausing-until-reset. Independent of the 5h HARD
+	// pause (five_hour_pause_pct), which the operator may disable. Gated on
+	// fiveReset.After(now) so a stale/rolled-over reading never wedges spawns.
+	if five.ResetsAt != 0 {
+		fiveReset := time.Unix(five.ResetsAt, 0)
+		if fiveReset.After(now) {
+			fiveStart := fiveReset.Add(-fiveHourWindow)
+			fFrac := float64(now.Sub(fiveStart)) / float64(fiveHourWindow)
+			if fFrac < 0 {
+				fFrac = 0
+			} else if fFrac > 1 {
+				fFrac = 1
+			}
+			fTarget := fFrac * 100
+			if five.UsedPct > 0 && five.UsedPct > fTarget+c.SlackPct {
+				d.Mode = ModeThrottle
+				d.Reason = fmt.Sprintf("5h over pace: used %.0f%% > target %.0f%% + slack %.0f%%", five.UsedPct, fTarget, c.SlackPct)
+				return d
+			}
+		}
 	}
 
 	// (4) Otherwise allow.
