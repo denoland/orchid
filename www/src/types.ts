@@ -53,6 +53,7 @@ export interface VM {
   agent?: string
   online?: boolean
   last_err?: string
+  os?: string
 }
 
 export interface Throttle {

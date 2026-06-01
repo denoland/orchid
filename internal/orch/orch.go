@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -271,6 +272,7 @@ type VMHealth struct {
 	Online  bool
 	LastOK  time.Time
 	LastErr string
+	OS      string // "Darwin" / "Linux" (from `uname -s`); for the dashboard machine icon
 }
 
 func (s *State) SetVMHealth(name string, h VMHealth) {
@@ -1250,12 +1252,18 @@ func runVMHealthLoop(ctx context.Context, cfg *Config, st *State) {
 		for i := range cfg.VMs {
 			vm := cfg.VMs[i]
 			if isLocal(vm) {
-				st.SetVMHealth(vm.Name, VMHealth{Online: true, LastOK: time.Now()})
+				osName := "Linux"
+				if runtime.GOOS == "darwin" {
+					osName = "Darwin"
+				}
+				st.SetVMHealth(vm.Name, VMHealth{Online: true, LastOK: time.Now(), OS: osName})
 				continue
 			}
 			before := st.VMHealth(vm.Name)
-			_, errStr, err := sshExec(vm, "tmux ls 2>/dev/null; true")
-			now := VMHealth{LastOK: before.LastOK}
+			// Piggyback `uname -s` onto the existing health probe (one ssh, no
+			// extra connection) so the dashboard can show an OS icon per machine.
+			out, errStr, err := sshExec(vm, "uname -s 2>/dev/null; tmux ls 2>/dev/null; true")
+			now := VMHealth{LastOK: before.LastOK, OS: before.OS}
 			if err != nil {
 				now.Online = false
 				now.LastErr = strings.TrimSpace(errStr)
@@ -1266,6 +1274,9 @@ func runVMHealthLoop(ctx context.Context, cfg *Config, st *State) {
 				now.Online = true
 				now.LastOK = time.Now()
 				now.LastErr = ""
+				if line := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0]); line == "Darwin" || line == "Linux" {
+					now.OS = line
+				}
 			}
 			if before.Online != now.Online {
 				log.Printf("vm %s: %s", vm.Name, map[bool]string{true: "online", false: "offline"}[now.Online])
