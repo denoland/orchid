@@ -149,7 +149,7 @@ function DashboardInner({ state: rawState, relay }: Props) {
           </div>
         ) : tab === 'analytics' ? (
           <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)] bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
-            <AnalyticsPage state={state} jobs={jobs} />
+            <AnalyticsPage state={state} />
           </div>
         ) : tab === 'machines' ? (
           <div className="relative flex-1 min-w-0 min-h-[calc(100vh-93px)] bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur">
@@ -2346,55 +2346,35 @@ function UsageRollups({ rows }: { rows: UsageHistoryRow[] }) {
 // then throughput in tok() (input+output+cache-writes; cache_read excluded — it
 // re-counts the same prefix every turn and would read as billions). No dollar
 // figures: subscriptions aren't billed per-token, so $ is noise here.
-function AnalyticsPage({ state, jobs }: { state: State; jobs: Job[] }) {
-  const [history, setHistory] = useState<UsageHistoryRow[] | null>(null)
+interface ActivityResp {
+  days: number
+  rows: { date: string; sessions: number; prs: number }[]
+  by_repo: { repo: string; sessions: number; prs: number }[]
+  total_sessions: number; total_prs: number
+  today_sessions: number; today_prs: number
+}
+
+function AnalyticsPage({ state }: { state: State }) {
   const [days, setDays] = useState(30)
+  const [act, setAct] = useState<ActivityResp | null>(null)
   useEffect(() => {
     let alive = true
-    const load = () => fetch(`/api/usage_history?days=${days}`, { credentials: 'include', cache: 'no-store' })
-      .then((r) => r.ok ? r.json() : null).then((j) => { if (alive) setHistory(j?.rows ?? []) }).catch(() => { if (alive) setHistory([]) })
+    const load = () => fetch(`/api/activity?days=${days}`, { credentials: 'include', cache: 'no-store' })
+      .then((r) => r.ok ? r.json() : null).then((j) => { if (alive) setAct(j) }).catch(() => { if (alive) setAct(null) })
     load(); const id = setInterval(load, 60_000)
     return () => { alive = false; clearInterval(id) }
   }, [days])
 
-  const rows = history ?? []
-  const today = new Date().toISOString().slice(0, 10)
-  // window of d days INCLUDING today (fixes the old off-by-one where "Today"
-  // summed today + yesterday and read ~2x).
-  const sinceISO = (d: number) => new Date(Date.now() - (d - 1) * 86400_000).toISOString().slice(0, 10)
-  const sumWin = (d: number) => rows.filter((r) => r.date >= sinceISO(d) && r.date <= today).reduce((a, r) => a + tok(r), 0)
-
-  // per-account quota (real constraint). Fall back to top-level quota as "claude".
+  // per-account quota (the real constraint). Fall back to top-level quota as "claude".
   const accounts: [string, AgentMeter][] = state.agents && Object.keys(state.agents).length
     ? Object.entries(state.agents)
     : (state.quota ? [['claude', { quota: state.quota, governor: state.governor }]] : [])
 
-  // daily throughput for the trend (last `days`, oldest→newest)
-  const byDay = useMemo(() => {
-    const m = new Map<string, number>()
-    for (const r of rows) m.set(r.date, (m.get(r.date) ?? 0) + tok(r))
-    const out: { date: string; v: number }[] = []
-    for (let i = days - 1; i >= 0; i--) {
-      const d = new Date(Date.now() - i * 86400_000).toISOString().slice(0, 10)
-      out.push({ date: d, v: m.get(d) ?? 0 })
-    }
-    return out
-  }, [rows, days])
-  const dayMax = Math.max(1, ...byDay.map((d) => d.v))
-
-  // by model (always accurate) over the window
-  const issueRepo = useMemo(() => new Map(jobs.filter((j) => j.issue).map((j) => [j.issue, j.target_repo ? j.target_repo.split('/')[1] : (j.target || '')])), [jobs])
-  const winRows = rows.filter((r) => r.date >= sinceISO(days) && r.date <= today)
-  const byKey = (keyfn: (r: UsageHistoryRow) => string) => {
-    const m = new Map<string, number>()
-    for (const r of winRows) { const k = keyfn(r) || '—'; m.set(k, (m.get(k) ?? 0) + tok(r)) }
-    return [...m.entries()].sort((a, b) => b[1] - a[1])
-  }
-  const byModel = byKey((r) => (r.model || '').replace(/^claude-/, '').replace(/-\d{8}$/, ''))
-  const byRepo = byKey((r) => issueRepo.get(r.issue ?? -1) || 'other')
-  const winTotal = winRows.reduce((a, r) => a + tok(r), 0)
-
-  const live = jobs.filter((j) => j.usage).slice().sort((a, b) => (b.usage?.context_pct ?? 0) - (a.usage?.context_pct ?? 0))
+  const rows = act?.rows ?? []
+  const dayMax = Math.max(1, ...rows.map((r) => r.sessions))
+  const repos = act?.by_repo ?? []
+  const repoMax = Math.max(1, ...repos.map((r) => r.sessions))
+  const today = new Date().toISOString().slice(0, 10)
 
   const section = (title: string, right?: React.ReactNode) => (
     <div className="flex items-center gap-2 mb-2">
@@ -2404,18 +2384,11 @@ function AnalyticsPage({ state, jobs }: { state: State; jobs: Job[] }) {
   )
   const card = 'rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950'
 
-  const barList = (entries: [string, number][], max: number) => (
-    <div className={card + ' divide-y divide-zinc-100 dark:divide-zinc-800/70'}>
-      {entries.length === 0 && <div className="px-3 py-2.5 text-[12.5px] text-zinc-400">No data.</div>}
-      {entries.slice(0, 8).map(([k, v]) => (
-        <div key={k} className="flex items-center gap-3 px-3 py-1.5">
-          <span className="text-[12.5px] text-zinc-700 dark:text-zinc-300 truncate w-40 flex-shrink-0">{k}</span>
-          <div className="relative h-1.5 flex-1 rounded-full overflow-hidden bg-zinc-100 dark:bg-zinc-800">
-            <div className="absolute inset-y-0 left-0 bg-violet-500/70" style={{ width: `${(v / max) * 100}%` }} />
-          </div>
-          <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums w-12 text-right">{fmtTok(v)}</span>
-        </div>
-      ))}
+  const stat = (label: string, value: number, sub?: string) => (
+    <div className={card + ' px-3 py-2.5'}>
+      <div className="text-[10px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-0.5">{label}</div>
+      <div className="mono text-[22px] text-zinc-900 dark:text-zinc-100 tabular-nums leading-tight">{value}</div>
+      {sub && <div className="text-[11px] text-zinc-400 dark:text-zinc-500 mt-0.5">{sub}</div>}
     </div>
   )
 
@@ -2423,7 +2396,7 @@ function AnalyticsPage({ state, jobs }: { state: State; jobs: Job[] }) {
     <div className="flex-1 min-w-0 w-full max-w-screen-xl mx-auto p-4 sm:p-6 flex flex-col gap-6">
       <div className="flex items-center gap-3">
         <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Analytics</h1>
-        <span className="mono text-[11px] px-1.5 py-0.5 rounded-full bg-zinc-200/80 dark:bg-zinc-700/70 text-zinc-600 dark:text-zinc-300 tabular-nums">{live.length} live</span>
+        <span className="mono text-[11px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 tabular-nums">{(state.jobs ?? []).filter((j) => !j.closed_state).length} active</span>
         <div className="flex-1" />
         <div className="flex items-center gap-1">
           {[7, 30, 90].map((d) => (
@@ -2435,7 +2408,7 @@ function AnalyticsPage({ state, jobs }: { state: State; jobs: Job[] }) {
         </div>
       </div>
 
-      {/* Accounts — quota is the real constraint; same glance cards as the main page */}
+      {/* Accounts — quota is the real constraint */}
       <div>
         {section('Accounts')}
         {accounts.length === 0
@@ -2447,62 +2420,42 @@ function AnalyticsPage({ state, jobs }: { state: State; jobs: Job[] }) {
             </div>}
       </div>
 
-      {/* Throughput — honest tok(), today window fixed */}
+      {/* Activity — sessions started + PRs opened (one row per issue) */}
       <div>
-        {section('Throughput', <span className="mono text-[10px] text-zinc-400">tokens in+out+cache-write · cache-reads excluded</span>)}
+        {section('Activity', <span className="mono text-[10px] text-zinc-400">one row per issue · resumes counted once</span>)}
         <div className="grid grid-cols-3 gap-3 mb-3">
-          {([['Today', 1], ['7 days', 7], ['30 days', 30]] as const).map(([label, d]) => (
-            <div key={label} className={card + ' px-3 py-2.5'}>
-              <div className="text-[10px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-0.5">{label}</div>
-              <div className="mono text-[19px] text-zinc-900 dark:text-zinc-100 tabular-nums">{fmtTok(sumWin(d))}</div>
-            </div>
-          ))}
+          {stat('Today', act?.today_sessions ?? 0, `${act?.today_prs ?? 0} PRs opened`)}
+          {stat(`Sessions · ${days}d`, act?.total_sessions ?? 0, 'issues worked')}
+          {stat(`PRs · ${days}d`, act?.total_prs ?? 0, 'pull requests opened')}
         </div>
         <div className={card + ' px-3 py-3'}>
           <div className="flex items-end gap-[2px] h-20">
-            {byDay.map((d) => (
-              <div key={d.date} title={`${d.date}: ${fmtTok(d.v)}`}
+            {rows.map((d) => (
+              <div key={d.date} title={`${d.date}: ${d.sessions} sessions, ${d.prs} PRs`}
                 className="flex-1 min-w-0 bg-violet-500/60 hover:bg-violet-500 rounded-sm transition-colors"
-                style={{ height: `${Math.max(2, (d.v / dayMax) * 100)}%` }} />
+                style={{ height: `${Math.max(2, (d.sessions / dayMax) * 100)}%` }} />
             ))}
           </div>
           <div className="flex justify-between mono text-[10px] text-zinc-400 mt-1.5">
-            <span>{byDay[0]?.date.slice(5)}</span><span>peak {fmtTok(dayMax)}/d</span><span>{today.slice(5)}</span>
+            <span>{rows[0]?.date.slice(5)}</span><span>peak {dayMax}/d</span><span>{today.slice(5)}</span>
           </div>
         </div>
       </div>
 
-      {/* Breakdowns */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-        <div>{section('By model', <span className="mono text-[10px] text-zinc-400">{fmtTok(winTotal)} · {days}d</span>)}{barList(byModel, byModel[0]?.[1] ?? 1)}</div>
-        <div>{section('By repo')}{barList(byRepo, byRepo[0]?.[1] ?? 1)}</div>
-      </div>
-
-      {/* Live context window */}
+      {/* By repo — sessions per work repo */}
       <div>
-        {section('Live context window', <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums">{live.length} active</span>)}
+        {section('By repo', <span className="mono text-[10px] text-zinc-400">sessions · {days}d</span>)}
         <div className={card + ' divide-y divide-zinc-100 dark:divide-zinc-800/70'}>
-          {live.length === 0 && <div className="px-3 py-2.5 text-[12.5px] text-zinc-400">No statusline samples yet.</div>}
-          {live.map((j) => {
-            const ctx = j.usage?.context_pct
-            const repo = j.target_repo ? j.target_repo.split('/')[1] : j.target || '—'
-            return (
-              <div key={j.tmux} className="flex items-center gap-3 px-3 py-2">
-                <div className="flex-1 min-w-0">
-                  <div className="text-[13px] text-zinc-900 dark:text-zinc-100 truncate">{j.issue_title || j.tmux}</div>
-                  <div className="mono text-[11px] text-zinc-500 dark:text-zinc-400 truncate">{repo} · {j.tmux}{j.usage?.model ? ' · ' + j.usage.model : ''}</div>
-                </div>
-                {typeof ctx === 'number' && (
-                  <div className="flex items-center gap-1.5 flex-shrink-0">
-                    <div className="relative h-1.5 w-16 rounded-full overflow-hidden bg-zinc-200 dark:bg-zinc-800">
-                      <div className={'absolute inset-y-0 left-0 ' + (ctx > 80 ? 'bg-rose-500/80' : 'bg-violet-500/80')} style={{ width: `${Math.min(100, Math.max(0, ctx))}%` }} />
-                    </div>
-                    <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums w-8 text-right">{Math.round(ctx)}%</span>
-                  </div>
-                )}
+          {repos.length === 0 && <div className="px-3 py-2.5 text-[12.5px] text-zinc-400">No activity in this window.</div>}
+          {repos.slice(0, 8).map((r) => (
+            <div key={r.repo} className="flex items-center gap-3 px-3 py-1.5">
+              <span className="text-[12.5px] text-zinc-700 dark:text-zinc-300 truncate w-40 flex-shrink-0">{r.repo}</span>
+              <div className="relative h-1.5 flex-1 rounded-full overflow-hidden bg-zinc-100 dark:bg-zinc-800">
+                <div className="absolute inset-y-0 left-0 bg-violet-500/70" style={{ width: `${(r.sessions / repoMax) * 100}%` }} />
               </div>
-            )
-          })}
+              <span className="mono text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums w-16 text-right">{r.sessions} · {r.prs} PR</span>
+            </div>
+          ))}
         </div>
       </div>
     </div>
