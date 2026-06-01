@@ -3,6 +3,8 @@ package orch
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -674,6 +676,85 @@ var subcommands = map[string]func([]string){
 	"run":  runRun,
 }
 
+// defaultConfigPath is where a no-flag `orch` reads/creates its config:
+// ~/.orch/swarm.hcl, falling back to ./swarm.hcl when HOME is unavailable
+// (e.g. a systemd unit with no HOME set).
+func defaultConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "swarm.hcl"
+	}
+	return filepath.Join(home, ".orch", "swarm.hcl")
+}
+
+// scaffoldConfig writes a minimal, valid starter config so a fresh install
+// boots straight into a usable dashboard. Everything beyond the bare minimum
+// (inbox repo, targets, machines) is left empty for the user to fill in via
+// the Settings panel. A random http_secret is generated and the ready-to-use
+// dashboard URL is logged.
+func scaffoldConfig(path string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return err
+	}
+	secret := hex.EncodeToString(buf)
+	cfg := fmt.Sprintf(defaultConfigTemplate,
+		filepath.Join(dir, "state.db"),
+		filepath.Join(dir, "work"),
+		secret,
+	)
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		return err
+	}
+	log.Printf("no config found — wrote a starter at %s", path)
+	log.Printf("open the dashboard: http://localhost:8000/?token=%s", secret)
+	return nil
+}
+
+// defaultConfigTemplate is a minimal valid config: %s = state_db path,
+// workdir_root path, http_secret. No inbox/targets/machines — the user adds
+// those in the dashboard. Until then orch runs but has nothing to dispatch.
+const defaultConfigTemplate = `# Orchid config. Edit here or in the dashboard Settings panel.
+github {
+  inbox_repo = ""   # owner/repo where you file issues to dispatch work
+}
+
+orchestrator {
+  poll_interval = "30s"
+  state_db      = "%s"
+  branch_prefix = "orch/issue-"
+  workdir_root  = "%s"
+  http_addr     = ":8000"
+  http_secret   = "%s"   # dashboard token; set "" for no auth (trusted networks only)
+}
+
+# Add work repos: an issue labeled "x" in the inbox is cloned + worked here.
+# target "example" {
+#   label = "example"
+#   repo  = "owner/repo"
+# }
+
+# Add a machine to run the swarm on. localhost needs claude/codex installed.
+# machine "local" {
+#   host = "localhost"
+#   agent "claude" { capacity = 4, session_cmd = "claude --dangerously-skip-permissions" }
+# }
+
+bootstrap_prompt = <<EOT
+You are an autonomous coding agent working issue #{{issue.number}} ({{issue.title}})
+in {{target.repo}}. Clone is at {{workdir}} on branch {{branch}}.
+
+Read the issue, make the change, open a pull request, and end the PR body with:
+Closes {{inbox.repo}}#{{issue.number}}
+
+Then stop and wait for review.
+EOT
+`
+
 // workerEnvPath is where `orch join vm` saves enough state for later
 // `orch run` invocations to phone home to central without re-typing
 // the URL + token every time.
@@ -774,16 +855,31 @@ func Main() {
 			return
 		}
 	}
-	cfgPath := flag.String("config", "swarm.hcl", "path to HCL config")
+	cfgPath := flag.String("config", "", "path to HCL config (default: ~/.orch/swarm.hcl, auto-created on first run)")
 	describeFlag := flag.Bool("describe", false, "print a SKILL.md-shaped description of this instance and exit")
 	captureOnly := flag.Bool("capture-only", false, "run only the /api/drafts capture HTTP server (no swarm polling, no VM bootstrap); requires a capture block in the config")
 	relayURL := flag.String("relay", "", "outbound relay URL (e.g. wss://orchid.com/agent) — dashboard is reachable at <sub>.orchid.com without exposing this port")
 	relayToken := flag.String("relay-token", "", "agent token issued by the relay on signup")
 	flag.Parse()
-	globalConfigPath = *cfgPath
+
+	// Zero-config start: with no -config (and no file at the default path) we
+	// scaffold a minimal swarm.hcl and boot from it, so a fresh user gets a
+	// running dashboard to configure in — no hand-written config required. The
+	// dashboard's Settings panel writes back to this same path.
+	cfgFile := *cfgPath
+	if cfgFile == "" {
+		cfgFile = defaultConfigPath()
+	}
+	globalConfigPath = cfgFile
+
+	if _, err := os.Stat(cfgFile); os.IsNotExist(err) {
+		if err := scaffoldConfig(cfgFile); err != nil {
+			log.Fatalf("create default config at %s: %v", cfgFile, err)
+		}
+	}
 
 	var cfg Config
-	if err := hclsimple.DecodeFile(*cfgPath, nil, &cfg); err != nil {
+	if err := hclsimple.DecodeFile(cfgFile, nil, &cfg); err != nil {
 		log.Fatalf("config: %v", err)
 	}
 	expandMachines(&cfg)
