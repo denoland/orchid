@@ -612,7 +612,7 @@ func TestSummarizeMergeable(t *testing.T) {
 // diffs, using the stored LastMergeable on the Job as the previous state.
 func TestDiffPRMergeable(t *testing.T) {
 	t.Run("MERGEABLE → CONFLICTING surfaced", func(t *testing.T) {
-		j := &Job{LastMergeable: "MERGEABLE"}
+		j := &prTracker{LastMergeable: "MERGEABLE"}
 		v := &PRView{Mergeable: "CONFLICTING"}
 		_, _, _, _, _, _, _, _, m := diffPR(j, v, "")
 		if m != "CONFLICTING" {
@@ -620,7 +620,7 @@ func TestDiffPRMergeable(t *testing.T) {
 		}
 	})
 	t.Run("UNKNOWN never bubbles up", func(t *testing.T) {
-		j := &Job{LastMergeable: "MERGEABLE"}
+		j := &prTracker{LastMergeable: "MERGEABLE"}
 		v := &PRView{Mergeable: "UNKNOWN"}
 		_, _, _, _, _, _, _, _, m := diffPR(j, v, "")
 		if m != "" {
@@ -628,7 +628,7 @@ func TestDiffPRMergeable(t *testing.T) {
 		}
 	})
 	t.Run("stable MERGEABLE is silent", func(t *testing.T) {
-		j := &Job{LastMergeable: "MERGEABLE"}
+		j := &prTracker{LastMergeable: "MERGEABLE"}
 		v := &PRView{Mergeable: "MERGEABLE"}
 		_, _, _, _, _, _, _, _, m := diffPR(j, v, "")
 		if m != "" {
@@ -649,7 +649,7 @@ func TestIsActionableCheck(t *testing.T) {
 	actionable := []string{
 		"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
 		"STARTUP_FAILURE",
-		"", // empty conclusion shouldn't reach here, but if it does, surface it
+		"",              // empty conclusion shouldn't reach here, but if it does, surface it
 		"SOMETHING_NEW", // forward-compat: unknown values are loud, not silent
 	}
 	for _, c := range silent {
@@ -670,7 +670,7 @@ func TestIsActionableCheck(t *testing.T) {
 // the worker isn't poked.
 func TestDiffPRChecksFilterSuccess(t *testing.T) {
 	t.Run("all-SUCCESS tick is silent", func(t *testing.T) {
-		j := &Job{LastCheckConclusions: map[string]string{}}
+		j := &prTracker{LastCheckConclusions: map[string]string{}}
 		v := &PRView{StatusCheckRollup: []StatusCheck{
 			{Name: "test linux", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-05-25T00:00:00Z"},
 			{Name: "test mac", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-05-25T00:00:00Z"},
@@ -684,7 +684,7 @@ func TestDiffPRChecksFilterSuccess(t *testing.T) {
 	})
 
 	t.Run("FAILURE is surfaced even when other checks are green", func(t *testing.T) {
-		j := &Job{LastCheckConclusions: map[string]string{}}
+		j := &prTracker{LastCheckConclusions: map[string]string{}}
 		v := &PRView{StatusCheckRollup: []StatusCheck{
 			{Name: "test linux", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-05-25T00:00:00Z"},
 			{Name: "test mac", Status: "COMPLETED", Conclusion: "FAILURE", CompletedAt: "2026-05-25T00:00:00Z"},
@@ -704,7 +704,7 @@ func TestDiffPRChecksFilterSuccess(t *testing.T) {
 		// fired for some other reason). Now the same check has flipped
 		// red — we must surface it. This is the SUCCESS→FAILURE
 		// regression case.
-		j := &Job{LastCheckConclusions: map[string]string{"test linux": "SUCCESS"}}
+		j := &prTracker{LastCheckConclusions: map[string]string{"test linux": "SUCCESS"}}
 		v := &PRView{StatusCheckRollup: []StatusCheck{
 			{Name: "test linux", Status: "COMPLETED", Conclusion: "FAILURE", CompletedAt: "2026-05-25T00:01:00Z"},
 		}}
@@ -715,7 +715,7 @@ func TestDiffPRChecksFilterSuccess(t *testing.T) {
 	})
 
 	t.Run("in-progress checks are ignored", func(t *testing.T) {
-		j := &Job{LastCheckConclusions: map[string]string{}}
+		j := &prTracker{LastCheckConclusions: map[string]string{}}
 		v := &PRView{StatusCheckRollup: []StatusCheck{
 			{Name: "test linux", Status: "IN_PROGRESS", Conclusion: "", CompletedAt: ""},
 		}}
@@ -761,7 +761,7 @@ func TestDiffPRBotSelfFilter(t *testing.T) {
 	}
 
 	t.Run("bot reviews/comments go silent, human ones visible", func(t *testing.T) {
-		j := &Job{}
+		j := &prTracker{}
 		v := mkView()
 		vr, _, vi, sr, _, si, _, _, _ := diffPR(j, v, bot)
 		if len(vr) != 1 || vr[0] != "rev-human" {
@@ -779,7 +779,7 @@ func TestDiffPRBotSelfFilter(t *testing.T) {
 	})
 
 	t.Run("bot-authored HEAD commit suppresses pushed", func(t *testing.T) {
-		j := &Job{LastHeadOID: "old-sha"}
+		j := &prTracker{LastHeadOID: "old-sha"}
 		v := &PRView{HeadRefOid: "new-sha"}
 		v.Commits = append(v.Commits, struct {
 			Oid     string `json:"oid"`
@@ -796,7 +796,7 @@ func TestDiffPRBotSelfFilter(t *testing.T) {
 	})
 
 	t.Run("human HEAD commit still surfaces pushed", func(t *testing.T) {
-		j := &Job{LastHeadOID: "old-sha"}
+		j := &prTracker{LastHeadOID: "old-sha"}
 		v := &PRView{HeadRefOid: "new-sha"}
 		v.Commits = append(v.Commits, struct {
 			Oid     string `json:"oid"`
@@ -813,7 +813,7 @@ func TestDiffPRBotSelfFilter(t *testing.T) {
 	})
 
 	t.Run("co-authored bot+human HEAD still surfaces pushed", func(t *testing.T) {
-		j := &Job{LastHeadOID: "old-sha"}
+		j := &prTracker{LastHeadOID: "old-sha"}
 		v := &PRView{HeadRefOid: "new-sha"}
 		v.Commits = append(v.Commits, struct {
 			Oid     string `json:"oid"`
@@ -830,7 +830,7 @@ func TestDiffPRBotSelfFilter(t *testing.T) {
 	})
 
 	t.Run("missing HEAD in commits list falls back to notify", func(t *testing.T) {
-		j := &Job{LastHeadOID: "old-sha"}
+		j := &prTracker{LastHeadOID: "old-sha"}
 		v := &PRView{HeadRefOid: "new-sha"} // no commits payload at all
 		_, _, _, _, _, _, pushed, _, _ := diffPR(j, v, bot)
 		if !pushed {
@@ -839,7 +839,7 @@ func TestDiffPRBotSelfFilter(t *testing.T) {
 	})
 
 	t.Run("empty botLogin disables filtering", func(t *testing.T) {
-		j := &Job{}
+		j := &prTracker{}
 		v := mkView()
 		vr, _, vi, sr, _, si, _, _, _ := diffPR(j, v, "")
 		if len(sr) != 0 || len(si) != 0 {
@@ -851,7 +851,7 @@ func TestDiffPRBotSelfFilter(t *testing.T) {
 	})
 
 	t.Run("seen IDs are not re-classified", func(t *testing.T) {
-		j := &Job{SeenIssueCommentIDs: []string{"c-bot", "c-human"}}
+		j := &prTracker{SeenIssueCommentIDs: []string{"c-bot", "c-human"}}
 		v := mkView()
 		_, _, vi, _, _, si, _, _, _ := diffPR(j, v, bot)
 		if len(vi) != 0 || len(si) != 0 {

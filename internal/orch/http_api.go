@@ -99,11 +99,11 @@ type apiVMEntry struct {
 }
 
 type apiStateResp struct {
-	Jobs     []apiJobEntry  `json:"jobs"`
-	VMs      []apiVMEntry   `json:"vms"`
-	Inbox    string         `json:"inbox"`
-	Quota    *apiQuota      `json:"quota,omitempty"` // legacy: claude's quota (back-compat)
-	Governor *apiGovernor   `json:"governor,omitempty"` // legacy: claude's governor (back-compat)
+	Jobs     []apiJobEntry `json:"jobs"`
+	VMs      []apiVMEntry  `json:"vms"`
+	Inbox    string        `json:"inbox"`
+	Quota    *apiQuota     `json:"quota,omitempty"`    // legacy: claude's quota (back-compat)
+	Governor *apiGovernor  `json:"governor,omitempty"` // legacy: claude's governor (back-compat)
 	// Per-agent metering: each configured agent's quota + governor, keyed by
 	// agent name ("claude"/"codex"). The legacy Quota/Governor above mirror the
 	// claude entry so existing widgets keep working.

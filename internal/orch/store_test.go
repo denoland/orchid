@@ -32,7 +32,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	cursor := time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)
 	in := map[int]*Job{
 		1: {VM: "local", Tmux: "claude-1", Target: "deno", TargetRepo: "denoland/deno", Branch: "orch/issue-1", PR: 42},
-		7: {VM: "remote", Tmux: "claude-7", Target: "orchid", TargetRepo: "denoland/orchid", Branch: "orch/issue-7", SeenReviewIDs: []string{"r1", "r2"}},
+		7: {VM: "remote", Tmux: "claude-7", Target: "orchid", TargetRepo: "denoland/orchid", Branch: "orch/issue-7", prTracker: prTracker{SeenReviewIDs: []string{"r1", "r2"}}},
 	}
 	m := &MaintainerCache{FetchedAt: cursor, Members: []string{"alice", "bob"}}
 	if err := store.SaveState(in, &cursor, m); err != nil {
