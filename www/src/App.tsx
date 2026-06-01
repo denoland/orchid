@@ -23,30 +23,18 @@ export interface WSBus {
 }
 export const WSBusContext = createContext<WSBus | null>(null)
 
+// The bare apex and local dev are the public entry point — they show the docs
+// (with a Sign in button), no marketing landing. Every other host is a
+// per-user dashboard subdomain (<user>.orchid.littledivy.com): it ALWAYS
+// renders the dashboard, even while orch is down — it must never fall back to
+// the public docs. (Signed-in users reach their subdomain via /login →
+// /dashboard; the apex never serves a dashboard.)
+const PUBLIC_HOSTS = new Set(['orchid.littledivy.com', 'localhost', '127.0.0.1'])
+
 export default function App() {
   if (location.pathname.startsWith('/docs')) return <Docs />
-  return <RootGate />
-}
-
-// "/" has no marketing landing: signed-in users get the dashboard, everyone
-// else gets the docs (with a Sign in button). We probe /api/state once to
-// decide — ok ⇒ dashboard, 401/403/unreachable ⇒ docs.
-function RootGate() {
-  const [authed, setAuthed] = useState<boolean | null>(null)
-  useEffect(() => {
-    let alive = true
-    fetch('/api/state', { credentials: 'include' })
-      .then((r) => {
-        // A real signed-in response is JSON; vite dev / SPA fallback returns
-        // HTML with 200, which must NOT count as authed.
-        const json = r.headers.get('content-type')?.includes('application/json')
-        if (alive) setAuthed(r.ok && !!json)
-      })
-      .catch(() => { if (alive) setAuthed(false) })
-    return () => { alive = false }
-  }, [])
-  if (authed === null) return null
-  return authed ? <DashboardApp /> : <Docs />
+  if (!PUBLIC_HOSTS.has(location.hostname)) return <DashboardApp />
+  return <Docs />
 }
 
 function DashboardApp() {
