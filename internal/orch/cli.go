@@ -1062,6 +1062,11 @@ func Main() {
 		}
 	}
 
+	// Prime the in-memory quota map from the DB so the dashboard shows each
+	// account's last-known reading immediately after a restart, instead of going
+	// blank until that account next emits a live sample.
+	seedAgentQuotaFromDB(&cfg, st.store)
+
 	for i := range cfg.VMs {
 		vm := cfg.VMs[i]
 		// Each VM streams its agent's usage: claude via the statusline.jsonl
