@@ -88,13 +88,8 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("orchid capture")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.large)
         }
     }
 
