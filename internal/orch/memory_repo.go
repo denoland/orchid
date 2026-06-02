@@ -162,7 +162,13 @@ func aggregateRemoteMemory(cfg *Config, localVM *VMBlock) {
 		}
 		seen[vm.Host] = true
 		sshOpt := "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -i " + expand(vm.Key)
-		src := fmt.Sprintf("%s@%s:%s/", vm.User, vm.Host, memoryStoreDir(cfg, vm))
+		// rsync 3.2+ enables --protect-args by default, so the remote path is NOT
+		// run through the remote shell — a literal "$HOME" (emitted by
+		// memoryRepoDir for a "~"/empty session_home) never expands and resolves
+		// relative to the login dir (e.g. /Users/divy/$HOME/...). rsync DOES still
+		// expand a leading "~" itself, so use that for home-relative paths.
+		remoteDir := strings.Replace(memoryStoreDir(cfg, vm), "$HOME", "~", 1)
+		src := fmt.Sprintf("%s@%s:%s/", vm.User, vm.Host, remoteDir)
 		// -rtu: recurse, preserve times, skip files newer on the receiver. No
 		// owner/group/perms (uids differ across boxes; the sync script chowns).
 		if _, errStr, err := run("rsync", "-rtu", "--timeout=30", "-e", sshOpt, src, localDir+"/"); err != nil {
