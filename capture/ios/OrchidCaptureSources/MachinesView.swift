@@ -1,15 +1,12 @@
 import SwiftUI
 
-/// Machines — the dashboard's telemetry sidebar as a tab: per-account
-/// usage & pacing (7d + 5h quota bars with the pace marker) and the VM
-/// fleet. Same row metrics + mono labels as Sessions.
-struct MachinesView: View {
+/// Machines — the dashboard telemetry sidebar as a tab body: per-account
+/// usage & pacing (7d + 5h bars with the pace marker) and the VM fleet.
+struct MachinesContent: View {
     @EnvironmentObject private var store: StateStore
 
     private var agents: [(String, AgentMeter)] {
-        if let a = store.state.agents, !a.isEmpty {
-            return a.keys.sorted().map { ($0, a[$0]!) }
-        }
+        if let a = store.state.agents, !a.isEmpty { return a.keys.sorted().map { ($0, a[$0]!) } }
         if store.state.quota != nil || store.state.governor != nil {
             return [("claude", AgentMeter(quota: store.state.quota, governor: store.state.governor))]
         }
@@ -18,68 +15,55 @@ struct MachinesView: View {
     private var vms: [VM] { store.state.vms ?? [] }
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if agents.isEmpty && vms.isEmpty {
-                    Hint(icon: "wifi.exclamationmark", title: "No telemetry",
-                         detail: store.lastError ?? "Waiting for orchid state.")
-                } else {
-                    list
+        Group {
+            if agents.isEmpty && vms.isEmpty {
+                Hint(icon: "server.rack", title: "No telemetry", detail: store.lastError ?? "Waiting for orchid state.")
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        if !agents.isEmpty {
+                            header("Usage & pacing")
+                            ForEach(agents, id: \.0) { UsageStrip(account: $0.0, meter: $0.1) }
+                        }
+                        if !vms.isEmpty {
+                            header("Machines").padding(.top, 18)
+                            ForEach(vms) { VMRow(vm: $0) }
+                        }
+                    }
+                    .padding(.vertical, 12)
                 }
-            }
-            .background(Theme.surface)
-            .navigationTitle("Machines")
-            .navigationBarTitleDisplayMode(.large)
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { ConnDot(link: store.link) } }
-        }
-        .onAppear { store.start() }
-    }
-
-    private var list: some View {
-        List {
-            if !agents.isEmpty {
-                Section {
-                    ForEach(agents, id: \.0) { UsageStrip(account: $0.0, meter: $0.1) }
-                } header: { head("Usage & pacing") }
-            }
-            if !vms.isEmpty {
-                Section {
-                    ForEach(vms) { VMRow(vm: $0) }
-                } header: { head("Machines") }
+                .refreshable { store.reconnect() }
             }
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.surface)
-        .refreshable { store.reconnect() }
     }
 
-    private func head(_ s: String) -> some View {
-        Text(s.uppercased()).font(Theme.mono(10, weight: .semibold)).tracking(1.4)
-            .foregroundStyle(Theme.muted)
+    private func header(_ s: String) -> some View {
+        Text(s.uppercased()).font(Theme.mono(9, weight: .semibold)).tracking(1.8)
+            .foregroundStyle(Theme.faint)
+            .padding(.horizontal, 16).padding(.bottom, 8)
     }
 }
-
-// ─── per-account usage strip ──────────────────────────────────────────────
 
 struct UsageStrip: View {
     let account: String
     let meter: AgentMeter
     private var q: Quota? { meter.quota }
     private var throttled: Bool { (q?.throttle?.mode ?? "allow") != "allow" }
-    private var tint: Color { account.hasPrefix("codex") ? Theme.emerald : Theme.orchid }
+    private var tint: Color { account.hasPrefix("codex") ? Theme.emerald : Theme.violet }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
+                AgentMark(agent: account.hasPrefix("codex") ? "codex" : "claude")
                 Text(account).font(.system(size: 14, weight: .medium)).foregroundStyle(Theme.ink)
                 if let plan = q?.planType, !plan.isEmpty {
                     Text(plan).font(Theme.mono(9)).foregroundStyle(Theme.faint)
                 }
                 Spacer()
-                if throttled {
-                    Text("throttled").font(Theme.mono(10, weight: .medium)).foregroundStyle(Theme.amber)
-                }
+                Text("\(Int((q?.sevenDayPct ?? 0).rounded()))%")
+                    .font(Theme.mono(13)).foregroundStyle(throttled ? Theme.amber : Theme.muted)
             }
             QuotaBar(pct: q?.sevenDayPct ?? 0, label: "7d", marker: q?.throttle?.targetPct,
                      fill: throttled ? Theme.amber : tint)
@@ -88,9 +72,7 @@ struct UsageStrip: View {
                 Text(reason).font(Theme.mono(10)).foregroundStyle(Theme.muted).lineLimit(2)
             }
         }
-        .padding(.vertical, 8).padding(.horizontal, 16)
-        .listRowInsets(EdgeInsets())
-        .listRowBackground(Theme.surface)
+        .padding(.horizontal, 16).padding(.vertical, 9)
     }
 }
 
@@ -100,7 +82,6 @@ struct QuotaBar: View {
     var marker: Double?
     var fill: Color
     var thin: Bool = false
-
     var body: some View {
         HStack(spacing: 8) {
             Text(label).font(Theme.mono(9)).foregroundStyle(Theme.faint).frame(width: 16, alignment: .leading)
@@ -116,13 +97,9 @@ struct QuotaBar: View {
                 }
             }
             .frame(height: thin ? 3 : 5)
-            Text("\(Int(pct.rounded()))%").font(Theme.mono(10)).foregroundStyle(Theme.muted)
-                .frame(width: 32, alignment: .trailing)
         }
     }
 }
-
-// ─── VM row ───────────────────────────────────────────────────────────────
 
 struct VMRow: View {
     let vm: VM
@@ -136,8 +113,6 @@ struct VMRow: View {
             Text("\(vm.used ?? 0)/\(vm.capacity ?? 0)")
                 .font(Theme.mono(11)).foregroundStyle(full ? Theme.amber : Theme.muted)
         }
-        .padding(.vertical, 7).padding(.horizontal, 16)
-        .listRowInsets(EdgeInsets())
-        .listRowBackground(Theme.surface)
+        .padding(.horizontal, 16).padding(.vertical, 7)
     }
 }
