@@ -1,269 +1,300 @@
 import SwiftUI
 
-/// Jobs list — mirrors the dashboard "list view": three groups
-/// (Needs you / Working / Awaiting review) over /api/state.
+/// Sessions — the GitHub-app-style list that mirrors the web dashboard's
+/// list view + the landing DashFrame mockup. Rows show a PR/CI glyph, the
+/// issue title, a `agent · repo · #issue · age` meta line, and a trailing
+/// status chip. Grouped by attention level. Live state comes from the
+/// shared StateStore (WS + poll).
 struct JobsView: View {
+    @EnvironmentObject private var store: StateStore
     @AppStorage("orchid.endpoint") private var endpoint: String = ""
-    @AppStorage("orchid.token")    private var captureToken: String = ""
-    @AppStorage("orchid.http_secret") private var httpSecret: String = ""
+    @State private var query = ""
 
-    @State private var jobs: [JobRow] = []
-    @State private var loading = false
-    @State private var lastError: String?
-    @State private var refreshTimer: Timer?
+    private var jobs: [Job] {
+        // The closed_jobs archive rides along in /api/state — keep it out
+        // of the live list (that was the old "merged sessions linger" bug).
+        (store.state.jobs ?? []).filter { !$0.isClosed }
+    }
+
+    private var filtered: [Job] {
+        guard !query.isEmpty else { return jobs }
+        let q = query.lowercased()
+        return jobs.filter {
+            ($0.issueTitle ?? "").lowercased().contains(q)
+            || $0.repoLabel.lowercased().contains(q)
+            || "\($0.issue)".contains(q)
+        }
+    }
+
+    private var groups: [(AttentionLevel, [Job])] {
+        let by = Dictionary(grouping: filtered) { attention($0).level }
+        return by.keys
+            .sorted { $0.order < $1.order }
+            .map { ($0, by[$0]!.sorted { attention($0).score > attention($1).score }) }
+    }
 
     var body: some View {
         NavigationStack {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text("Orchid")
-                        .font(.system(size: 36, weight: .medium, design: .serif).italic())
-                        .foregroundStyle(.primary)
-                    if !jobs.isEmpty {
-                        Text("\(jobs.count)")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button { Task { await refresh() } } label: {
-                        Image(systemName: "arrow.clockwise").font(.system(size: 16))
-                            .foregroundStyle(.secondary)
-                    }.disabled(loading)
-                }
-                .padding(.horizontal, 20).padding(.top, 32).padding(.bottom, 4)
-                Color.clear.frame(height: 90)
             Group {
                 if endpoint.isEmpty {
-                    setupCard
-                } else if jobs.isEmpty && lastError == nil {
-                    placeholder("tray", "No jobs yet",
-                                "File an inbox issue to spawn a session.")
-                } else if let err = lastError, jobs.isEmpty {
-                    placeholder("wifi.exclamationmark", "Couldn't reach orchid", err)
+                    SetupCard()
+                } else if jobs.isEmpty {
+                    EmptyState(error: store.lastError)
                 } else {
                     list
                 }
             }
-            .refreshable { await refresh() }
-            }
-            .overlay(alignment: .topLeading) {
-                Image("orchid-spray")
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 280, height: 210)
-                    .offset(x: -80, y: -50)
-                    .opacity(0.30)
-                    .foregroundStyle(Color(red: 0.49, green: 0.23, blue: 0.93))
-                    .allowsHitTesting(false)
-            }
-            .navigationBarHidden(true)
+            .background(Theme.surface.ignoresSafeArea())
+            .navigationTitle("")
+            .toolbar { toolbar }
+            .toolbarBackground(Theme.surface, for: .navigationBar)
         }
-        .task { await refresh() }
-        .onAppear {
-            refreshTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { _ in
-                Task { await refresh() }
-            }
-        }
-        .onDisappear { refreshTimer?.invalidate(); refreshTimer = nil }
+        .tint(Theme.orchid)
+        .onAppear { store.start() }
     }
 
-    private func placeholder(_ icon: String, _ title: String, _ subtitle: String) -> some View {
+    // ── list ────────────────────────────────────────────────────────
+    private var list: some View {
+        List {
+            ForEach(groups, id: \.0) { level, items in
+                Section {
+                    ForEach(items) { job in row(job) }
+                } header: {
+                    SectionHeader(title: level.title, count: items.count, color: level.color)
+                }
+            }
+            Color.clear.frame(height: 8).listRowBackground(Color.clear)
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(Theme.surface)
+        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search sessions")
+        .refreshable { store.reconnect() }
+    }
+
+    @ViewBuilder
+    private func row(_ job: Job) -> some View {
+        if job.tmuxName.isEmpty {
+            SessionRow(job: job).listRowBackground(Theme.surface)
+        } else {
+            NavigationLink {
+                PaneView(tmux: job.tmuxName, title: "\(job.repoLabel) · #\(job.issue)")
+            } label: {
+                SessionRow(job: job)
+            }
+            .listRowBackground(Theme.surface)
+        }
+    }
+
+    // ── toolbar (wordmark + live indicator) ───────────────────────────
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            HStack(spacing: 8) {
+                Text("Orchid").font(Theme.wordmark(28)).foregroundStyle(Theme.ink)
+                if !jobs.isEmpty {
+                    Text("\(jobs.count)").font(Theme.mono(12)).foregroundStyle(Theme.muted)
+                }
+            }
+        }
+        ToolbarItem(placement: .topBarTrailing) { ConnDot(link: store.link) }
+    }
+}
+
+// ─── row ────────────────────────────────────────────────────────────────
+
+struct SessionRow: View {
+    let job: Job
+    private var att: Attention { attention(job) }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            PRGlyph(job: job, level: att.level)
+                .frame(width: 18)
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(job.issueTitle?.isEmpty == false ? job.issueTitle! : "—")
+                    .font(.system(size: 15))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(2)
+                MetaLine(job: job)
+            }
+            Spacer(minLength: 8)
+            StatusChip(job: job, att: att)
+        }
+        .padding(.vertical, 5)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct MetaLine: View {
+    let job: Job
+    var body: some View {
+        let agent = (job.vm ?? "").contains("codex") ? "codex" : "claude"
+        let age = relAge(job.spawnedAt)
+        HStack(spacing: 5) {
+            Text(agent)
+            dot; Text(job.repoLabel)
+            dot; Text("#\(job.issue)")
+            if job.prNum > 0 { dot; Text("PR #\(job.prNum)") }
+            if !age.isEmpty { dot; Text(age) }
+        }
+        .font(Theme.mono(11))
+        .foregroundStyle(Theme.muted)
+        .lineLimit(1)
+    }
+    private var dot: some View { Text("·").foregroundStyle(Theme.faint) }
+}
+
+// ─── glyphs + chips ───────────────────────────────────────────────────────
+
+private struct PRGlyph: View {
+    let job: Job
+    let level: AttentionLevel
+    var body: some View {
+        if level == .working {
+            ProgressView().scaleEffect(0.7).tint(Theme.emerald)
+        } else if job.prNum > 0 {
+            Image(systemName: "arrow.triangle.pull")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Theme.orchid)
+        } else {
+            PulseDot(color: level.color, pulsing: level == .needsYou)
+        }
+    }
+}
+
+private struct PulseDot: View {
+    let color: Color
+    var pulsing: Bool
+    @State private var on = false
+    var body: some View {
+        Circle().fill(color).frame(width: 9, height: 9)
+            .overlay {
+                if pulsing {
+                    Circle().stroke(color, lineWidth: 2)
+                        .scaleEffect(on ? 2.1 : 1).opacity(on ? 0 : 0.7)
+                        .animation(.easeOut(duration: 1.6).repeatForever(autoreverses: false), value: on)
+                }
+            }
+            .onAppear { if pulsing { on = true } }
+    }
+}
+
+private struct StatusChip: View {
+    let job: Job
+    let att: Attention
+
+    var body: some View {
+        switch att.level {
+        case .needsYou:
+            chip("needs you", fg: Theme.rose, bg: Theme.rose.opacity(0.13))
+        case .watching:
+            switch ciStatus(job.lastCheckConclusions) {
+            case .pass: chip("✓ CI", fg: Theme.emerald, bg: Theme.emerald.opacity(0.13))
+            case .fail: chip("✕ CI", fg: Theme.rose,    bg: Theme.rose.opacity(0.13))
+            default:    chip("review", fg: Theme.amber, bg: Theme.amber.opacity(0.13))
+            }
+        case .working:
+            chip("working", fg: Theme.emerald, bg: Theme.emerald.opacity(0.12))
+        case .quiet:
+            EmptyView()
+        }
+    }
+
+    private func chip(_ text: String, fg: Color, bg: Color) -> some View {
+        Text(text)
+            .font(Theme.mono(10, weight: .medium))
+            .foregroundStyle(fg)
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(bg, in: Capsule())
+            .fixedSize()
+    }
+}
+
+// ─── header + chrome ──────────────────────────────────────────────────────
+
+private struct SectionHeader: View {
+    let title: String
+    let count: Int
+    let color: Color
+    var body: some View {
+        HStack(spacing: 7) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(title.uppercased())
+                .font(Theme.mono(10, weight: .semibold))
+                .tracking(1.2)
+                .foregroundStyle(Theme.muted)
+            Text("\(count)").font(Theme.mono(10)).foregroundStyle(Theme.faint)
+            Spacer()
+        }
+        .textCase(nil)
+        .padding(.vertical, 2)
+    }
+}
+
+struct ConnDot: View {
+    let link: StateStore.Link
+    var body: some View {
+        let (c, label): (Color, String) = {
+            switch link {
+            case .live:    return (Theme.emerald, "live")
+            case .polling: return (Theme.amber, "sync")
+            case .offline: return (Theme.faint, "offline")
+            }
+        }()
+        return HStack(spacing: 5) {
+            Circle().fill(c).frame(width: 7, height: 7)
+            Text(label).font(Theme.mono(10)).foregroundStyle(Theme.muted)
+        }
+    }
+}
+
+private struct EmptyState: View {
+    let error: String?
+    var body: some View {
         VStack(spacing: 10) {
-            Image(systemName: icon)
-                .font(.system(size: 44, weight: .thin))
-                .foregroundStyle(.secondary)
-            Text(title).font(.system(.body, design: .monospaced))
-            Text(subtitle)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Image(systemName: error == nil ? "tray" : "wifi.exclamationmark")
+                .font(.system(size: 42, weight: .thin))
+                .foregroundStyle(Theme.faint)
+            Text(error == nil ? "No active sessions" : "Couldn't reach orchid")
+                .font(Theme.mono(13)).foregroundStyle(Theme.ink)
+            Text(error ?? "File an inbox issue to spawn one.")
+                .font(.caption).foregroundStyle(Theme.muted)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
-    }
-
-    private var setupCard: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "gearshape")
-                .font(.system(size: 48, weight: .thin))
-                .foregroundStyle(.secondary)
-            Text("Add your orchid endpoint")
-                .font(.system(.body, design: .monospaced))
-            Text("Open Capture → settings to set it.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(40)
-    }
-
-    private var list: some View {
-        List {
-            section("Needs you", color: .pink,    items: jobs.filter { $0.group == .needs })
-            section("Working",   color: .green,   items: jobs.filter { $0.group == .working })
-            section("Awaiting review", color: .orange, items: jobs.filter { $0.group == .review })
-            section("Quiet",     color: .gray,    items: jobs.filter { $0.group == .quiet })
-        }
-        .listStyle(.plain)
-    }
-
-    @ViewBuilder
-    private func section(_ title: String, color: Color, items: [JobRow]) -> some View {
-        if !items.isEmpty {
-            Section {
-                ForEach(items) { row in
-                    if row.tmux.isEmpty {
-                        // Cron row not currently running — no pane to open.
-                        JobCell(row: row, dotColor: color)
-                    } else {
-                        NavigationLink {
-                            PaneView(tmux: row.tmux,
-                                     title: "\(row.repo) · #\(row.issue)")
-                        } label: {
-                            JobCell(row: row, dotColor: color)
-                        }
-                    }
-                }
-            } header: {
-                HStack {
-                    Text(title)
-                        .font(.system(.title3, design: .serif).italic())
-                        .foregroundStyle(.primary)
-                    Text("\(items.count)")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-                .textCase(nil)
-                .padding(.top, 4)
-            }
-        }
-    }
-
-    private func refresh() async {
-        loading = true; defer { loading = false }
-        guard let base = baseURL(),
-              let stateURL = URL(string: "\(base.absoluteString)/api/state")
-        else { lastError = "bad endpoint"; return }
-        var req = URLRequest(url: stateURL)
-        req.timeoutInterval = 8
-        if !httpSecret.isEmpty {
-            req.setValue("Bearer \(httpSecret)", forHTTPHeaderField: "Authorization")
-        }
-        do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse else { lastError = "no http"; return }
-            if http.statusCode == 401 || http.statusCode == 403 {
-                lastError = "auth rejected — add http_secret in Capture settings"
-                return
-            }
-            if http.statusCode >= 400 {
-                lastError = "http \(http.statusCode)"; return
-            }
-            let decoded = try JSONDecoder().decode(StateResp.self, from: data)
-            jobs = decoded.jobs.map(JobRow.from)
-            lastError = nil
-        } catch {
-            lastError = error.localizedDescription
-        }
-    }
-
-    private func baseURL() -> URL? {
-        guard let u = URL(string: endpoint) else { return nil }
-        var s = u.absoluteString
-        for suffix in ["/api/drafts", "/api/state", "/"] {
-            if s.hasSuffix(suffix) { s.removeLast(suffix.count); break }
-        }
-        return URL(string: s)
+        .background(Theme.surface)
     }
 }
 
-private struct JobCell: View {
-    let row: JobRow
-    let dotColor: Color
-
+private struct SetupCard: View {
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Circle().fill(dotColor).frame(width: 8, height: 8)
-                .padding(.top, 7)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(row.title.isEmpty ? "—" : row.title)
-                    .font(.system(.body))
-                    .foregroundStyle(.primary)
-                HStack(spacing: 4) {
-                    Text(row.repo)
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                    Text("·").foregroundStyle(.secondary)
-                    Text("#\(row.issue)")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                    if row.pr > 0 {
-                        Text("·").foregroundStyle(.secondary)
-                        Text("PR #\(row.pr)")
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            Spacer()
+        VStack(spacing: 12) {
+            Text("Orchid").font(Theme.wordmark(40)).foregroundStyle(Theme.ink)
+            Image(systemName: "gearshape").font(.system(size: 40, weight: .thin))
+                .foregroundStyle(Theme.faint)
+            Text("Add your orchid endpoint")
+                .font(Theme.mono(13)).foregroundStyle(Theme.ink)
+            Text("Settings tab → endpoint + dashboard token.")
+                .font(.caption).foregroundStyle(Theme.muted)
         }
-        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(40)
+        .background(Theme.surface)
     }
 }
 
-// ─── data ───────────────────────────────────────────────────────────
-
-private struct StateResp: Decodable {
-    let jobs: [JobAPI]
-}
-
-private struct JobAPI: Decodable {
-    let issue: Int
-    let tmux: String
-    let target: String?
-    let target_repo: String?
-    let issue_title: String?
-    let pr: Int?
-    let needs_input: Bool?
-    let last_check_conclusions: [String: String]?
-}
-
-struct JobRow: Identifiable {
-    let id: String
-    let issue: Int
-    let tmux: String
-    let pr: Int
-    let title: String
-    let repo: String
-    let group: Group
-    enum Group { case needs, working, review, quiet }
-
-    fileprivate static func from(_ j: JobAPI) -> JobRow {
-        let repoLabel: String = {
-            if let r = j.target_repo, !r.isEmpty { return String(r.split(separator: "/").last ?? Substring(r)) }
-            return j.target ?? "—"
-        }()
-        let group: Group = {
-            if j.needs_input == true { return .needs }
-            if j.pr ?? 0 > 0 {
-                if let checks = j.last_check_conclusions {
-                    if checks.values.contains("FAILURE") { return .needs }
-                    if checks.values.contains("IN_PROGRESS") || checks.values.contains("PENDING") { return .working }
-                }
-                return .review
-            }
-            return .working
-        }()
-        return JobRow(
-            // Issue # disambiguates cron rows that haven't fired and have
-            // empty tmux — otherwise ForEach trips on duplicate ids.
-            id: "\(j.issue)-\(j.tmux)",
-            issue: j.issue,
-            tmux: j.tmux,
-            pr: j.pr ?? 0,
-            title: j.issue_title ?? "",
-            repo: repoLabel,
-            group: group
-        )
+// attention-level → swatch
+extension AttentionLevel {
+    var color: Color {
+        switch self {
+        case .needsYou: return Theme.rose
+        case .watching: return Theme.amber
+        case .working:  return Theme.emerald
+        case .quiet:    return Theme.zinc
+        }
     }
 }
