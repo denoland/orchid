@@ -383,9 +383,6 @@ func describe(cfg *Config, st *State, hostname string) string {
 	if cfg.Orch.HTTPAddr != "" {
 		fmt.Fprintf(&b, "- Dashboard:    http://%s%s/\n", hostname, cfg.Orch.HTTPAddr)
 	}
-	if cfg.Orch.NtfyTopic != "" {
-		fmt.Fprintf(&b, "- ntfy topic:   %s\n", cfg.Orch.NtfyTopic)
-	}
 	b.WriteString("\nTargets (label → work repo):\n")
 	for _, t := range cfg.Targets {
 		fmt.Fprintf(&b, "- `%s` → %s\n", t.Label, t.Repo)

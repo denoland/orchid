@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -284,9 +283,9 @@ func needsInputForIssue(n int) bool {
 }
 
 // ingestNotify processes one notify.jsonl line: a Notification sets the issue's
-// needs-input flag (and fires ntfy on the rising edge); UserPromptSubmit clears
-// it. issue is resolved from the event cwd.
-func ingestNotify(line []byte, ntfyTopic string) {
+// needs-input flag (surfaced as a dashboard badge); UserPromptSubmit clears it.
+// issue is resolved from the event cwd.
+func ingestNotify(line []byte) {
 	var e notifyEvent
 	if err := json.Unmarshal(line, &e); err != nil {
 		return
@@ -307,11 +306,6 @@ func ingestNotify(line []byte, ntfyTopic string) {
 		needsInputMu.Unlock()
 		if rising {
 			log.Printf("issue #%d: needs input (notify: %s)", n, strings.TrimSpace(e.Message))
-			msg := e.Message
-			if msg == "" {
-				msg = "Claude is waiting for input"
-			}
-			ntfyNotify(ntfyTopic, fmt.Sprintf("issue #%d needs input", n), msg, "")
 		}
 	case "UserPromptSubmit", "Stop":
 		needsInputMu.Lock()
@@ -322,7 +316,7 @@ func ingestNotify(line []byte, ntfyTopic string) {
 
 // tailNotify follows ~/.claude/notify.jsonl on a claude VM (the Notification /
 // UserPromptSubmit hook feed), mirroring tailStatusLine. Started per claude VM.
-func tailNotify(ctx context.Context, vm VMBlock, ntfyTopic string, bcast chan<- struct{}) {
+func tailNotify(ctx context.Context, vm VMBlock, bcast chan<- struct{}) {
 	path := claudeHome(vm) + "/.claude/notify.jsonl"
 	log.Printf("usage: tailing %s on %s", path, vm.Name)
 	for ctx.Err() == nil {
@@ -344,7 +338,7 @@ func tailNotify(ctx context.Context, vm VMBlock, ntfyTopic string, bcast chan<- 
 		sc := bufio.NewScanner(stdout)
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
-			ingestNotify(sc.Bytes(), ntfyTopic)
+			ingestNotify(sc.Bytes())
 			if bcast != nil {
 				select {
 				case bcast <- struct{}{}:

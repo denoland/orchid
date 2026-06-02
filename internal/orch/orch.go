@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -117,7 +116,6 @@ type OrchBlock struct {
 	AllowedLogins []string       `hcl:"allowed_logins,optional" json:"allowed_logins,omitempty"`
 	BotLogin      string         `hcl:"bot_login,optional" json:"bot_login,omitempty"`
 	BotEmail      string         `hcl:"bot_email,optional" json:"bot_email,omitempty"`
-	NtfyTopic     string         `hcl:"ntfy_topic,optional" json:"ntfy_topic,omitempty"`
 	BotGithubKey  string         `hcl:"bot_github_key,optional" json:"bot_github_key,omitempty"`
 	Mentions      *MentionsBlock `hcl:"mentions,block" json:"mentions,omitempty"`
 	Capture       *CaptureBlock  `hcl:"capture,block" json:"capture,omitempty"`
@@ -1820,27 +1818,6 @@ func diffPR(t *prTracker, v *PRView, botLogin string) (
 	return
 }
 
-func ntfyNotify(topic, title, msg, clickURL string) {
-	if topic == "" {
-		return
-	}
-	req, err := http.NewRequest("POST", "https://ntfy.sh/"+topic, strings.NewReader(msg))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Title", title)
-	req.Header.Set("Priority", "default")
-	if clickURL != "" {
-		req.Header.Set("Click", clickURL)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("ntfy: %v", err)
-		return
-	}
-	resp.Body.Close()
-}
-
 func oneLine(s string, max int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	if len(s) > max {
@@ -1946,8 +1923,8 @@ func summarizeExternal(repo string, num int, v *PRView, nr, ntc, nic []string, p
 }
 
 // maxReviewRepokes caps how many times orch re-surfaces an unaddressed review /
-// failing CI before escalating to a human (ntfy) and backing off — so a session
-// that genuinely can't act doesn't get nudged forever.
+// failing CI before logging a needs-human escalation and backing off — so a
+// session that genuinely can't act doesn't get nudged forever.
 const maxReviewRepokes = 4
 
 // resurfaceMsg is the reminder orch re-sends when a CHANGES_REQUESTED review or
