@@ -46,59 +46,133 @@ struct MachinesContent: View {
     }
 }
 
+enum Hot { case none, amber, red }
+
+/// 1:1 with the web QuotaStrip (stacked variant): left column = brand mark +
+/// label + the 5h/7d bars + governor line; right column = the big weekly %.
 struct UsageStrip: View {
     let account: String
     let meter: AgentMeter
     private var q: Quota? { meter.quota }
-    private var throttled: Bool { (q?.throttle?.mode ?? "allow") != "allow" }
-    private var tint: Color { account.hasPrefix("codex") ? Theme.emerald : Theme.violet }
+    private var g: Governor? { meter.governor }
+
+    private var sevenHot: Hot {
+        switch q?.throttle?.mode {
+        case "pause_5h", "pause_week": return .red
+        case "throttle": return .amber
+        default: return .none
+        }
+    }
+    private var bigColor: Color {
+        switch sevenHot { case .red: return Theme.rose; case .amber: return Theme.amber; case .none: return Theme.ink }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 7) {
-                AgentMark(agent: account.hasPrefix("codex") ? "codex" : "claude")
-                Text(account).font(.system(size: 14, weight: .medium)).foregroundStyle(Theme.ink)
-                if let plan = q?.planType, !plan.isEmpty {
-                    Text(plan).font(Theme.mono(9)).foregroundStyle(Theme.faint)
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    AgentMark(agent: account.hasPrefix("codex") ? "codex" : "claude")
+                    Text(account).font(Theme.mono(12)).foregroundStyle(Theme.muted)
+                    if let plan = q?.planType, !plan.isEmpty {
+                        Text(plan).font(Theme.mono(9)).foregroundStyle(Theme.faint)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(Theme.searchBg, in: RoundedRectangle(cornerRadius: 4))
+                    }
                 }
-                Spacer()
-                Text("\(Int((q?.sevenDayPct ?? 0).rounded()))%")
-                    .font(Theme.mono(13)).foregroundStyle(throttled ? Theme.amber : Theme.muted)
+                VStack(alignment: .leading, spacing: 6) {
+                    QuotaBar(label: "5h", pct: q?.fiveHourPct ?? 0,
+                             resets: q?.fiveHourResetsAt ?? 0, window: 5 * 3600)
+                    QuotaBar(label: "7d", pct: q?.sevenDayPct ?? 0,
+                             resets: q?.sevenDayResetsAt ?? 0, window: 7 * 24 * 3600,
+                             forcedHot: sevenHot, target: q?.throttle?.targetPct)
+                }
+                if let g, g.enabled == true { GovStrip(g: g) }
             }
-            QuotaBar(pct: q?.sevenDayPct ?? 0, label: "7d", marker: q?.throttle?.targetPct,
-                     fill: throttled ? Theme.amber : tint)
-            QuotaBar(pct: q?.fiveHourPct ?? 0, label: "5h", marker: nil, fill: tint, thin: true)
-            if throttled, let reason = q?.throttle?.reason, !reason.isEmpty {
-                Text(reason).font(Theme.mono(10)).foregroundStyle(Theme.muted).lineLimit(2)
+            Spacer(minLength: 8)
+            VStack(spacing: 3) {
+                HStack(alignment: .firstTextBaseline, spacing: 1) {
+                    Text("\(Int((q?.sevenDayPct ?? 0).rounded()))")
+                        .font(Theme.mono(32, weight: .semibold)).foregroundStyle(bigColor)
+                    Text("%").font(.system(size: 14)).foregroundStyle(Theme.muted)
+                }
+                Text("7D").font(Theme.mono(9)).tracking(2).foregroundStyle(Theme.faint)
             }
         }
-        .padding(.horizontal, 16).padding(.vertical, 9)
+        .padding(12)
+        .background(Theme.panel, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.line, lineWidth: 1))
+        .padding(.horizontal, 16).padding(.vertical, 5)
     }
 }
 
 struct QuotaBar: View {
-    let pct: Double
     let label: String
-    var marker: Double?
-    var fill: Color
-    var thin: Bool = false
+    let pct: Double
+    let resets: Double
+    let window: Double
+    var forcedHot: Hot? = nil
+    var target: Double? = nil
+
+    private var hot: Hot {
+        if let f = forcedHot { return f }
+        let elapsed = min(100, max(0, (1 - max(0, resets - now()) / window) * 100))
+        return pct > elapsed + 5 ? .amber : .none
+    }
+    private var track: Color {
+        switch hot { case .red: return Theme.rose.opacity(0.28); case .amber: return Theme.amber.opacity(0.28); case .none: return Theme.line }
+    }
+    private var fill: Color {
+        switch hot { case .red: return Theme.rose; case .amber: return Theme.amber; case .none: return Theme.emerald }
+    }
+
     var body: some View {
-        HStack(spacing: 8) {
-            Text(label).font(Theme.mono(9)).foregroundStyle(Theme.faint).frame(width: 16, alignment: .leading)
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Theme.line)
-                    Capsule().fill(pct >= 95 ? Theme.rose : fill)
-                        .frame(width: max(0, min(1, pct / 100)) * geo.size.width)
-                    if let m = marker, m > 0, m < 100 {
-                        Rectangle().fill(Theme.ink.opacity(0.5)).frame(width: 1.5)
-                            .offset(x: (m / 100) * geo.size.width)
-                    }
+        HStack(spacing: 6) {
+            Text(label).font(Theme.mono(10)).foregroundStyle(Theme.muted).frame(width: 18, alignment: .leading)
+            ZStack(alignment: .leading) {
+                Capsule().fill(track)
+                Capsule().fill(fill).frame(width: clamp(pct) / 100 * 80)
+                if let t = target, t > 0, t < 100 {
+                    Rectangle().fill(Theme.muted.opacity(0.7)).frame(width: 1)
+                        .offset(x: clamp(t) / 100 * 80)
                 }
             }
-            .frame(height: thin ? 3 : 5)
+            .frame(width: 80, height: 6)
+            Text("\(Int(pct.rounded()))%").font(Theme.mono(10)).foregroundStyle(Theme.muted)
+                .frame(width: 30, alignment: .leading)
+            Text(fmtReset(resets - now())).font(Theme.mono(10)).foregroundStyle(Theme.faint)
         }
     }
+    private func clamp(_ v: Double) -> Double { min(100, max(0, v)) }
+}
+
+/// Compact governor readout — cap (active/paused) · burn≷target · →proj%.
+struct GovStrip: View {
+    let g: Governor
+    var body: some View {
+        let onFive = g.binding == "5h"
+        let burn = onFive ? (g.burnFive ?? 0) : (g.burnWeekly ?? 0)
+        let target = onFive ? (g.targetFive ?? 0) : (g.targetWeekly ?? 0)
+        let over = burn > target + 0.05
+        let cap = (g.effectiveCap ?? -1) < 0 ? "∞" : "\(g.effectiveCap ?? 0)"
+        let proj = g.projectedEndPct ?? 0
+        return HStack(spacing: 6) {
+            Text("cap \(cap) (\(g.active ?? 0)\((g.paused ?? 0) > 0 ? "/\(g.paused ?? 0)❄" : ""))")
+                .foregroundStyle(Theme.muted)
+            Text("\(burn, specifier: "%.1f")\(over ? "›" : "≤")\(target, specifier: "%.1f")%/h")
+                .foregroundStyle(over ? Theme.amber : Theme.muted)
+            Text("→\(Int(proj))%").foregroundStyle(proj > 92 ? Theme.amber : Theme.muted)
+        }
+        .font(Theme.mono(10))
+    }
+}
+
+private func now() -> Double { Date().timeIntervalSince1970 }
+private func fmtReset(_ secs: Double) -> String {
+    if secs <= 0 { return "now" }
+    let h = Int(secs) / 3600, m = (Int(secs) % 3600) / 60, d = Int(secs) / 86400
+    if d > 0 { return "\(d)d\(h % 24)h" }
+    if h > 0 { return "\(h)h\(m)m" }
+    return "\(m)m"
 }
 
 struct VMRow: View {

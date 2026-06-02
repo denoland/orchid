@@ -15,13 +15,11 @@ struct OrchidCaptureApp: App {
     }
 }
 
-enum Tab: String, CaseIterable { case sessions, machines, analytics, memory, settings
+enum Tab: String, CaseIterable { case sessions, machines, settings
     var label: String {
         switch self {
         case .sessions: return "Sessions"
         case .machines: return "Machines"
-        case .analytics: return "Analytics"
-        case .memory: return "Memory"
         case .settings: return "Settings"
         }
     }
@@ -59,10 +57,6 @@ struct RootView: View {
         case .sessions:  SessionsList(q: q)
         case .machines:  MachinesContent()
         case .settings:  SettingsForm()
-        case .analytics: Hint(icon: "chart.bar", title: "Analytics",
-                              detail: "Usage charts live on the web dashboard.")
-        case .memory:    Hint(icon: "doc.text", title: "Memory",
-                              detail: "The shared memory log lives on the web dashboard.")
         }
     }
 }
