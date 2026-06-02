@@ -717,11 +717,6 @@ func tick(cfg *Config, st *State) {
 			}
 			j.PR = pr.Number
 			log.Printf("issue #%d: found PR #%d in %s", n, j.PR, j.TargetRepo)
-			prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
-			ntfyNotify(cfg.Orch.NtfyTopic,
-				fmt.Sprintf("PR opened: issue #%d", n),
-				fmt.Sprintf("%s\n%s", j.Branch, prURL),
-				prURL)
 			saveStateLogged(st)
 		}
 		// Token-saving: if this session's context has grown too large (or it's
@@ -738,13 +733,6 @@ func tick(cfg *Config, st *State) {
 			continue
 		}
 		if v.State == "MERGED" || v.State == "CLOSED" {
-			if v.State == "MERGED" && j.PR != 0 {
-				prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
-				ntfyNotify(cfg.Orch.NtfyTopic,
-					fmt.Sprintf("PR merged: issue #%d", n),
-					fmt.Sprintf("%s/pull/%d merged ✓", j.TargetRepo, j.PR),
-					prURL)
-			}
 			closedState := "merged"
 			if v.State == "CLOSED" {
 				closedState = "closed"
@@ -943,10 +931,6 @@ func tick(cfg *Config, st *State) {
 				j.RelayPokes++
 				if j.RelayPokes >= maxReviewRepokes {
 					log.Printf("issue #%d: PR #%d review/CI unaddressed after %d nudges — escalating to human", n, j.PR, j.RelayPokes)
-					ntfyNotify(cfg.Orch.NtfyTopic,
-						fmt.Sprintf("needs human: issue #%d", n),
-						fmt.Sprintf("PR #%d has an unaddressed review/CI after %d nudges", j.PR, j.RelayPokes),
-						fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR))
 				}
 			}
 		}

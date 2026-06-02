@@ -1086,8 +1086,8 @@ func Main() {
 		} else {
 			go tailStatusLine(ctx, vm, st.Bcast)
 			// Reliable needs-input detection from claude's Notification /
-			// UserPromptSubmit hooks (notify.jsonl), + ntfy on the rising edge.
-			go tailNotify(ctx, vm, cfg.Orch.NtfyTopic, st.Bcast)
+			// UserPromptSubmit hooks (notify.jsonl); surfaced as a dashboard badge.
+			go tailNotify(ctx, vm, st.Bcast)
 		}
 	}
 

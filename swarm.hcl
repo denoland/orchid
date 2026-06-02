@@ -10,7 +10,6 @@ orchestrator {
   http_addr     = ":8000"
   http_secret   = "123"
   bot_login     = "divybot"
-  ntfy_topic    = "orchid-divy-7f3k9"
 
   # Git-backed shared memory. Agents' auto-memory is redirected per target repo
   # into a clone of this repo (memory/<owner>/<repo>/*.md); orch commits + pushes
