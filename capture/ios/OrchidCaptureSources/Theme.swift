@@ -21,10 +21,18 @@ enum Theme {
 
     // ── accent + status ───────────────────────────────────────────────
     static let orchid  = dyn(light: 0x7C3AED, dark: 0xA78BFA)
-    static let rose    = dyn(light: 0xF43F5E, dark: 0xFB7185) // needs-you
+    static let rose    = dyn(light: 0xF43F5E, dark: 0xFB7185) // needs-you / CI fail
     static let amber   = dyn(light: 0xF59E0B, dark: 0xFBBF24) // watching
-    static let emerald = dyn(light: 0x10B981, dark: 0x34D399) // working
+    static let emerald = dyn(light: 0x10B981, dark: 0x34D399) // working / CI pass / PR open
     static let zinc    = dyn(light: 0xD4D4D8, dark: 0x52525B) // quiet
+    static let sky     = dyn(light: 0x0EA5E9, dark: 0x38BDF8) // building, no PR yet
+    static let violet  = dyn(light: 0x8B5CF6, dark: 0xA78BFA) // merged
+    static let claudeMark = dyn(light: 0xCC7C5A, dark: 0xCC7C5A)
+
+    // chrome
+    static let navBg   = dyn(light: 0xFFFFFF, dark: 0x09090B)
+    static let chipBg  = dyn(light: 0xE5E5EA, dark: 0x3F3F46)
+    static let searchBg = dyn(light: 0xF1F1F3, dark: 0x27272A)
 
     // ── type ──────────────────────────────────────────────────────────
     /// The "Orchid" wordmark — Cormorant on web; system serif italic here.

@@ -18,20 +18,17 @@ struct ContentView: View {
     private var canSpawn: Bool { !endpoint.isEmpty && !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
     var body: some View {
-        NavigationStack {
-            VStack(alignment: .leading, spacing: 14) {
-                composer
-                statusLine
-                Spacer()
-            }
-            .padding(16)
-            .background(Theme.surface)
-            .navigationTitle("Capture")
-            .navigationBarTitleDisplayMode(.large)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) { routeMenu }
-            }
+        VStack(alignment: .leading, spacing: 14) {
+            composer
+            statusLine
+            Spacer()
         }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Theme.surface)
+        .navigationTitle("Capture")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .topBarLeading) { routeMenu } }
         .onReceive(transcriber.$transcript) { t in
             if recorder.isRecording, !t.isEmpty { note = t }
         }

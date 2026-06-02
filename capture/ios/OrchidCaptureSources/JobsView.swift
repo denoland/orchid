@@ -1,73 +1,93 @@
 import SwiftUI
 
-/// Sessions — the dashboard list view. Tight, single-line rows: a state
-/// glyph, the issue title, a `agent · repo · #issue · age` meta line, and
-/// a trailing CI/attention marker. needs-you rows get a rose left rule +
-/// faint tint (matching the web .dmn-row.needs). Live state from StateStore.
-struct JobsView: View {
+/// Sessions — a 1:1 port of the web dashboard ListView: one flat, hairline-
+/// divided list. Live sessions sort by attention (needs-you first), closed
+/// "ghosts" are deduped one-per-issue and sink to the bottom, dimmed. Each
+/// row is the dashboard SessionRow — PR-status octicon, title, and a
+/// `agent · repo · age` meta line with the needs-input tag.
+struct SessionsList: View {
     @EnvironmentObject private var store: StateStore
     @AppStorage("orchid.endpoint") private var endpoint: String = ""
-    @State private var query = ""
+    let q: String
 
-    private var jobs: [Job] {
-        (store.state.jobs ?? []).filter { !$0.isClosed }
-    }
-
-    private var filtered: [Job] {
-        guard !query.isEmpty else { return jobs }
-        let q = query.lowercased()
-        return jobs.filter {
-            ($0.issueTitle ?? "").lowercased().contains(q)
-            || $0.repoLabel.lowercased().contains(q)
-            || "\($0.issue)".contains(q)
+    private var rows: [Job] {
+        let all = store.state.jobs ?? []
+        var live: [Job] = []
+        var byIssue: [Int: Job] = [:]
+        for j in all {
+            if j.isClosed {
+                if let p = byIssue[j.issue], (p.closedAt ?? 0) >= (j.closedAt ?? 0) { continue }
+                byIssue[j.issue] = j
+            } else if !j.tmuxName.isEmpty {
+                live.append(j)
+            }
         }
-    }
-
-    private var groups: [(AttentionLevel, [Job])] {
-        let by = Dictionary(grouping: filtered) { attention($0).level }
-        return by.keys.sorted { $0.order < $1.order }
-            .map { ($0, by[$0]!.sorted { attention($0).score > attention($1).score }) }
+        var merged = live + Array(byIssue.values)
+        let term = q.trimmingCharacters(in: .whitespaces).lowercased()
+        if !term.isEmpty {
+            merged = merged.filter {
+                ($0.issueTitle ?? "").lowercased().contains(term)
+                || ($0.targetRepo ?? "").lowercased().contains(term)
+                || "\($0.issue)".contains(term)
+                || $0.tmuxName.lowercased().contains(term)
+            }
+        }
+        func rank(_ j: Job) -> Int {
+            if j.isClosed { return 4 }
+            switch attention(j).level {
+            case .needsYou: return 0; case .working: return 1
+            case .watching: return 2; case .quiet: return 3
+            }
+        }
+        func ts(_ j: Job) -> Double { isoMillis(j.spawnedAt) }
+        return merged.sorted { a, b in
+            let (ra, rb) = (rank(a), rank(b))
+            return ra != rb ? ra < rb : ts(a) > ts(b)
+        }
     }
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if endpoint.isEmpty {
-                    Hint(icon: "gearshape", title: "Add your endpoint",
-                         detail: "Settings → endpoint + dashboard token.")
-                } else if jobs.isEmpty {
-                    Hint(icon: store.lastError == nil ? "tray" : "wifi.exclamationmark",
-                         title: store.lastError == nil ? "No active sessions" : "Can’t reach orchid",
-                         detail: store.lastError ?? "File an inbox issue to spawn one.")
-                } else {
-                    list
+        Group {
+            if endpoint.isEmpty {
+                Hint(icon: "gearshape", title: "Add your endpoint",
+                     detail: "Settings → endpoint + dashboard token.")
+            } else if rows.isEmpty {
+                empty
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(rows) { job in
+                            row(job)
+                            Rectangle().fill(Theme.line).frame(height: 1).padding(.leading, 12)
+                        }
+                    }
                 }
+                .refreshable { store.reconnect() }
             }
-            .background(Theme.surface)
-            .navigationTitle("Sessions")
-            .navigationBarTitleDisplayMode(.large)
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { ConnDot(link: store.link) } }
         }
-        .onAppear { store.start() }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.surface)
     }
 
-    private var list: some View {
-        List {
-            ForEach(groups, id: \.0) { level, items in
-                Section {
-                    ForEach(items) { SessionRow(job: $0) }
-                } header: {
-                    Text(level.title.uppercased())
-                        .font(Theme.mono(10, weight: .semibold)).tracking(1.4)
-                        .foregroundStyle(Theme.muted)
-                }
-            }
+    @ViewBuilder private func row(_ job: Job) -> some View {
+        if job.isClosed || job.tmuxName.isEmpty {
+            SessionRow(job: job)
+        } else {
+            NavigationLink {
+                PaneView(tmux: job.tmuxName, title: "\(job.repoLabel) · #\(job.issue)")
+            } label: { SessionRow(job: job) }
+            .buttonStyle(.plain)
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
-        .background(Theme.surface)
-        .searchable(text: $query, prompt: "Search sessions")
-        .refreshable { store.reconnect() }
+    }
+
+    private var empty: some View {
+        VStack(spacing: 6) {
+            Text(q.isEmpty ? "Empty" : "No matches")
+                .font(Theme.serif(28).italic()).foregroundStyle(Theme.muted)
+            Text(q.isEmpty ? "Open an inbox issue to spawn a session." : "Try a different search.")
+                .font(.system(size: 13)).foregroundStyle(Theme.faint)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -75,116 +95,118 @@ struct JobsView: View {
 
 struct SessionRow: View {
     let job: Job
+    private var ghost: Bool { job.isClosed }
     private var att: Attention { attention(job) }
-    private var needs: Bool { att.level == .needsYou }
+    private var needs: Bool { !ghost && att.level == .needsYou }
 
     var body: some View {
-        let content = HStack(spacing: 11) {
-            StateGlyph(job: job, level: att.level).frame(width: 16)
+        HStack(spacing: 12) {
+            PrStatusIcon(job: job, active: att.level == .working)
             VStack(alignment: .leading, spacing: 2) {
-                Text(job.issueTitle?.isEmpty == false ? job.issueTitle! : "—")
-                    .font(.system(size: 14, weight: needs ? .semibold : .regular))
-                    .foregroundStyle(Theme.ink)
+                Text(job.issueTitle?.isEmpty == false ? job.issueTitle! : (job.tmuxName.isEmpty ? "—" : job.tmuxName))
+                    .font(.system(size: 14, weight: ghost ? .regular : (needs ? .semibold : .medium)))
+                    .foregroundStyle(ghost ? Theme.muted : Theme.ink)
                     .lineLimit(1)
-                Text(meta).font(Theme.mono(11)).foregroundStyle(Theme.faint).lineLimit(1)
+                meta
             }
-            Spacer(minLength: 8)
-            Trailing(job: job, level: att.level)
+            Spacer(minLength: 4)
         }
-        .padding(.vertical, 9)
-        .padding(.trailing, 16)
-        .padding(.leading, 16)
+        .padding(.vertical, 10).padding(.horizontal, 12)
+        .overlay(alignment: .leading) {
+            if needs { Rectangle().fill(Theme.rose).frame(width: 2) }
+        }
+        .background(needs ? Theme.rose.opacity(0.06) : Color.clear)
+        .opacity(ghost ? 0.55 : 1)
+        .contentShape(Rectangle())
+    }
 
-        return Group {
-            if job.tmuxName.isEmpty {
-                content
+    private var agent: String {
+        let t = job.tmuxName.lowercased()
+        if t.hasPrefix("codex") { return "codex" }
+        if t.hasPrefix("claude") { return "claude" }
+        return "unknown"
+    }
+
+    private var meta: some View {
+        HStack(spacing: 6) {
+            AgentMark(agent: agent)
+            Text(job.repoLabel).font(Theme.mono(11)).foregroundStyle(Theme.muted)
+            if ghost {
+                Text(job.closedState ?? "")
+                    .font(Theme.mono(11))
+                    .foregroundStyle(job.closedState == "merged" ? Theme.violet : Theme.muted)
             } else {
-                NavigationLink {
-                    PaneView(tmux: job.tmuxName, title: "\(job.repoLabel) · #\(job.issue)")
-                } label: { content }
+                let age = relAge(job.spawnedAt)
+                if !age.isEmpty {
+                    Text("·").foregroundStyle(Theme.faint)
+                    Text(age).font(Theme.mono(11)).foregroundStyle(Theme.muted)
+                }
+                if needs {
+                    Text((job.needsInput ?? false) ? "needs input" : att.reason)
+                        .font(Theme.mono(9, weight: .medium)).tracking(0.5)
+                        .foregroundStyle(Theme.rose)
+                        .padding(.horizontal, 6).padding(.vertical, 1)
+                        .background(Theme.rose.opacity(0.14), in: Capsule())
+                }
             }
         }
-        .listRowInsets(EdgeInsets())
-        .listRowBackground(
-            ZStack(alignment: .leading) {
-                (needs ? Theme.rose.opacity(0.06) : Color.clear)
-                if needs { Rectangle().fill(Theme.rose).frame(width: 3) }
-            }
-        )
-    }
-
-    private var meta: String {
-        let agent = (job.vm ?? "").contains("codex") ? "codex" : "claude"
-        var parts = [agent, job.repoLabel, "#\(job.issue)"]
-        if job.prNum > 0 { parts.append("PR #\(job.prNum)") }
-        let age = relAge(job.spawnedAt)
-        if !age.isEmpty { parts.append(age) }
-        return parts.joined(separator: "  ·  ")
+        .lineLimit(1)
     }
 }
 
-/// Leading state glyph — all SF Symbols. Open PR → green pull-request mark;
-/// active-without-PR → spinner; otherwise a level-colored dot.
-private struct StateGlyph: View {
+/// PR-status glyph — exact mapping from the dashboard PrStatusIcon.
+struct PrStatusIcon: View {
     let job: Job
-    let level: AttentionLevel
-    var body: some View {
-        if job.prNum > 0 {
-            Image(systemName: "arrow.triangle.pull")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Theme.emerald)
-        } else if level == .working {
-            ProgressView().controlSize(.mini).tint(Theme.amber)
-        } else {
-            Image(systemName: "circle.fill")
-                .font(.system(size: 8))
-                .foregroundStyle(level.color)
-        }
-    }
-}
+    let active: Bool
+    @State private var pulse = false
 
-/// Trailing marker — SF Symbol CI status, or a needs-you pill.
-private struct Trailing: View {
-    let job: Job
-    let level: AttentionLevel
     var body: some View {
-        switch level {
-        case .needsYou:
-            Text("needs you")
-                .font(Theme.mono(10, weight: .semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 8).padding(.vertical, 3)
-                .background(Theme.rose, in: Capsule())
-        case .watching:
-            switch ciStatus(job.lastCheckConclusions) {
-            case .pass: Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.emerald)
-            case .fail: Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.rose)
-            default:    Image(systemName: "clock").foregroundStyle(Theme.amber)
+        Group {
+            if job.closedState == "merged" {
+                mark("octicon-merge", Theme.violet)
+            } else if job.closedState == "closed" {
+                Image(systemName: "xmark.circle").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.faint)
+            } else if job.prNum > 0, ciStatus(job.lastCheckConclusions) == .fail {
+                Image(systemName: "xmark.circle").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.rose)
+            } else if job.prNum > 0, ciStatus(job.lastCheckConclusions) == .pass {
+                Image(systemName: "checkmark.circle").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.emerald)
+            } else if job.prNum > 0 {
+                mark("octicon-pr", Theme.emerald)
+            } else {
+                Circle().fill(Theme.sky).frame(width: 10, height: 10)
+                    .opacity(active && pulse ? 0.4 : 1)
+                    .animation(active ? .easeInOut(duration: 0.9).repeatForever() : .default, value: pulse)
+                    .onAppear { if active { pulse = true } }
             }
-        case .working, .quiet:
-            EmptyView()
         }
+        .frame(width: 20, height: 20)
+    }
+
+    private func mark(_ name: String, _ color: Color) -> some View {
+        Image(name).renderingMode(.template).resizable().scaledToFit()
+            .frame(width: 15, height: 15).foregroundStyle(color)
     }
 }
 
-// ─── shared chrome ──────────────────────────────────────────────────────────
-
-struct ConnDot: View {
-    let link: StateStore.Link
+/// Provider brand mark (Claude / OpenAI), bundled SVGs tinted to match the
+/// web AgentMark.
+struct AgentMark: View {
+    let agent: String
     var body: some View {
-        let (c, label): (Color, String) = {
-            switch link {
-            case .live:    return (Theme.emerald, "live")
-            case .polling: return (Theme.amber, "sync")
-            case .offline: return (Theme.faint, "offline")
-            }
-        }()
-        return HStack(spacing: 5) {
-            Circle().fill(c).frame(width: 6, height: 6)
-            Text(label).font(Theme.mono(10)).foregroundStyle(Theme.muted)
+        switch agent {
+        case "claude":
+            Image("claude-mark").renderingMode(.template).resizable().scaledToFit()
+                .frame(width: 13, height: 13).foregroundStyle(Theme.claudeMark)
+        case "codex":
+            Image("openai-mark").renderingMode(.template).resizable().scaledToFit()
+                .frame(width: 13, height: 13).foregroundStyle(Theme.ink)
+        default:
+            Circle().fill(Theme.zinc).frame(width: 11, height: 11)
         }
     }
 }
+
+// ─── shared ────────────────────────────────────────────────────────────────
 
 struct Hint: View {
     let icon: String
@@ -192,14 +214,11 @@ struct Hint: View {
     let detail: String
     var body: some View {
         VStack(spacing: 9) {
-            Image(systemName: icon).font(.system(size: 34, weight: .light))
-                .foregroundStyle(Theme.faint)
+            Image(systemName: icon).font(.system(size: 34, weight: .light)).foregroundStyle(Theme.faint)
             Text(title).font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.ink)
-            Text(detail).font(.footnote).foregroundStyle(Theme.muted)
-                .multilineTextAlignment(.center)
+            Text(detail).font(.footnote).foregroundStyle(Theme.muted).multilineTextAlignment(.center)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity).padding(40)
         .background(Theme.surface)
     }
 }
@@ -213,4 +232,13 @@ extension AttentionLevel {
         case .quiet:    return Theme.zinc
         }
     }
+}
+
+/// RFC3339 → epoch millis (0 if unknown), for sort.
+func isoMillis(_ s: String?) -> Double {
+    guard let s = s, !s.isEmpty, !s.hasPrefix("0001") else { return 0 }
+    let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let d = f.date(from: s) { return d.timeIntervalSince1970 * 1000 }
+    let f2 = ISO8601DateFormatter()
+    return (f2.date(from: s)?.timeIntervalSince1970 ?? 0) * 1000
 }
