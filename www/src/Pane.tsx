@@ -97,33 +97,55 @@ export function Pane({ session }: Props) {
     let es: EventSource | null = null
     const shouldStream = () => isVisible && isForeground
 
-    const decoder = new TextDecoder('utf-8')
     const decodeBytes = (data: string) => {
       const bin = atob(data)
       const out = new Uint8Array(bin.length)
       for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
       return out
     }
+    // CSI \x1b[H = cursor home, \x1b[2J = erase entire screen.
+    const CLEAR = new Uint8Array([0x1b, 0x5b, 0x48, 0x1b, 0x5b, 0x32, 0x4a])
+    // Frames carry a one-byte mode prefix from the relay agent:
+    //   'F' = full repaint (the initial screen + late-joiner resyncs)
+    //   'D' = delta (raw PTY bytes appended verbatim — no clear)
+    // The SSE fallback sends unprefixed full snapshots; treat those as 'F'.
     const applyFrame = async (raw: string) => {
       try {
+        let mode = 'F'
+        let body = raw
+        if (raw[0] === 'F' || raw[0] === 'D') {
+          mode = raw[0]
+          body = raw.slice(1)
+        }
         let bytes: Uint8Array
-        if (raw.startsWith('z:')) {
-          const gz = decodeBytes(raw.slice(2))
+        if (body.startsWith('z:')) {
+          const gz = decodeBytes(body.slice(2))
           const stream = new Blob([gz as BlobPart]).stream()
             .pipeThrough(new DecompressionStream('gzip'))
           const buf = await new Response(stream).arrayBuffer()
           bytes = new Uint8Array(buf)
         } else {
-          bytes = decodeBytes(raw)
+          bytes = decodeBytes(body)
         }
-        // Clear + redraw as a single write so xterm processes the
-        // reset and the new frame within one render tick. The
-        // previous `term.clear() + term.write(...)` split kicked a
-        // browser paint between them, which showed up as a perceptible
-        // black flash every 200ms.
-        // CSI \x1b[H = cursor home, \x1b[2J = erase entire screen.
-        term.write('\x1b[H\x1b[2J' + decoder.decode(bytes))
+        if (mode === 'D') {
+          // Raw PTY bytes — write verbatim. xterm buffers partial UTF-8 /
+          // escape sequences across writes, so chunk splits are safe.
+          term.write(bytes)
+        } else {
+          // Full repaint: home + erase, then the snapshot, in a single
+          // write so xterm processes it within one render tick (no flash).
+          const out = new Uint8Array(CLEAR.length + bytes.length)
+          out.set(CLEAR, 0)
+          out.set(bytes, CLEAR.length)
+          term.write(out)
+        }
       } catch { /* malformed frame, ignore */ }
+    }
+    // applyFrame is async (gzip inflate awaits), so serialize calls — out-of-
+    // order delta application would corrupt the terminal.
+    let applyChain: Promise<void> = Promise.resolve()
+    const enqueueFrame = (raw: string) => {
+      applyChain = applyChain.then(() => applyFrame(raw)).catch(() => {})
     }
 
     let busUnsub: (() => void) | undefined
@@ -138,7 +160,7 @@ export function Pane({ session }: Props) {
           busUnsub = bus.subscribe((msg: any) => {
             if (msg?.t !== 'pane' || msg.paneId !== session) return
             setStatus('live')
-            void applyFrame(msg.data)
+            enqueueFrame(msg.data)
           })
         }
         return
@@ -150,7 +172,7 @@ export function Pane({ session }: Props) {
         `/api/pane/stream?s=${encodeURIComponent(session)}&cols=${term.cols}&rows=${term.rows}`,
       )
       es.onopen = () => setStatus('live')
-      es.onmessage = (ev) => { void applyFrame(ev.data) }
+      es.onmessage = (ev) => { enqueueFrame(ev.data) }
       es.onerror = () => {
         setStatus('error')
         if (es?.readyState === EventSource.CLOSED) {

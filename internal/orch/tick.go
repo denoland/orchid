@@ -32,21 +32,42 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 			sessionCmdOverride = vm.SessionCmd + flags
 		}
 	}
-	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, sessionCmdOverride, botLogin, botEmail, memoryStoreArg(cfg, vm)); err != nil {
+	if err := tmuxStart(*vm, session, workdir, sharedDir, target.Repo, branch, sessionCmdOverride, botLogin, botEmail, memoryStoreArg(cfg, vm), cfg.GitHub.InboxRepo); err != nil {
 		return err
 	}
 	time.Sleep(3 * time.Second)
 	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s C-m", session))
-	// 3 minutes covers slow claude TUI startup in heavy worktrees (e.g.
-	// fresh deno checkout: lockfile parse + project scan can push first
-	// idle past the 60s mark on a contended VM).
-	const idleWaitTimeout = 3 * time.Minute
+	// 6 minutes covers slow claude TUI startup in heavy worktrees (a fresh
+	// deno checkout's lockfile parse + project scan can push first idle well
+	// past 3min). Two extra guards stop the old 3min kill+respawn loop on
+	// heavy VMs: (a) every ~30s we send Escape+Enter to dismiss a launch
+	// interstitial (the "How is Claude doing?" survey, update / what's-new
+	// dialogs) that otherwise pins the pane on a prompt marker so tmuxIdle
+	// never fires; (b) we bail FAST on a genuine auth failure instead of
+	// blocking the serial tick loop for the full window.
+	const idleWaitTimeout = 6 * time.Minute
 	deadline := time.Now().Add(idleWaitTimeout)
 	sawIdle := false
-	for time.Now().Before(deadline) {
+	for i := 0; time.Now().Before(deadline); i++ {
 		if idle, _, err := tmuxIdle(*vm, session); err == nil && idle {
 			sawIdle = true
 			break
+		}
+		// Fast-fail a real auth failure (~every 10s) so a dead VM can't
+		// hold the loop for the whole 6min window.
+		if i > 0 && i%5 == 0 {
+			if p, _, e := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s | tail -8", session)); e == nil &&
+				(strings.Contains(p, "Please run /login") || strings.Contains(p, "Invalid authentication") || strings.Contains(p, "API Error: 401")) {
+				tmuxKill(*vm, session)
+				return fmt.Errorf("session auth failed (login required) on %s; pane tail:\n%s", vm.Name, strings.TrimSpace(p))
+			}
+		}
+		// Dismiss any blocking launch interstitial every ~30s: Escape closes
+		// a dialog, Enter confirms/wakes, so a real idle prompt can appear.
+		if i > 0 && i%15 == 0 {
+			_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s Escape", session))
+			time.Sleep(300 * time.Millisecond)
+			_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s C-m", session))
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -144,7 +165,7 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 	resumeCmd := vmAgent(*vm).resumeXform(base)
 
 	botLogin, botEmail := vmBotIdentity(cfg.Orch, *vm)
-	if err := tmuxStart(*vm, session, workdir, sharedDir, j.TargetRepo, j.Branch, resumeCmd, botLogin, botEmail, memoryStoreArg(cfg, vm)); err != nil {
+	if err := tmuxStart(*vm, session, workdir, sharedDir, j.TargetRepo, j.Branch, resumeCmd, botLogin, botEmail, memoryStoreArg(cfg, vm), cfg.GitHub.InboxRepo); err != nil {
 		return err
 	}
 	// claude's `--resume` opens an interactive "Resume from summary / full /

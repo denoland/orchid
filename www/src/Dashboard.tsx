@@ -412,7 +412,16 @@ function QuotaStrip({ quota, governor, label, stacked }: { quota: NonNullable<St
           )}
         </div>
         <span className="mono text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">{Math.round(pct)}%</span>
-        <span className="mono text-[10px] text-zinc-500 dark:text-zinc-400">{fmt(resets - now)}</span>
+        {resets - now <= -60 ? (
+          <span
+            className="mono text-[10px] text-amber-600 dark:text-amber-400"
+            title="Quota reading is stale — its reset window already passed and Claude Code hasn't reported a fresh rate limit. Pacing is unaffected (governor fails open)."
+          >
+            stale
+          </span>
+        ) : (
+          <span className="mono text-[10px] text-zinc-500 dark:text-zinc-400">{fmt(resets - now)}</span>
+        )}
       </div>
     )
   }

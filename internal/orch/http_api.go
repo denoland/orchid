@@ -716,8 +716,10 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 			"tmux resize-window -t %s -x %d -y %d 2>/dev/null", session, cols, rows,
 		))
 
+		// Visible viewport only — see runCapture in relay_agent.go for why
+		// dropping -S (scrollback) is what kills the flicker.
 		remote := fmt.Sprintf(
-			`while :; do tmux capture-pane -p -e -t %s -S -200 2>&1; printf '\x1e'; sleep 0.2; done`,
+			`while :; do tmux capture-pane -p -e -t %s 2>&1; printf '\x1e'; sleep 0.2; done`,
 			session,
 		)
 		var cmd *exec.Cmd

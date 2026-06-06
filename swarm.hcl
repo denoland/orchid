@@ -79,6 +79,13 @@ inherits it.
 
 ## Your job
 
+You are running FULLY AUTONOMOUSLY — no human is watching this session. Never
+ask the user a question and never open an interactive prompt or plan-mode menu
+(AskUserQuestion / ExitPlanMode): there is nobody to answer, so it strands the
+session. When you hit a fork or an ambiguous decision, pick the best option
+yourself from the issue's goal and proceed. Ship your judgment in the PR — the
+human reviews it there, not mid-session.
+
 Implement this fully. Read the codebase, understand it deeply, make the change.
 Large refactors are expected — do not avoid them. If the right fix touches 10
 files, touch 10 files. If it requires redesigning a data structure, redesign it.
