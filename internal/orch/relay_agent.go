@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
@@ -297,6 +298,7 @@ func makeLocalWSDialer(localAddr, secret string) cfrelaytun.WSHandler {
 type paneSub struct {
 	refs   int
 	cancel context.CancelFunc
+	resync chan struct{} // late joiners poke this to get a fresh full frame
 }
 
 type paneMux struct {
@@ -310,11 +312,19 @@ func (p *paneMux) start(ctx context.Context, c *cfrelaytun.Client, id string, co
 	defer p.mu.Unlock()
 	if existing, ok := p.panes[id]; ok {
 		existing.refs++
+		// A new viewer joined a pane that's already streaming deltas; it
+		// missed the initial paint. Ask the capture loop to broadcast a
+		// fresh full frame. Non-blocking — a pending resync already covers it.
+		select {
+		case existing.resync <- struct{}{}:
+		default:
+		}
 		return
 	}
 	paneCtx, cancel := context.WithCancel(ctx)
-	p.panes[id] = &paneSub{refs: 1, cancel: cancel}
-	go p.runCapture(paneCtx, c, id, cols, rows)
+	sub := &paneSub{refs: 1, cancel: cancel, resync: make(chan struct{}, 1)}
+	p.panes[id] = sub
+	go p.runCapture(paneCtx, c, id, cols, rows, sub.resync)
 }
 
 func (p *paneMux) stop(id string) {
@@ -342,10 +352,15 @@ func validPaneID(id string) bool {
 	return id != ""
 }
 
-// runCapture spawns `tmux capture-pane` in a loop on the target VM,
-// gzipping each frame and sending it over the relay tunnel. Frames are
-// delimited by 0x1e (record separator); duplicates are dropped.
-func (p *paneMux) runCapture(ctx context.Context, c *cfrelaytun.Client, id string, cols, rows int) {
+// runCapture streams a tmux pane over the relay tunnel. It paints the
+// current screen once (a "full" frame), then tails the pane's live PTY
+// output via `tmux pipe-pane`, forwarding only the delta bytes. This is
+// event-driven: an idle pane costs nothing (no 5Hz polling), and the
+// frontend appends deltas with no clear-and-repaint, so there's no flicker.
+// Each frame carries a one-byte mode prefix: 'F' = full repaint, 'D' = delta
+// append. The SSE fallback (/api/pane/stream) keeps the legacy unprefixed
+// full-snapshot format; the frontend treats an absent prefix as full.
+func (p *paneMux) runCapture(ctx context.Context, c *cfrelaytun.Client, id string, cols, rows int, resync <-chan struct{}) {
 	if !validPaneID(id) || p.vmLookup == nil {
 		return
 	}
@@ -361,52 +376,122 @@ func (p *paneMux) runCapture(ctx context.Context, c *cfrelaytun.Client, id strin
 	}
 	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux resize-window -t %s -x %d -y %d 2>/dev/null", id, cols, rows))
 
-	script := fmt.Sprintf(
-		`while :; do tmux capture-pane -p -e -t %s -S -200 2>&1; printf '\x1e'; sleep 0.2; done`,
-		id,
-	)
+	// gzip+base64 a frame and ship it. mode is 'F' (full) or 'D' (delta).
+	// Serialized so the resync goroutine and the delta loop can both send.
+	var sendMu sync.Mutex
+	gzbuf := new(bytes.Buffer)
+	gzw := gzip.NewWriter(gzbuf)
+	send := func(mode byte, payload string) bool {
+		sendMu.Lock()
+		gzbuf.Reset()
+		gzw.Reset(gzbuf)
+		_, _ = gzw.Write([]byte(payload))
+		_ = gzw.Close()
+		data := string(mode) + "z:" + base64.StdEncoding.EncodeToString(gzbuf.Bytes())
+		sendMu.Unlock()
+		return c.Send(ctx, "pane", map[string]any{"paneId": id, "data": data})
+	}
+
+	// pipe-pane needs a rendezvous file: the tmux server runs the pipe
+	// command in its own process tree, so its stdout isn't ours. Detach any
+	// stale pipe, recreate the fifo, start piping NEW output into it, print
+	// the current screen + a NUL sentinel, then stream the fifo. NUL never
+	// appears in tmux text/escape output, so it's a safe split marker. The
+	// trap and the explicit cleanup below both detach the pipe so it can't
+	// leak on the tmux server.
+	fifo := "/tmp/orch-pp-" + id
+	script := fmt.Sprintf(`S=%s
+F=%s
+tmux pipe-pane -t "$S" 2>/dev/null
+rm -f "$F"; mkfifo "$F" || exit 1
+trap 'tmux pipe-pane -t "$S" 2>/dev/null; rm -f "$F"' EXIT INT TERM HUP
+tmux pipe-pane -t "$S" "cat > $F"
+tmux capture-pane -p -e -t "$S"
+printf '\000FULLEND\000'
+exec cat "$F"`, id, fifo)
+
 	var cmd *exec.Cmd
 	if isLocal(*vm) {
 		cmd = exec.CommandContext(ctx, "bash", "-c", script)
 	} else {
 		cmd = exec.CommandContext(ctx, "ssh", append(sshArgs(*vm), script)...)
 	}
+	// SIGTERM the whole process group on cancel so the trap runs (detaches
+	// the pipe, removes the fifo); os/exec force-kills after WaitDelay.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		}
+		return nil
+	}
+	cmd.WaitDelay = 3 * time.Second
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil || cmd.Start() != nil {
 		return
 	}
-	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	defer func() {
+		// On the cancel path, os/exec already ran cmd.Cancel (graceful
+		// SIGTERM → trap) and force-kills after WaitDelay. On an early
+		// return that ctx didn't trigger (e.g. relay send failed), nothing
+		// would reap the process, so kill it here.
+		if ctx.Err() == nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		// Belt-and-suspenders: detach the pipe + drop the fifo even if the
+		// signal raced (esp. remote, where SIGHUP delivery isn't guaranteed).
+		// Detaching closes the writer, so any lingering `cat` reader EOFs.
+		vmCopy := *vm
+		go func() {
+			_, _, _ = sshExec(vmCopy, fmt.Sprintf(`tmux pipe-pane -t %s 2>/dev/null; rm -f %s`, id, fifo))
+		}()
+	}()
 
 	rd := bufio.NewReader(stdout)
-	var buf strings.Builder
-	gzbuf := new(bytes.Buffer)
-	gzw := gzip.NewWriter(gzbuf)
-	var last string
 
-	for ctx.Err() == nil {
+	// Read the initial full frame, terminated by the NUL sentinel.
+	const sentinel = "\x00FULLEND\x00"
+	var full strings.Builder
+	for {
 		b, err := rd.ReadByte()
 		if err != nil {
 			return
 		}
-		if b != 0x1e {
-			buf.WriteByte(b)
-			continue
+		full.WriteByte(b)
+		if strings.HasSuffix(full.String(), sentinel) {
+			break
 		}
-		snap := buf.String()
-		buf.Reset()
-		if snap == last {
-			continue
+	}
+	if !send('F', strings.TrimSuffix(full.String(), sentinel)) {
+		return
+	}
+
+	// Resync: when a late viewer joins, repaint with a fresh full frame.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-resync:
+				if out, _, err := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -e -t %s 2>/dev/null", id)); err == nil {
+					send('F', out)
+				}
+			}
 		}
-		last = snap
-		gzbuf.Reset()
-		gzw.Reset(gzbuf)
-		_, _ = gzw.Write([]byte(snap))
-		_ = gzw.Close()
-		data := "z:" + base64.StdEncoding.EncodeToString(gzbuf.Bytes())
-		if !c.Send(ctx, "pane", map[string]any{
-			"paneId": id,
-			"data":   data,
-		}) {
+	}()
+
+	// Delta loop: forward raw PTY bytes as they arrive.
+	buf := make([]byte, 32*1024)
+	for ctx.Err() == nil {
+		n, err := rd.Read(buf)
+		if n > 0 {
+			if !send('D', string(buf[:n])) {
+				return
+			}
+		}
+		if err != nil {
 			return
 		}
 	}

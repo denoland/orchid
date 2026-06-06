@@ -392,6 +392,80 @@ func tailStatusLine(ctx context.Context, vm VMBlock, bcast chan<- struct{}) {
 	}
 }
 
+// parseUnifiedRateHeaders extracts the live 5h + weekly utilization from a raw
+// HTTP response-header dump (curl -D -) carrying Anthropic's unified
+// rate-limit headers (Anthropic-Ratelimit-Unified-{5h,7d}-{Utilization,Reset}).
+// Utilization is a 0..1 fraction; we scale to a 0..100 percent to match the
+// statusline RateLimit shape. ok is false if neither window parsed.
+func parseUnifiedRateHeaders(raw string) (five, seven RateLimit, ok bool) {
+	get := func(name string) string {
+		for _, ln := range strings.Split(raw, "\n") {
+			if i := strings.IndexByte(ln, ':'); i > 0 && strings.EqualFold(strings.TrimSpace(ln[:i]), name) {
+				return strings.TrimSpace(ln[i+1:])
+			}
+		}
+		return ""
+	}
+	pf := func(s string) float64 { f, _ := strconv.ParseFloat(s, 64); return f }
+	pi := func(s string) int64 { n, _ := strconv.ParseInt(s, 10, 64); return n }
+	five = RateLimit{
+		UsedPct:  pf(get("Anthropic-Ratelimit-Unified-5h-Utilization")) * 100,
+		ResetsAt: pi(get("Anthropic-Ratelimit-Unified-5h-Reset")),
+	}
+	seven = RateLimit{
+		UsedPct:  pf(get("Anthropic-Ratelimit-Unified-7d-Utilization")) * 100,
+		ResetsAt: pi(get("Anthropic-Ratelimit-Unified-7d-Reset")),
+	}
+	ok = five.ResetsAt != 0 || seven.ResetsAt != 0
+	return
+}
+
+// pollClaudeUnifiedQuota periodically reads the account's LIVE 5h/weekly
+// utilization from Anthropic's unified rate-limit response headers and feeds
+// the claude quota bucket. Claude Code 2.1.x stopped writing fresh rate_limits
+// to the statusline (the values freeze at the last header it happened to
+// surface — e.g. a weekly that already reset days ago), but the headers
+// themselves ride every API response. So we make a tiny throwaway call and read
+// them ourselves. The box's claude is clawpatrol-wrapped (its local oauth token
+// is inert; the gateway injects the real cred), so the probe is DERIVED from the
+// VM's session_cmd: we swap the `clawpatrol run claude …` invocation for
+// `clawpatrol run -- curl …`, reusing the runuser/env/clawpatrol setup verbatim
+// so the call authenticates through the very same gateway claude uses.
+func pollClaudeUnifiedQuota(ctx context.Context, vm VMBlock, bcast chan<- struct{}) {
+	account := vmAccount(vm)
+	// sshExec runs this through a shell (`bash -c` locally, the remote shell over
+	// ssh), so the JSON body MUST be single-quoted: unquoted, bash brace-expands
+	// the `{...,...}` and shreds the request. The body itself uses only double
+	// quotes, so single-quoting is safe.
+	const body = `{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`
+	probe := "clawpatrol run -- curl -s -D - -o /dev/null -X POST https://api.anthropic.com/v1/messages " +
+		"-H anthropic-version:2023-06-01 -H content-type:application/json -d '" + body + "'"
+	remote := strings.Replace(vm.SessionCmd, "clawpatrol run claude --dangerously-skip-permissions", probe, 1)
+	if !strings.Contains(remote, "curl") {
+		log.Printf("usage: claude unified-quota poller: %s session_cmd has no clawpatrol claude invocation; skipping", vm.Name)
+		return
+	}
+	log.Printf("usage: polling claude unified rate-limit headers via %s (account=%s)", vm.Name, account)
+	for ctx.Err() == nil {
+		if out, _, err := sshExec(vm, remote); err == nil {
+			if five, seven, okp := parseUnifiedRateHeaders(out); okp {
+				setAgentQuota(account, five, seven, "", nil)
+				if bcast != nil {
+					select {
+					case bcast <- struct{}{}:
+					default:
+					}
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Minute):
+		}
+	}
+}
+
 // codexRolloutTailScript follows the NEWEST codex session rollout JSONL under
 // the given codex-home dir and re-discovers on rotation: when a newer
 // rollout-*.jsonl appears (a new codex session started) it kills the current

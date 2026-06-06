@@ -783,7 +783,50 @@ fi
 	return nil
 }
 
-func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, sessionCmdOverride, botLogin, botEmail, memOverrideDir string) error {
+// orchidAskHookScript is a Claude Code PreToolUse hook installed on each worker
+// (see stamp_hooks). The swarm is autonomous — no human answers interactive
+// prompts, so AskUserQuestion / ExitPlanMode would strand a session forever.
+// This intercepts them BEFORE the blocking menu renders:
+//   - AskUserQuestion → post the question + options to the inbox issue (so the
+//     decision is visible / a human can redirect later via the PR), then DENY
+//     with a reason that tells the agent to pick the best option itself and keep
+//     going. (We deny rather than auto-answer because the allow+answers path is
+//     unreliable — Claude Code strips the injected answer, anthropics/claude-code#12031.)
+//   - ExitPlanMode → ALLOW, so the agent leaves plan mode and starts editing.
+// __INBOX_REPO__ is replaced with the configured inbox repo in Go. Always emits
+// a decision even if jq/gh fail, so a worker never hangs waiting on this hook.
+const orchidAskHookScript = `#!/usr/bin/env bash
+input=$(cat)
+tool=$(printf '%s' "$input" | jq -r '.tool_name // ""' 2>/dev/null)
+
+if [ "$tool" = "ExitPlanMode" ]; then
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}\n'
+  exit 0
+fi
+if [ "$tool" != "AskUserQuestion" ]; then
+  exit 0
+fi
+
+cwd=$(printf '%s' "$input" | jq -r '.cwd // ""' 2>/dev/null)
+issue=$(printf '%s' "$cwd" | sed -n 's#.*/issue-\([0-9][0-9]*\).*#\1#p')
+body=$(printf '%s' "$input" | jq -r '
+  "An autonomous orchid worker tried to ask a question. No human is watching, so it was told to choose the best option and continue — recorded here for visibility:\n\n"
+  + ([.tool_input.questions[]?
+       | "**" + ((.question // .header // .text) // "Question") + "**\n"
+         + ([.options[]? | "- " + ((.label // .) | tostring)
+              + (if (.description // "") != "" then " — " + .description else "" end)] | join("\n"))
+     ] | join("\n\n"))
+' 2>/dev/null)
+if [ -n "$issue" ] && [ -n "$body" ]; then
+  gh issue comment "$issue" --repo "__INBOX_REPO__" --body "$body" >/dev/null 2>&1 || true
+fi
+
+reason="You are running fully autonomously in the orchid swarm — there is NO human available to answer, and the interactive menu you just opened would strand this session forever. Your question and options have been posted to the tracking issue for visibility. Decide the best option YOURSELF from the issue goal and keep working. Do not call AskUserQuestion or ExitPlanMode again — just proceed until you can open a PR."
+jq -cn --arg r "$reason" '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
+exit 0
+`
+
+func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, sessionCmdOverride, botLogin, botEmail, memOverrideDir, inboxRepo string) error {
 	sessionCmd := sessionCmdOverride
 	if sessionCmd == "" {
 		sessionCmd = vm.SessionCmd
@@ -794,6 +837,16 @@ func tmuxStart(vm VMBlock, session, workdir, sharedDir, repo, branch, sessionCmd
 	sessionHome := vm.SessionHome
 	agent := vmAgent(vm).name
 	codexHome := vm.CodexHome
+	// PreToolUse hook that keeps an autonomous worker from stranding on an
+	// interactive prompt: AskUserQuestion → post the question to the inbox issue
+	// and deny so the agent decides itself; ExitPlanMode → allow (proceed). Shipped
+	// as base64 so the inbox repo is injected in Go, with no shell-escaping in the
+	// embedded provisioning template. Empty when unset (stamp_hooks then skips it).
+	askHookB64 := ""
+	if inboxRepo != "" {
+		askHookB64 = base64.StdEncoding.EncodeToString(
+			[]byte(strings.ReplaceAll(orchidAskHookScript, "__INBOX_REPO__", inboxRepo)))
+	}
 	script := fmt.Sprintf(`set -e
 SHARED=%q
 REPO=%q
@@ -807,6 +860,7 @@ BOT_EMAIL=%q
 AGENT=%q
 CODEX_HOME=%q
 MEM_STORE=%q
+ASK_HOOK_B64=%q
 
 # 1) shared clone (once per repo per VM); always fetch fresh refs.
 # Prefer ssh when the bot has an id_ed25519 wired to github; fall back
@@ -884,7 +938,17 @@ if [ "$AGENT" = "claude" ]; then
     mkdir -p "$CHOME/.claude/auto-memory"
     local SJ="$CHOME/.claude/settings.json"
     [ -f "$SJ" ] || echo '{}' > "$SJ"
-    jq --arg amd "$CHOME/.claude/auto-memory" '.hooks.Notification = [{"hooks":[{"type":"command","command":"tee -a $HOME/.claude/notify.jsonl >/dev/null"}]}] | .hooks.UserPromptSubmit = [{"hooks":[{"type":"command","command":"tee -a $HOME/.claude/notify.jsonl >/dev/null"}]}] | .autoMemoryEnabled = true | .autoMemoryDirectory = $amd' "$SJ" > "$SJ.tmp" && mv "$SJ.tmp" "$SJ"
+    # PreToolUse auto-handler for interactive prompts (no human watches the
+    # swarm): decode the hook script and register it for AskUserQuestion /
+    # ExitPlanMode. jq only touches the keys it names, so a hand-set hook key
+    # survives; we (re)write all of them each spawn so updates roll out.
+    local HOOKARG='.'
+    if [ -n "$ASK_HOOK_B64" ]; then
+      local HOOKSH="$CHOME/.claude/orchid-ask-hook.sh"
+      printf '%%s' "$ASK_HOOK_B64" | base64 -d > "$HOOKSH" && chmod +x "$HOOKSH"
+      HOOKARG='.hooks.PreToolUse = [{"matcher":"AskUserQuestion|ExitPlanMode","hooks":[{"type":"command","command":$hook}]}]'
+    fi
+    jq --arg amd "$CHOME/.claude/auto-memory" --arg hook "$CHOME/.claude/orchid-ask-hook.sh" ".hooks.Notification = [{\"hooks\":[{\"type\":\"command\",\"command\":\"tee -a \$HOME/.claude/notify.jsonl >/dev/null\"}]}] | .hooks.UserPromptSubmit = [{\"hooks\":[{\"type\":\"command\",\"command\":\"tee -a \$HOME/.claude/notify.jsonl >/dev/null\"}]}] | .autoMemoryEnabled = true | .autoMemoryDirectory = \$amd | $HOOKARG" "$SJ" > "$SJ.tmp" && mv "$SJ.tmp" "$SJ"
   }
   stamp_trust "$HOME"
   stamp_hooks "$HOME"
@@ -919,6 +983,23 @@ elif [ "$AGENT" = "codex" ]; then
       fi
     done
   }
+  # Suppress codex's "Update now / Skip" launch interstitial. It fires whenever
+  # version.json's dismissed_version != latest_version; on a version bump the
+  # default-highlighted "Update now" eats orch's wake-keystroke and the session
+  # never reaches the idle prompt (3m spawn timeout). Re-stamp dismissed_version
+  # to the latest codex has seen so the prompt stays dismissed across bumps.
+  dismiss_codex_update() {
+    local CDIR="$1"
+    [ -z "$CDIR" ] && return
+    local VJ="$CDIR/version.json"
+    [ -f "$VJ" ] || return
+    python3 -c 'import json,sys
+p=sys.argv[1]
+try: d=json.load(open(p))
+except Exception: sys.exit(0)
+lv=d.get("latest_version")
+if lv: d["dismissed_version"]=lv; json.dump(d,open(p,"w"))' "$VJ" 2>/dev/null || true
+  }
   # Stamp AGENTS.md pointing codex at the shared store + inline its current index
   # for cold-start value. Overwritten each spawn so the inlined index stays fresh.
   stamp_codex_agents() {
@@ -941,12 +1022,15 @@ elif [ "$AGENT" = "codex" ]; then
   }
   if [ -n "$CODEX_HOME" ]; then
     trust_codex "$CODEX_HOME"
+    dismiss_codex_update "$CODEX_HOME"
     stamp_codex_agents "$CODEX_HOME"
   else
     trust_codex "$HOME/.codex"
+    dismiss_codex_update "$HOME/.codex"
     stamp_codex_agents "$HOME/.codex"
     if [ -n "$SESSION_HOME" ] && [ "$SESSION_HOME" != "~" ] && [ "$SESSION_HOME" != "$HOME" ]; then
       trust_codex "$SESSION_HOME/.codex"
+      dismiss_codex_update "$SESSION_HOME/.codex"
       stamp_codex_agents "$SESSION_HOME/.codex"
     fi
   fi
@@ -971,7 +1055,7 @@ if [ "$AGENT" = "claude" ] && [ -n "$MEM_STORE" ]; then
 fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -c "$WORKDIR" -s "$SESSION" "$LAUNCH"
-`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome, botLogin, botEmail, agent, codexHome, memOverrideDir)
+`, sharedDir, repo, workdir, branch, session, sessionCmd, sessionHome, botLogin, botEmail, agent, codexHome, memOverrideDir, askHookB64)
 
 	_, errStr, err := sshExecIn(vm, script, "bash -s")
 	if err != nil {

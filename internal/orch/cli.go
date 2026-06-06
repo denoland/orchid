@@ -1076,6 +1076,7 @@ func Main() {
 	// blank until that account next emits a live sample.
 	seedAgentQuotaFromDB(&cfg, st.store)
 
+	claudeQuotaPolled := map[string]bool{}
 	for i := range cfg.VMs {
 		vm := cfg.VMs[i]
 		// Each VM streams its agent's usage: claude via the statusline.jsonl
@@ -1088,6 +1089,15 @@ func Main() {
 			// Reliable needs-input detection from claude's Notification /
 			// UserPromptSubmit hooks (notify.jsonl); surfaced as a dashboard badge.
 			go tailNotify(ctx, vm, st.Bcast)
+			// Claude Code 2.1.x stopped writing fresh rate_limits to the
+			// statusline, so we also poll Anthropic's unified rate-limit
+			// response headers directly. One poller per account suffices (rate
+			// limits are account-global); it needs a LOCAL clawpatrol claude VM
+			// so the probe auths through the same gateway claude uses.
+			if isLocal(vm) && strings.Contains(vm.SessionCmd, "clawpatrol run claude") && !claudeQuotaPolled[vmAccount(vm)] {
+				claudeQuotaPolled[vmAccount(vm)] = true
+				go pollClaudeUnifiedQuota(ctx, vm, st.Bcast)
+			}
 		}
 	}
 
