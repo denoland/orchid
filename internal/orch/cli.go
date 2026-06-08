@@ -76,7 +76,7 @@ func runJoinRelay(args []string) {
 	}
 	envPath := os.Getenv("ORCHID_ENV_FILE")
 	if envPath == "" {
-		envPath = "/root/orch/env"
+		envPath = "/etc/orchid/env"
 	}
 	// Read existing env, drop any old RELAY_* lines, append new ones.
 	var keep []string

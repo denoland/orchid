@@ -19,13 +19,12 @@ github {
 
 orchestrator {
   poll_interval = "30s"
-  state_db      = "/home/divy/.orch/state.db"
+  state_db      = "/var/lib/orchid/state.db"
   branch_prefix = "orch/issue-"
-  workdir_root  = "/home/divy/.orch/work"
+  workdir_root  = "/var/lib/orchid/orch-work"
   http_addr     = ":8000"
   http_secret   = "<32-hex>"
-  bot_login     = "divybot"
-  ntfy_topic    = "orchid-..."
+  bot_login     = "mybot"
   allowed_logins = ["alice", "bob"]   # extra GitHub logins that can see the dashboard
 }
 ```
@@ -40,7 +39,6 @@ orchestrator {
 | `orchestrator.http_addr` | Local bind for the dashboard server. |
 | `orchestrator.http_secret` | Bearer token for the dashboard. |
 | `orchestrator.bot_login` | GitHub login Claude commits as. |
-| `orchestrator.ntfy_topic` | Optional ntfy.sh topic for PR-merged push notifications. |
 | `orchestrator.allowed_logins` | Extra GitHub usernames allowed to read your dashboard (used by the optional relay's OAuth). |
 
 ## Targets
@@ -72,11 +70,11 @@ write them once instead of repeating a `vm` block per agent:
 
 ```hcl
 machine "mac-mini" {
-  host         = "0.0.0.0"
-  user         = "divy"
-  key          = "/root/orch/vm-keys/mac-mini"
+  host         = "mac-mini.tail-abc.ts.net"   # LAN IP or Tailscale name
+  user         = "orchid"
+  key          = "/var/lib/orchid/vm-keys/mac-mini"
   session_home = "~"
-  workdir_root = "/Users/divy/orch-work"
+  workdir_root = "/Users/orchid/orch-work"
   join_managed = true
 
   agent "claude" { capacity = 7 }

@@ -165,7 +165,7 @@ func aggregateRemoteMemory(cfg *Config, localVM *VMBlock) {
 		// rsync 3.2+ enables --protect-args by default, so the remote path is NOT
 		// run through the remote shell — a literal "$HOME" (emitted by
 		// memoryRepoDir for a "~"/empty session_home) never expands and resolves
-		// relative to the login dir (e.g. /Users/divy/$HOME/...). rsync DOES still
+		// relative to the login dir (e.g. /home/orchid/$HOME/...). rsync DOES still
 		// expand a leading "~" itself, so use that for home-relative paths.
 		remoteDir := strings.Replace(memoryStoreDir(cfg, vm), "$HOME", "~", 1)
 		src := fmt.Sprintf("%s@%s:%s/", vm.User, vm.Host, remoteDir)

@@ -145,7 +145,7 @@ export function SettingsMockup() {
         </label>
         <label className="dm-field">
           <span>Bot login</span>
-          <input value="divybot" readOnly />
+          <input value="mybot" readOnly />
         </label>
         <div className="dm-saved">✓ saved · changes auto-apply</div>
       </div>
@@ -277,8 +277,7 @@ export function ConfigMockup() {
 {K('github')} {'{\n  '}{A('inbox_repo')} = {S('denoland/orchid')}{'\n}\n\n'}
 {K('orchestrator')} {'{\n  '}{A('poll_interval')} = {S('30s')}{'\n  '}
 {A('branch_prefix')} = {S('orch/issue-')}{'\n  '}
-{A('bot_login')}     = {S('divybot')}{'\n  '}
-{A('ntfy_topic')}    = {S('REDACTED')}{'\n}\n\n'}
+{A('bot_login')}     = {S('mybot')}{'\n}\n\n'}
 {K('target')} {L('"clawpatrol"')} {'{\n  '}{A('label')} = {S('clawpatrol')}{'\n  '}
 {A('repo')}  = {S('denoland/clawpatrol')}{'\n}\n\n'}
 {K('vm')} {L('"fra1"')} {'{\n  '}{A('host')}     = {S('orchid@worker.fra1.example.com')}{'\n  '}
