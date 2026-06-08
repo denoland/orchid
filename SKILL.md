@@ -4,95 +4,83 @@ A skill file for chat agents (OpenClaw, Hermes, Claude Code) supervising
 an orchid instance. Drop this into the agent's skill directory or load it
 via `npx skill add orchid` / equivalent.
 
-You are the human-in-the-loop orchestration assistant for this repo. Your job is to monitor the swarm, open GitHub issues so workers pick them up, review PRs, and keep things running. You have an hourly wakeup scheduled to check health.
+You are the human-in-the-loop orchestration assistant for an orchid
+swarm. Your job is to monitor the swarm, open GitHub issues so workers
+pick them up, review PRs, and keep things running.
 
 ## What orchid is
 
-A GitHub-issue-to-PR swarm. Open an issue in `denoland/orchid` with a target label → orchid spawns a `claude` session on the VM → claude opens a PR → orchid relays reviews/CI → PR merged → session freed.
+A GitHub-issue-to-PR swarm. Open an issue in the inbox repo with a
+target label → orchid spawns a `claude` session on a host → claude
+opens a PR → orchid relays reviews/CI → PR merged → session freed.
 
-## VM
+## Host
+
+Fill these in for the instance you operate. The paths are the
+installer defaults (`install.sh`); adjust if you self-built.
 
 ```
-root@0.0.0.0
-Binary:   /root/orch/orch
-Config:   /root/orch/swarm.hcl
-State:    /root/orch/state.json
-Log:      /root/orch/orch.log
-Capacity: 30 concurrent sessions
-Dashboard: https://orchid.littledivy.com/
-Pane view: https://orchid.littledivy.com/pane?session=claude-N
-ntfy:     REDACTED
+SSH:       <user>@<orch-host>          # e.g. orchid@host or a Tailscale name
+Binary:    /usr/local/bin/orch
+Config:    /etc/orchid/swarm.hcl
+State:     /var/lib/orchid/state.db    # SQLite
+Logs:      journalctl -u orchid
+Service:   orchid.service
+Run user:  orchid                       # sessions run as this user, not root
+Dashboard: http://<orch-host>:8000/?token=<http_secret>
+Pane view: http://<orch-host>:8000/pane?session=claude-N
+Inbox repo: <owner/repo>                # github.inbox_repo in swarm.hcl
 ```
 
 ## Check health
 
 ```bash
-ssh root@0.0.0.0 "tmux list-sessions && tail -20 /root/orch/orch.log"
-ssh root@0.0.0.0 "cat /root/orch/state.json | python3 -m json.tool"
-ssh root@0.0.0.0 "tmux capture-pane -p -t claude-N -S -50"
+ssh <orch-host> "systemctl status orchid --no-pager && journalctl -u orchid -n 20 --no-pager"
+ssh <orch-host> "sudo -u orchid tmux list-sessions"
+ssh <orch-host> "sudo -u orchid tmux capture-pane -p -t claude-N -S -50"
+# structured state via the dashboard API:
+curl -s http://<orch-host>:8000/api/state -H "Authorization: Bearer <http_secret>" | python3 -m json.tool
 ```
 
 ## Restart orchid
 
 Orchid runs as a **systemd service** (`orchid.service`). Use systemctl — never `pkill`.
 
-> **WARNING:** `pkill -f '/root/orch/orch'` matches the tmux server process (its cmdline contains the orch path) and kills ALL worker sessions. Always use systemctl.
+> **WARNING:** `pkill -f orch` matches the tmux server process (its cmdline contains the orch path) and kills ALL worker sessions. Always use systemctl.
 
 ```bash
-ssh root@0.0.0.0 "systemctl restart orchid"
-ssh root@0.0.0.0 "systemctl status orchid"
+ssh <orch-host> "sudo systemctl restart orchid"
+ssh <orch-host> "sudo systemctl status orchid --no-pager"
 ```
 
-GH_TOKEN is stored in `/root/orch/env` (read by the unit's `EnvironmentFile=`).
+`GH_TOKEN` and relay env live in `/etc/orchid/env` (read by the unit's `EnvironmentFile=`).
 
-## Deploy new binary
+## Deploy a new binary
 
 ```bash
-ssh root@0.0.0.0 "systemctl stop orchid"
+ssh <orch-host> "sudo systemctl stop orchid"
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o orch-linux ./cmd/orch
-scp orch-linux root@0.0.0.0:/root/orch/orch && rm orch-linux
-ssh root@0.0.0.0 "systemctl start orchid && systemctl status orchid"
+scp orch-linux <orch-host>:/tmp/orch && rm orch-linux
+ssh <orch-host> "sudo install -m0755 /tmp/orch /usr/local/bin/orch && sudo systemctl start orchid && sudo systemctl status orchid --no-pager"
 ```
 
 ## Open work for workers
 
 ```bash
-gh issue create --repo denoland/orchid --label clawpatrol \
+gh issue create --repo <owner/repo> --label <target-label> \
   --title "..." --body "..."
 ```
 
-Labels: `clawpatrol` → `denoland/clawpatrol`, `orchid` → `denoland/orchid`, `deno` → `denoland/deno`
-
-## Inbox: denoland/orchid — filed issues
-
-| # | Title | Status |
-|---|---|---|
-| #8 | CA cert delivered over plain HTTP (critical) | open |
-| #9 | No IP pinning for join credentials (critical) | open |
-| #10 | Strip auth-bearing response headers (critical) | open |
-| #11 | Detect EUID==0 in join/run | open |
-| #12 | Local mode bind loopback not 0.0.0.0 | open |
-| #13 | `clawpatrol get-token` subcommand | open |
-| #14 | Doc: replace Node.js with Go | open |
-| #15 | Fix dual-stack IP format bug | open |
-| #16 | Fire-and-forget approval mode | open |
-| #17 | Matcher lowercase normalization | open |
-| #18 | Configurable LLM body truncation | open |
-| #19 | 1Password CLI integration | open |
-| #20 | Postgres SQL parser audit | open |
-| #21 | Plugin diagnostic log tab | open |
-| #22 | Unified match grammar | open |
-| #23 | First-time experience audit | open |
-| #24 | Generalize env pushdown | open |
-| #25 | ClickHouse dispatch architecture | open |
+Labels map to repos via the `target` blocks in `swarm.hcl` — one
+label per work repo. Use a label that matches a configured target.
 
 ## Operational notes
 
 - Killing orchid does **not** kill worker tmux sessions — they survive.
-- Closing the work-repo PR does **not** close the orchid inbox issue — must close inbox issue too.
+- Closing the work-repo PR does **not** close the orchid inbox issue — close the inbox issue too.
 - `GH_TOKEN=$(gh auth token)` must be in orchid's environment.
-- Worker sessions set XDG_RUNTIME_DIR=/run/user/1001 when invoking claude as the orchid user. If the session command is switched back to clawpatrol run, this is required: without it, runuser may inherit root runtime dir /run/user/0, so clawpatrol uses the wrong runtime socket directory and Claude API transport breaks inside panes.
-- Sessions run as `orchid` user (not root — claude blocks `--dangerously-skip-permissions` as root).
-- AppArmor: `apparmor_restrict_unprivileged_userns=0` persisted at `/etc/sysctl.d/99-clawpatrol.conf`.
-- State is written to `state.json` after bootstrap prompt is pasted (up to ~2 min after tmux session appears).
-- Hourly wakeup is scheduled to check health and restart if dead.
+- Sessions run as the `orchid` user (not root — claude blocks `--dangerously-skip-permissions` as root).
+- If sessions run through clawpatrol, the runuser invocation needs `XDG_RUNTIME_DIR=/run/user/<orchid-uid>` set, or it inherits root's runtime dir and clawpatrol uses the wrong socket directory — breaking the Claude API transport inside panes.
+- AppArmor: the installer persists `kernel.apparmor_restrict_unprivileged_userns=0` at `/etc/sysctl.d/99-orchid.conf` (needed for claude's unprivileged-userns sandbox).
+- State is written to `state.db` after the bootstrap prompt is pasted (up to ~2 min after the tmux session appears).
+- Consider an hourly wakeup to check health and restart if dead.
