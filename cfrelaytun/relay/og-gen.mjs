@@ -1,15 +1,16 @@
 // Generate per-page OpenGraph cards (1200×630) for the docs site.
-//   node og-gen.mjs   →   cfrelaytun/relay/public/og/<slug>.png
+//   node cfrelaytun/relay/og-gen.mjs   →   public/og/<slug>.png
 import { chromium } from 'playwright'
 import { readFileSync, mkdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 
-const ROOT = dirname(fileURLToPath(import.meta.url))
-const OUT = `${ROOT}/cfrelaytun/relay/public/og`
+const HERE = dirname(fileURLToPath(import.meta.url)) // cfrelaytun/relay
+const ROOT = resolve(HERE, '../..')                  // repo root
+const OUT = `${HERE}/public/og`
 mkdirSync(OUT, { recursive: true })
 
-const favicon = readFileSync(`${ROOT}/cfrelaytun/relay/public/favicon.svg`, 'utf8')
+const favicon = readFileSync(`${HERE}/public/favicon.svg`, 'utf8')
 const spray = readFileSync(`${ROOT}/.claude/skills/orchid-art/orchid-spray.svg`, 'utf8')
 
 // slug, title (on card), lede, footer path
