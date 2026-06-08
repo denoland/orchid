@@ -27,7 +27,7 @@ whichever host has a free slot, and each host can run multiple agent harnesses
 
 ### Usage-limit throttle
 
-The governor paces the swarm against your 5-hour and weekly quota, braking
+Configure the pacing of the swarm against your 5-hour and weekly quota, braking
 velocity as you approach the cap so you never run dry mid-flight. Each agent
 account (claude / codex) meters independently against its own
 quota; per-issue `priority = N` jumps the queue. See the
