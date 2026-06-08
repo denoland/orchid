@@ -1,62 +1,105 @@
+# orchid swarm config — example.
+#
+# Copy to where you run `orch -config` (the installer writes
+# /etc/orchid/swarm.hcl). Required blocks are uncommented; optional knobs are
+# shown commented out with their defaults. Full reference:
+# https://orchid.littledivy.com/docs/configuration
+
 github {
-  inbox_repo = "denoland/orchid"
+  inbox_repo = "your-org/your-inbox" # issues filed here drive the swarm
 }
 
 orchestrator {
   poll_interval = "30s"
-  state_db      = "/root/orch/state.db"
+  state_db      = "/var/lib/orchid/state.db"
   branch_prefix = "orch/issue-"
-  workdir_root  = "/home/orchid/orch-work"
-  http_addr     = ":8000"
-  http_secret   = "123"
-  bot_login     = "divybot"
+  workdir_root  = "/var/lib/orchid/orch-work"
 
-  # Git-backed shared memory. Agents' auto-memory is redirected per target repo
-  # into a clone of this repo (memory/<owner>/<repo>/*.md); orch commits + pushes
-  # on sync_interval, so the swarm's accumulated knowledge is durable, versioned,
-  # browsable on GitHub, and shared across boxes. Dashboard "Memory" tab reads it.
-  memory {
-    enabled       = true
-    repo          = "denoland/orchid" # default: inbox_repo
-    branch        = "main"
-    dir           = "memory"
-    sync_interval = "5m"
-  }
+  http_addr   = ":8000"     # dashboard bind address
+  http_secret = "change-me" # dashboard bearer token — `openssl rand -hex 16`
+
+  # GitHub identity the agent commits and pushes as. Defaults to the
+  # gh-authenticated user on the host.
+  # bot_login = "mybot"
+  # bot_email = "mybot@users.noreply.github.com"
+
+  # Extra GitHub logins allowed to view the dashboard (via the optional relay).
+  # allowed_logins = ["teammate1", "teammate2"]
+
+  # Git-backed shared memory: agents' notes are committed to a repo and shared
+  # across the swarm, browsable in the dashboard's Memory tab. Off by default.
+  # memory {
+  #   enabled       = true
+  #   repo          = "your-org/your-inbox" # default: inbox_repo
+  #   branch        = "main"
+  #   dir           = "memory"
+  #   sync_interval = "5m"
+  # }
+
+  # Usage-limit throttle + pacing governor. Off by default (reactive only).
+  # Paces the swarm against your 5h/weekly quota so it never runs dry.
+  # throttle {
+  #   governor_enabled   = true
+  #   weekly_ceiling_pct = 92   # hard stop as the weekly quota nears this
+  #   max_active         = 8    # adaptive ceiling on concurrent sessions
+  #   duty_cycle         = true # SIGSTOP/SIGCONT pacing of running sessions
+  #   # sample_interval    = "90s"
+  #   # max_context_tokens = 500000 # /clear a session past this (token saver)
+  # }
+
+  # Auto-spawn sessions from @mentions in the inbox org. Off by default.
+  # mentions {
+  #   org         = "your-org"
+  #   acknowledge = true
+  # }
 }
 
-# Each target maps an issue label (in the inbox repo) to a work repo.
-# Issue labeled `deno` → orch clones denoland/deno, claude opens PR there.
+# Targets map an inbox issue label → a work repo. An issue labeled `deno` makes
+# orch clone the repo, run a session, and open a PR there. Add one per repo.
 target "deno" {
   label = "deno"
   repo  = "denoland/deno"
 }
 
-target "orchid" {
-  label = "orchid"
-  repo  = "denoland/orchid"
+# target "myrepo" {
+#   label = "myrepo"
+#   repo  = "your-org/myrepo"
+# }
+
+# Machines run the agent sessions, driven over SSH. "localhost" runs in-process;
+# add more `machine` blocks (host = "user@box" or a Tailscale name) to scale out.
+machine "local" {
+  host         = "localhost"
+  session_home = "/home/orchid"
+
+  # One `agent` block per agent/account on this machine. The label is the agent
+  # CLI (`claude` or `codex`); capacity = max concurrent sessions.
+  agent "claude" {
+    capacity = 8
+
+    # session_cmd is the exact command tmux launches per session. The default
+    # runs `claude --dangerously-skip-permissions` as the session_home user.
+    # Override to set the run-user, inject git identity / env, or wrap the agent
+    # (e.g. pipe it through clawpatrol for egress control).
+    # session_cmd = "runuser -u orchid -- claude --dangerously-skip-permissions"
+  }
+
+  # A second account on the same box — e.g. codex alongside claude:
+  # agent "codex" {
+  #   capacity   = 4
+  #   account    = "codex"
+  #   codex_home = "$HOME/.codex" # isolate this codex login's auth + telemetry
+  # }
 }
 
-target "clawpatrol" {
-  label = "clawpatrol"
-  repo  = "denoland/clawpatrol"
-}
+# machine "fra1" {
+#   host         = "orchid@worker.fra1.example.com" # or a Tailscale name
+#   session_home = "/home/orchid"
+#   agent "claude" { capacity = 16 }
+# }
 
-target "sui" {
-  label = "sui"
-  repo  = "denoland/sui"
-}
-
-target "fastwebsockets" {
-  label = "fastwebsockets"
-  repo  = "denoland/fastwebsockets"
-}
-
-target "clawpatrol-deno" {
-  label = "clawpatrol-deno"
-  repo  = "denoland/clawpatrol-deno"
-}
-
-# Placeholders use {{...}} (not ${...}) to avoid HCL interpolation.
+# Prompt pasted into every fresh session. Placeholders use {{...}} (not ${...})
+# to avoid HCL interpolation.
 bootstrap_prompt = <<EOT
 You are implementing GitHub issue #{{issue.number}} from {{inbox.repo}}: "{{issue.title}}"
 
@@ -122,18 +165,3 @@ Then stop and wait. The orchestrator sends a follow-up when reviews, comments,
 or CI results arrive. Address them, push fixes, stop again.
 The session ends automatically when the PR merges or closes.
 EOT
-
-machine "local" {
-  host         = "localhost"
-  session_home = "/home/orchid"
-
-  agent "claude" {
-    capacity    = 30
-    session_cmd = "runuser -u orchid -- env XDG_RUNTIME_DIR=/run/user/1001 GIT_AUTHOR_NAME=divybot GIT_AUTHOR_EMAIL=divybot@users.noreply.github.com GIT_COMMITTER_NAME=divybot GIT_COMMITTER_EMAIL=divybot@users.noreply.github.com claude --dangerously-skip-permissions"
-  }
-}
-
-target "deno_core" {
-  label = "deno_core"
-  repo  = "denoland/deno"
-}
