@@ -57,3 +57,6 @@ npx -y @openclaw/cli@latest skill install https://orchid.littledivy.com/skill.md
 
 See [docs/supervision.md](docs/SUPERVISION.md).
 
+### License
+
+MIT License
