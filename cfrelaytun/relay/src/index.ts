@@ -248,14 +248,61 @@ app.use('*', async (c, next) => {
 })
 
 // ─── apex routes (orchid.littledivy.com) ───
+// ─── OpenGraph / social cards ───────────────────────────────────────────
+// Crawlers don't run the SPA, so per-route og:/twitter: tags must be baked
+// into the served HTML. index.html ships defaults; we override them here per
+// docs page. Titles/ledes mirror www/src/Docs.tsx PAGES.
+type Meta = { title: string; desc: string; slug: string }
+const LANDING: Meta = {
+  title: 'Orchid — high velocity coding agent orchestration',
+  desc: 'A self-hosted swarm of coding agents that ship pull requests.',
+  slug: 'default',
+}
+const DOCS_INDEX: Meta = {
+  title: 'Documentation · Orchid',
+  desc: 'Everything orchid knows how to do — written down.',
+  slug: 'docs',
+}
+const PAGE_META: Record<string, Meta> = {
+  'getting-started': { slug: 'getting-started', title: 'Getting started · Orchid', desc: 'Install on a machine, connect GitHub, file your first inbox issue.' },
+  'dashboard':       { slug: 'dashboard',       title: 'Dashboard · Orchid',       desc: 'Tour the session list, PR/CI status, panes, and settings.' },
+  'configuration':   { slug: 'configuration',   title: 'Configuration · Orchid',   desc: 'Every field in swarm.hcl, what it does, when to change it.' },
+  'throttling':      { slug: 'throttling',      title: 'Throttling & pacing · Orchid', desc: 'Spend the weekly quota evenly — hard gate, adaptive governor, duty-cycling, priority.' },
+  'targets':         { slug: 'targets',         title: 'Targets · Orchid',         desc: 'Route labels in the inbox to different work repos.' },
+  'vms':             { slug: 'vms',             title: 'VMs · Orchid',             desc: 'Scale the swarm across multiple machines.' },
+  'security':        { slug: 'security',        title: 'Security · Orchid',        desc: 'Sandbox sessions with clawpatrol; rotate tokens.' },
+  'tailscale':       { slug: 'tailscale',       title: 'Tailscale · Orchid',       desc: 'Run orch without public IPs using your own tailnet.' },
+  'memory':          { slug: 'memory',          title: 'Memory · Orchid',          desc: 'Shared, git-backed knowledge base the swarm accumulates across sessions.' },
+  'supervision':     { slug: 'supervision',     title: 'Supervision · Orchid',     desc: 'Chat with your orchid on Telegram, Slack, Discord via OpenClaw or Hermes.' },
+  'architecture':    { slug: 'architecture',    title: 'Architecture · Orchid',    desc: 'How orch, the relay, and Claude sessions fit together.' },
+}
+
+// Serve index.html with per-route og/twitter tags rewritten in.
+async function serveShell(c: any, meta: Meta): Promise<Response> {
+  const origPath = new URL(c.req.url).pathname
+  const u = new URL(c.req.url); u.pathname = '/index.html'
+  const res = await c.env.ASSETS.fetch(new Request(u, c.req.raw))
+  const base = `https://${c.env.ROOT_DOMAIN}`
+  const url = base + origPath
+  const img = `${base}/og/${meta.slug}.png`
+  const content = (val: string) => ({ element(e: any) { e.setAttribute('content', val) } })
+  return new HTMLRewriter()
+    .on('title', { element(e: any) { e.setInnerContent(meta.title) } })
+    .on('meta[name="description"]', content(meta.desc))
+    .on('meta[property="og:title"]', content(meta.title))
+    .on('meta[property="og:description"]', content(meta.desc))
+    .on('meta[property="og:url"]', content(url))
+    .on('meta[property="og:image"]', content(img))
+    .on('meta[name="twitter:title"]', content(meta.title))
+    .on('meta[name="twitter:description"]', content(meta.desc))
+    .on('meta[name="twitter:image"]', content(img))
+    .transform(res)
+}
+
 // Apex "/" serves the SPA shell. There is no separate landing page: the app's
 // root gate renders the docs (with a Sign in button) for signed-out visitors
 // and the dashboard for signed-in users.
-app.get('/', async (c) => {
-  const u = new URL(c.req.url)
-  u.pathname = '/index.html'
-  return c.env.ASSETS.fetch(new Request(u, c.req.raw))
-})
+app.get('/', (c) => serveShell(c, LANDING))
 
 app.get('/login', (c) => handleLogin(c.env, c.req.raw))
 
@@ -283,15 +330,10 @@ app.get('/healthz', (c) => c.text('ok'))
 // /docs[/<slug>] on the apex serves the SPA shell so the React Docs
 // route can mount and render bundled markdown. Raw .md files under
 // /docs/*.md still hit ASSETS directly via the catch-all below.
-app.get('/docs', (c) => {
-  const u = new URL(c.req.url); u.pathname = '/index.html'
-  return c.env.ASSETS.fetch(new Request(u, c.req.raw))
-})
+app.get('/docs', (c) => serveShell(c, DOCS_INDEX))
 app.get('/docs/:slug', async (c) => {
-  const u = new URL(c.req.url)
-  if (u.pathname.endsWith('.md')) return c.env.ASSETS.fetch(c.req.raw)
-  u.pathname = '/index.html'
-  return c.env.ASSETS.fetch(new Request(u, c.req.raw))
+  if (new URL(c.req.url).pathname.endsWith('.md')) return c.env.ASSETS.fetch(c.req.raw)
+  return serveShell(c, PAGE_META[c.req.param('slug')] ?? DOCS_INDEX)
 })
 
 app.all('*', (c) => c.env.ASSETS.fetch(c.req.raw))
