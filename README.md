@@ -19,26 +19,29 @@ from one session to a whole fleet.
 
 ## Cluster
 
-Add a machine, it joins the pool — orchid drives every box over plain SSH,
-no agent or inbound ports on the workers. Sessions dispatch to whichever
-host has a free slot; each can run a different agent.
-
-<img src="docs/img/feat-cluster.png" width="640" alt="machine cluster">
+A machine is anything that runs `tmux` + your agent over SSH — orchid drives
+them all, with no agent or inbound ports on the workers. Sessions dispatch to
+whichever host has a free slot, and each host can run a different agent
+(`claude`, `codex`, …). Add a box, it joins the pool. See the
+[VMs docs](https://orchid.littledivy.com/docs/vms).
 
 ## Usage-limit throttle
 
-The governor paces the swarm against your 5-hour and weekly quota — braking
+The governor paces the swarm against your 5-hour and weekly quota, braking
 velocity as you approach the cap so you never run dry mid-flight. Each agent
-account is metered independently.
-
-<img src="docs/img/feat-throttle.png" width="280" alt="usage and pacing">
+account (claude / codex / codex-mini) meters independently against its own
+quota; per-issue `priority = N` jumps the queue. See the
+[Throttling docs](https://orchid.littledivy.com/docs/throttling).
 
 ## Memory
 
-A git-backed, Karpathy-style note store the whole swarm reads and writes —
-shared across repos, browsable as a tree, with backlinks between notes.
-
-<img src="docs/img/feat-memory.png" width="640" alt="shared memory notes">
+A persistent, git-backed knowledge base the swarm writes across sessions, so it
+stops re-deriving the same things (build incantations, test recipes, maintainer
+preferences). It's [Andrej Karpathy's "LLM wiki"
+pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) —
+plain interlinked markdown the agents maintain themselves — shared across repos,
+browsable as a tree with backlinks in the dashboard's **Memory** tab. See the
+[Memory docs](https://orchid.littledivy.com/docs/memory).
 
 ### Setup
 
