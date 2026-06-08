@@ -14,7 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - uses: actions/setup-go@v5
         with:
@@ -23,8 +25,8 @@ jobs:
       - name: Build dashboard SPA
         working-directory: www
         run: |
-          bun install
-          bun run build
+          npm install
+          npm run build
 
       - name: Build orch binaries
         run: |

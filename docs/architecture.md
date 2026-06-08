@@ -37,7 +37,7 @@ Tailscale — that's the default self-host path.
 replaces both the daemon and the UI. The build pipeline is just:
 
 ```bash
-cd www && bun run build              # → internal/orch/embed-dist
+cd www && npm run build              # → internal/orch/embed-dist
 go build -o orch ./cmd/orch          # embeds + compiles
 ```
 

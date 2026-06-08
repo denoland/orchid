@@ -13,7 +13,7 @@ Cloudflare Worker that hosts orchid.littledivy.com:
 cd cfrelaytun/relay
 npm install
 # build the dashboard SPA + sync it (and docs) into ./public:
-( cd ../../www && bun run build )
+( cd ../../www && npm run build )
 cp -R ../../internal/orch/embed-dist/_a public/_a
 cp ../../internal/orch/embed-dist/index.html public/index.html
 rm -rf public/docs && cp -R ../../docs public/docs

@@ -4,7 +4,7 @@
   "workspaces": [
     "www",
     "www/whiteboard",
-    "cf"
+    "cfrelaytun/relay"
   ],
   "devDependencies": {
     "playwright": "^1.60.0"

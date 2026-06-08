@@ -1,5 +1,5 @@
 // Headless screenshot pipeline for docs.
-// Run: cd www && bun run dev   (in another shell)
+// Run: cd www && npm run dev   (in another shell)
 // Then: node docs/img/snap.mjs
 
 import { chromium } from 'playwright'
