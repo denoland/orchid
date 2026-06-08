@@ -1,6 +1,6 @@
 ### orchid
 
-Orchestration and project management with coding agents
+High velocity coding agent orchestration
 
 <img width="601" height="419" alt="image" src="https://github.com/user-attachments/assets/0bc63b69-6f92-406c-befa-aba122fb31d2" />
 
@@ -19,9 +19,13 @@ user-level systemd service, and prints your dashboard URL:
 http://localhost:8000/?token=<secret>
 ```
 
+## Documentation
+
+https://orchid.littledivy.com/
+
 ## Configuration
 
-See [./swarm.hcl](swarm.hcl)
+See example [./swarm.hcl](swarm.hcl)
 
 ## Chat with your orchid
 
