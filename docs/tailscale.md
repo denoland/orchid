@@ -1,10 +1,11 @@
 # {{illust:vine-mesh}} Tailscale
 
-The relay (`orchid.littledivy.com`) is one way to reach your
-dashboard without a public IP. **Tailscale** is the other: spin up
-your own private mesh, run orch on a node, and hit it from any
-device on the tailnet. No relay involvement, no third-party domain,
-no inbound port forwarding.
+By default the dashboard binds a local port — fine on the LAN, but
+you'll want a way to reach it from your phone or laptop elsewhere.
+**Tailscale** is the simplest: spin up your own private mesh, run
+orch on a node, and hit it from any device on the tailnet. No
+third-party domain, no inbound port forwarding. (The optional relay
+in `cf/` is the alternative — a public subdomain you self-deploy.)
 
 This setup also lets the central orch reach VMs behind NAT — useful
 when your "worker" is a laptop, a beefy desktop at home, or a node
@@ -63,8 +64,7 @@ Or use `127.0.0.1:8000` and reach the dashboard through Tailscale's
 own port-forward / ssh-tunnel. Either way the open internet sees
 nothing.
 
-**4. Skip the relay if you want.** Drop the `orch join` step
-entirely. The dashboard is reachable at
+**4. That's it — no relay needed.** The dashboard is reachable at
 `http://<central>.tail-abc.ts.net:8000/?token=<http_secret>` — phone,
 laptop, anywhere on the tailnet.
 
@@ -75,23 +75,22 @@ laptop, anywhere on the tailnet.
 | One beefy box at home | Central + sessions on that box; tailscale for remote access only. |
 | Home box + VPS | VPS as central (always-on); home as VM via tailscale (free compute). |
 | Multiple workstations | Pick one as central; tag others with `vm` role in Tailscale ACL. |
-| Pure cloud | Central + workers on cloud nodes; tailscale optional, relay does the same job. |
+| Pure cloud | Central + workers on cloud nodes; tailscale optional, the relay does the same job. |
 
 ## Tailscale vs the relay
 
-Both solve the "no public IP" problem. Pick by what bothers you
-more:
+Both solve the "no public IP" problem. Pick by what fits:
 
-| | Relay | Tailscale |
+| | Relay (`cf/`) | Tailscale |
 |---|---|---|
-| **Setup** | One signup, one `orch join`. | Per-node install + login. |
-| **Cost** | Free for now. | Free for up to 3 users / 100 devices. |
-| **Trust boundary** | `orchid.littledivy.com` operator. | Tailscale + your ACL config. |
+| **Setup** | Deploy a Worker to your CF account + domain. | Per-node install + login. |
+| **Cost** | Cloudflare Workers free tier. | Free for up to 3 users / 100 devices. |
+| **Reach** | Public URL — share with anyone you allow-list. | Private mesh — devices you've enrolled. |
 | **Cross-device chat** | Tunnels everything over CF Workers. | Direct WireGuard mesh. |
 | **VM ↔ central** | Still goes over SSH (you pick reachability). | Same SSH, but tailnet eliminates NAT. |
 
-You can run both. The relay handles the dashboard; the tailnet
-handles VM connectivity.
+You can run both. The relay handles public dashboard access; the
+tailnet handles VM connectivity.
 
 ## SSH key plumbing
 

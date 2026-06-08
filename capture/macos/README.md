@@ -45,8 +45,9 @@ bundles it as a proper `.app` and you get the SwiftUI canvas.
 
 Open the popover → `…` menu → **Settings...** → **Endpoint** tab. Paste:
 
-- **Endpoint URL** — e.g. `http://127.0.0.1:8787/api/drafts` (local dev)
-  or `https://orchid.littledivy.com/api/drafts` (prod).
+- **Endpoint URL** — wherever your orch is reachable, e.g.
+  `http://127.0.0.1:8000/api/drafts` (local) or
+  `http://<host>:8000/api/drafts` (LAN / Tailscale).
 - **X-Capture-Token** — the same token you set in the orch `capture.auth_token`
   config.
 

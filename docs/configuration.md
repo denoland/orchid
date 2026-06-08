@@ -41,7 +41,7 @@ orchestrator {
 | `orchestrator.http_secret` | Bearer token for the dashboard + capture endpoint. |
 | `orchestrator.bot_login` | GitHub login Claude commits as. |
 | `orchestrator.ntfy_topic` | Optional ntfy.sh topic for PR-merged push notifications. |
-| `orchestrator.allowed_logins` | GitHub usernames that can read your dashboard via the relay. |
+| `orchestrator.allowed_logins` | Extra GitHub usernames allowed to read your dashboard (used by the optional relay's OAuth). |
 
 ## Targets
 
@@ -188,7 +188,7 @@ issues, add a `capture` block:
 capture {
   auth_token  = "<32-hex>"
   assets_dir  = "/home/divy/.orch/captures"
-  public_url  = "https://<sub>.orchid.littledivy.com"
+  public_url  = "http://<host>:8000"
 }
 ```
 

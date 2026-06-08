@@ -183,7 +183,7 @@ export function CaptureMockup() {
 
 // ─── install terminal ────────────────────────────────────────────────
 // A terminal-only mockup (no browser frame) showing the curl install +
-// orch join one-liners.
+// install one-liner → self-hosted dashboard URL.
 export function InstallMockup() {
   return (
     <div className="docs-term">
@@ -200,8 +200,8 @@ export function InstallMockup() {
         <span className="t-dim">  ▶ building orch → ~/.local/bin/orch</span>{'\n'}
         <span className="t-ok">  ✓ user service enabled</span>{'\n'}
         {'\n'}
-        <span className="t-prompt">$</span> <span className="t-cmd">orch join wss://divy.orchid.littledivy.com/agent ab38…91f2</span>{'\n'}
-        <span className="t-ok">  ✓ connected to relay as divy</span>{'\n'}
+        <span className="t-ok">  ✓ orchid is running</span>{'\n'}
+        <span className="t-dim">  dashboard : http://192.168.1.20:8000/?token=ab38…91f2</span>{'\n'}
       </pre>
     </div>
   )

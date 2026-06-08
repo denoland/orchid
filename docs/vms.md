@@ -19,7 +19,8 @@ inbound ports on the worker.
 ## Adding a VM
 
 The central orch generates an invite token; the new VM runs the
-installer + `orch join vm`. The pair handshakes over the relay:
+installer + `orch join vm`. The VM reaches the central directly over
+HTTP — no relay involved:
 
 **Central** — copy the join command from Settings → VMs → "Add VM",
 or generate one by hand:
@@ -27,15 +28,19 @@ or generate one by hand:
 ```bash
 orch invite-vm
 # prints:
-# orch join vm wss://<sub>.orchid.littledivy.com/agent <invite-token>
+# orch join vm http://<central-host>:8000 <invite-token>
 ```
 
 **VM (fresh Linux box, your user)** — paste both lines:
 
 ```bash
 curl -fsSL https://orchid.littledivy.com/install.sh | WORKER=1 bash
-orch join vm wss://<sub>.orchid.littledivy.com/agent <invite-token>
+orch join vm http://<central-host>:8000 <invite-token>
 ```
+
+Use the central's LAN IP, a Tailscale address, or — if you deployed
+the relay — your subdomain. Whatever URL the VM can reach the central
+on works.
 
 What happens under the hood:
 

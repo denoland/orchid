@@ -2,10 +2,11 @@
 
 {{mockup:dashboard}}
 
-Each orchid user has a personal dashboard at
-`<your-handle>.orchid.littledivy.com`. It's a single-page React app
-served by the relay; the data behind it streams over a single
-WebSocket per tab.
+`orch` serves the dashboard itself at `http://<host>:8000` (the
+`orchestrator.http_addr` port). It's a single-page React app embedded
+in the binary; the data behind it streams over a single WebSocket per
+tab. If you deploy the optional relay, the same dashboard is also
+reachable on your public subdomain.
 
 ## Tabs
 
@@ -73,7 +74,8 @@ rows and tables stack below 640px.
 ## Multi-user
 
 Add logins to `orchestrator.allowed_logins` in `swarm.hcl` (or
-through Settings → Access). They sign in with GitHub at the apex,
-get redirected to your subdomain, and see the same dashboard. They
-can review PRs and chat to sessions; only the owner can change
-config or revoke the agent token.
+through Settings → Access) to grant teammates read access. Over the
+optional relay they sign in with GitHub and land on the same
+dashboard; on a bare self-host you share the tokened URL (or a
+Tailscale address). They can review PRs and chat to sessions; only the
+owner can change config or revoke the agent token.

@@ -11,7 +11,7 @@ const PAGES: Page[] = [
     title: 'Getting started',
     file: 'getting-started.md',
     section: 'start',
-    lede: 'Sign in, install on a machine, file your first inbox issue.',
+    lede: 'Install on a machine, connect GitHub, file your first inbox issue.',
   },
   {
     slug: 'dashboard',
@@ -209,9 +209,9 @@ export function Docs() {
         </a>
         <div className="docs-nav-right">
           <DocsThemeToggle />
-          <a className="docs-signin" href="/login">
+          <a className="docs-signin" href="https://github.com/denoland/orchid" target="_blank" rel="noopener">
             <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.49c-2.23.48-2.7-.95-2.7-.95-.36-.93-.9-1.18-.9-1.18-.73-.5.06-.49.06-.49.81.06 1.24.83 1.24.83.72 1.24 1.9.88 2.36.67.07-.52.28-.88.5-1.08-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.66 7.66 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.74.54 1.5v2.22c0 .21.15.46.55.38A8 8 0 0 0 8 0z"/></svg>
-            Sign in
+            GitHub
           </a>
         </div>
       </header>

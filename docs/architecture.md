@@ -4,27 +4,31 @@ A high-level map of what runs where and how the pieces talk.
 
 ## Components
 
-Three processes you actually run:
+Two processes you actually run:
 
-1. **The Cloudflare Worker** (`cf/`) — hosts the landing page, GitHub
-   OAuth, and routes each user's traffic to their personal Durable
-   Object. The DO holds the live WebSocket to the user's agent and
-   does hibernated multiplexing of dashboard subscribers.
-2. **`orch`** — the Go binary on your machine. Polls GitHub, spawns
-   tmux sessions, relays reviews back, serves the dashboard on a
-   local port, opens an outbound WS to the relay so the dashboard
-   is reachable on your subdomain.
-3. **Claude sessions** — `claude --dangerously-skip-permissions`
+1. **`orch`** — the Go binary on your machine. Polls GitHub, spawns
+   tmux sessions, relays reviews back, and serves the dashboard on a
+   local port (`:8000` by default).
+2. **Claude sessions** — `claude --dangerously-skip-permissions`
    inside tmux. Each session owns one issue; orch pastes
    bootstrap prompt + review summaries via `tmux load-buffer`.
 
+Plus one **optional** process:
+
+3. **The relay** (`cf/`) — a Cloudflare Worker that fronts the
+   dashboard with a public subdomain + GitHub OAuth, routing each
+   user's traffic to their personal Durable Object. The DO holds a
+   live WebSocket to the agent and does hibernated multiplexing of
+   dashboard subscribers. Deploy it to your own Cloudflare account if
+   you want public access; skip it otherwise.
+
 ## Why a relay at all
 
-So you don't have to expose a public IP. The agent opens one
-outbound WS to `wss://<sub>.orchid.littledivy.com/agent`; the DO
-proxies dashboard fetches + WS upgrades back over that tunnel.
-Self-hosters can skip the relay entirely and hit the orch HTTP
-server directly on `:8000` from the LAN or via Tailscale.
+So you don't have to expose a public IP. When deployed, the agent
+opens one outbound WS to the relay; the DO proxies dashboard fetches +
+WS upgrades back over that tunnel. You can skip the relay entirely and
+hit the orch HTTP server directly on `:8000` from the LAN or via
+Tailscale — that's the default self-host path.
 
 ## Single binary, embedded SPA
 
@@ -54,12 +58,12 @@ files in the same dir get auto-imported once and renamed
 ## Auth surfaces
 
 - **Dashboard / API** — `Authorization: Bearer <http_secret>` for
-  direct hits, or the relay session cookie when going through
-  `<sub>.orchid.littledivy.com`.
+  direct hits, or the relay session cookie when fronted by the
+  optional relay.
 - **Capture intake** — `X-Capture-Token: <auth_token>` (separate
   from `http_secret` so leaking it doesn't grant dashboard access).
 - **Worker join** — central `http_secret` doubles as the bearer the
   worker's `orch join vm` presents.
-- **Agent ↔ relay** — one-time agent token issued at signup; can be
-  rotated via Settings → Revoke.
+- **Agent ↔ relay** — when the relay is deployed, a one-time agent
+  token authenticates the outbound WS; rotate it via Settings → Revoke.
 
