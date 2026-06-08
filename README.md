@@ -10,25 +10,35 @@ File a GitHub issue, orchid spins up a coding agent to ship the PR — then
 relays reviews and CI back into the session until it merges. Scale that
 from one session to a whole fleet.
 
-**Scale** — from a couple of sessions to hundreds, fanned across every core
-you give it.
+- **Scale** — from a couple of sessions to hundreds, fanned across every core you give it.
+- **Load balancing** — run sessions across a cluster of machines over plain SSH.
+- **Mix harnesses** — Claude, Codex, Pi, or opencode, side by side in one swarm.
+- **Usage-limit throttle** — adaptive pacing against your weekly quota.
+- **Shared memory** — Karpathy-style memory notes shared across the cluster.
+- **Git-native** — prioritize and manage work through GitHub issues and PRs.
 
-**Load balancing** — run sessions across a cluster of machines over plain
-SSH. Add a box, it joins the pool.
+## Cluster
 
-**Mix harnesses** — Claude, Codex, Pi, or opencode, side by side in the same
-swarm.
+Add a machine, it joins the pool — orchid drives every box over plain SSH,
+no agent or inbound ports on the workers. Sessions dispatch to whichever
+host has a free slot; each can run a different agent.
 
-**Usage-limit throttle** — adaptive pacing against your weekly quota so the
-swarm never runs out of tokens mid-flight.
+<img src="docs/img/feat-cluster.png" width="640" alt="machine cluster">
 
-<img src="docs/img/feat-throttle.png" width="240" alt="usage and pacing">
+## Usage-limit throttle
 
-**Shared memory** — Karpathy-style memory notes the whole cluster reads and
-writes.
+The governor paces the swarm against your 5-hour and weekly quota — braking
+velocity as you approach the cap so you never run dry mid-flight. Each agent
+account is metered independently.
 
-**Git-native** — prioritize and manage work through GitHub issues and PRs,
-nothing else to learn.
+<img src="docs/img/feat-throttle.png" width="280" alt="usage and pacing">
+
+## Memory
+
+A git-backed, Karpathy-style note store the whole swarm reads and writes —
+shared across repos, browsable as a tree, with backlinks between notes.
+
+<img src="docs/img/feat-memory.png" width="640" alt="shared memory notes">
 
 ### Setup
 
