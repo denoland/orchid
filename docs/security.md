@@ -81,7 +81,7 @@ By default the orch HTTP listener binds `0.0.0.0:8000`. The bearer
 - **Bind loopback.** `http_addr = "127.0.0.1:8000"` plus an SSH
   tunnel or [Tailscale](/docs/tailscale) for remote dashboard access.
 - **Front it with the relay.** If you deploy the optional relay
-  (`cf/`), let the dashboard be reached only through it and lock the
+  (`cfrelaytun/relay/`), let the dashboard be reached only through it and lock the
   local HTTP listener to loopback so even the LAN can't hit it.
 
 ## Dashboard ACL

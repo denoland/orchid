@@ -15,7 +15,7 @@ Two processes you actually run:
 
 Plus one **optional** process:
 
-3. **The relay** (`cf/`) — a Cloudflare Worker that fronts the
+3. **The relay** (`cfrelaytun/relay/`) — a Cloudflare Worker that fronts the
    dashboard with a public subdomain + GitHub OAuth, routing each
    user's traffic to their personal Durable Object. The DO holds a
    live WebSocket to the agent and does hibernated multiplexing of

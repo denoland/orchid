@@ -5,7 +5,7 @@ you'll want a way to reach it from your phone or laptop elsewhere.
 **Tailscale** is the simplest: spin up your own private mesh, run
 orch on a node, and hit it from any device on the tailnet. No
 third-party domain, no inbound port forwarding. (The optional relay
-in `cf/` is the alternative — a public subdomain you self-deploy.)
+in `cfrelaytun/relay/` is the alternative — a public subdomain you self-deploy.)
 
 This setup also lets the central orch reach VMs behind NAT — useful
 when your "worker" is a laptop, a beefy desktop at home, or a node
@@ -81,7 +81,7 @@ laptop, anywhere on the tailnet.
 
 Both solve the "no public IP" problem. Pick by what fits:
 
-| | Relay (`cf/`) | Tailscale |
+| | Relay (`cfrelaytun/relay/`) | Tailscale |
 |---|---|---|
 | **Setup** | Deploy a Worker to your CF account + domain. | Per-node install + login. |
 | **Cost** | Cloudflare Workers free tier. | Free for up to 3 users / 100 devices. |

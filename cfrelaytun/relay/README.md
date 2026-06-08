@@ -10,9 +10,13 @@ Cloudflare Worker that hosts orchid.littledivy.com:
 ## Dev
 
 ```bash
-cd relay
+cd cfrelaytun/relay
 npm install
-cp ../www/dist public/dash       # bundle the React dashboard into the worker
+# build the dashboard SPA + sync it (and docs) into ./public:
+( cd ../../www && bun run build )
+cp -R ../../internal/orch/embed-dist/_a public/_a
+cp ../../internal/orch/embed-dist/index.html public/index.html
+rm -rf public/docs && cp -R ../../docs public/docs
 npx wrangler kv namespace create OAUTH     # update id in wrangler.toml
 npx wrangler secret put GH_CLIENT_ID
 npx wrangler secret put GH_CLIENT_SECRET

@@ -9,7 +9,7 @@
     "tail": "wrangler tail"
   },
   "dependencies": {
-    "cfrelaytun": "file:../cfrelaytun/worker",
+    "cfrelaytun": "file:../worker",
     "hono": "^4.6.0"
   },
   "devDependencies": {

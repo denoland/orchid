@@ -71,7 +71,7 @@ IP, you have two options:
 
 - **[Tailscale](/docs/tailscale)** — put the host on your tailnet and
   hit it from any device. No third-party domain, no port forwarding.
-- **The relay (`cf/`)** — an optional Cloudflare Worker in the repo
+- **The relay (`cfrelaytun/relay/`)** — an optional Cloudflare Worker in the repo
   that gives you a public subdomain + GitHub OAuth in front of the
   dashboard. Deploy it to your own Cloudflare account and domain.
 
