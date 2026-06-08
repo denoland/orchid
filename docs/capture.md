@@ -39,13 +39,14 @@ Add a capture block to `swarm.hcl`:
 capture {
   auth_token  = "<32-hex; treat as a secret>"
   assets_dir  = "/home/divy/.orch/captures"
-  public_url  = "https://<sub>.orchid.littledivy.com"
+  public_url  = "http://<host>:8000"
 }
 ```
 
-`auth_token` is the bearer the apps send. `public_url` is the
-internet-reachable base URL — apps fetch images/voice via it. The
-relay's per-user subdomain works out of the box.
+`auth_token` is the bearer the apps send. `public_url` is the base URL
+the apps reach orch on — apps fetch images/voice via it. Use whatever
+address the apps can hit: a LAN IP, a Tailscale name, or your relay
+subdomain if you deployed one.
 
 ## macOS menu-bar app
 

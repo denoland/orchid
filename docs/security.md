@@ -80,9 +80,9 @@ By default the orch HTTP listener binds `0.0.0.0:8000`. The bearer
 
 - **Bind loopback.** `http_addr = "127.0.0.1:8000"` plus an SSH
   tunnel or [Tailscale](/docs/tailscale) for remote dashboard access.
-- **Stay on the relay.** Let the dashboard be reached only via
-  `<sub>.orchid.littledivy.com`; lock the local HTTP listener to
-  loopback so even the LAN can't hit it.
+- **Front it with the relay.** If you deploy the optional relay
+  (`cf/`), let the dashboard be reached only through it and lock the
+  local HTTP listener to loopback so even the LAN can't hit it.
 
 ## Capture intake
 
@@ -102,9 +102,9 @@ agent token. Revocation is immediate.
 
 - Rotate `http_secret` if any teammate leaves. Both `/api/*` and the
   agent join token are derived from it.
-- Rotate the relay agent token via **Settings → Revoke**. Issues a
-  fresh token, drops the current WS, the agent reconnects with the
-  new token on first try.
+- If you run the relay, rotate its agent token via **Settings →
+  Revoke**. Issues a fresh token, drops the current WS, the agent
+  reconnects with the new token on first try.
 - `state.db` contains every PR diff orch has seen plus the inbox
   issue bodies. Treat it like source: back it up if it matters,
   destroy it before recycling the VM.
@@ -115,5 +115,5 @@ If you only do three things:
 
 1. Run sessions as a non-root user.
 2. Pipe sessions through clawpatrol with an egress allow-list.
-3. Keep the orch HTTP listener off the public internet — use the
-   relay or a Tailscale node.
+3. Keep the orch HTTP listener off the public internet — bind
+   loopback and reach it via Tailscale or the relay.
