@@ -1,11 +1,8 @@
 ## orchid 
 
-High velocity coding agent orchestration
+High velocity coding agent orchestration. 
 
-<img width="601" height="419" alt="dashboard" src="https://github.com/user-attachments/assets/0bc63b69-6f92-406c-befa-aba122fb31d2" />
-
-
-It tries to solve the speed and scaling problems with agents:
+It integrates well with Github issues for scheduling work and opening PRs while trying to solve the speed and scaling problems with agents:
 
 - **Scaling**: from a couple of sessions to hundreds, fanned across bit of compute.
 - **Usage-limit throttle**: adaptive pacing against your weekly quota.
@@ -13,17 +10,20 @@ It tries to solve the speed and scaling problems with agents:
 - **Load balancing**: run sessions across a cluster of machines over plain SSH.
 - **Security**: Works well with [clawpatrol](https://clawpatrol.dev) security firewall
 
-Orchid integrates well with Github issues for scheduling work and opening PRs.
-
 Get started at https://orchid.littledivy.com/docs/getting-started
+
+```
+curl -fsSL https://orchid.littledivy.com/install.sh | bash
+```
 
 ### Cluster
 
 A machine is anything that runs `tmux` + your agent over SSH. orchid drives
 them all, with no agent or inbound ports on the workers. Sessions dispatch to
-whichever host has a free slot, and each host can run a different agent
-(`claude`, `codex`, …). Add a box, it joins the pool. See the
-[VMs docs](https://orchid.littledivy.com/docs/vms).
+whichever host has a free slot, and each host can run multiple agent harnesses
+(`claude`, `codex`, …). See the [VMs docs](https://orchid.littledivy.com/docs/vms).
+
+<img height="319" alt="dashboard" src="https://github.com/user-attachments/assets/0bc63b69-6f92-406c-befa-aba122fb31d2" />
 
 ### Usage-limit throttle
 
@@ -47,7 +47,7 @@ See example [./swarm.hcl](swarm.hcl)
 
 ### Chat with your orchid
 
-Point any chat-agent runtime (OpenClaw, Hermes, Claude Code) at
+Point any agent harness (OpenClaw, Hermes, Claude Code) at
 <https://orchid.littledivy.com/skill.md> and you get a
 Telegram/Slack/Discord bot that knows your swarm. One paste:
 
@@ -56,3 +56,4 @@ npx -y @openclaw/cli@latest skill install https://orchid.littledivy.com/skill.md
 ```
 
 See [docs/supervision.md](docs/SUPERVISION.md).
+
