@@ -857,7 +857,6 @@ func Main() {
 	}
 	cfgPath := flag.String("config", "", "path to HCL config (default: ~/.orch/swarm.hcl, auto-created on first run)")
 	describeFlag := flag.Bool("describe", false, "print a SKILL.md-shaped description of this instance and exit")
-	captureOnly := flag.Bool("capture-only", false, "run only the /api/drafts capture HTTP server (no swarm polling, no VM bootstrap); requires a capture block in the config")
 	relayURL := flag.String("relay", "", "outbound relay URL (e.g. wss://orchid.com/agent) — dashboard is reachable at <sub>.orchid.com without exposing this port")
 	relayToken := flag.String("relay-token", "", "agent token issued by the relay on signup")
 	flag.Parse()
@@ -914,20 +913,6 @@ func Main() {
 		}
 	}
 	log.Printf("orch: state loaded, %d jobs tracked", len(st.Jobs))
-	if *captureOnly {
-		if cfg.Orch.Capture == nil {
-			log.Fatalf("-capture-only requires a `capture { ... }` block in the config")
-		}
-		if cfg.Orch.HTTPAddr == "" {
-			log.Fatalf("-capture-only requires orchestrator.http_addr to be set")
-		}
-		log.Printf("orchid capture: listening on http://%s/, assets under %s",
-			cfg.Orch.HTTPAddr, captureAssetsDirOrPlaceholder(&cfg))
-		if err := http.ListenAndServe(cfg.Orch.HTTPAddr, httpHandler(&cfg, st)); err != nil {
-			log.Fatalf("http: %v", err)
-		}
-		return
-	}
 	if *describeFlag {
 		snap := make(map[int]Job, len(st.Jobs))
 		for n, j := range st.Jobs {

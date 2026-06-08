@@ -35,7 +35,6 @@ run_worker_first = [
   "/healthz",
   "/agent",
   "/api/*",
-  "/captures/*",
   "/docs",
   "/docs/*",
 ]

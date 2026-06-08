@@ -62,16 +62,11 @@ gh issue create --repo your-org/orchid-inbox \
   --body  "Steps to reproduce: ..."
 ```
 
-Orch sees it on the next poll tick (≤ `poll_interval`). The dashboard
-also has a **Composer** that fans an issue out across multiple targets
-in one shot — useful for "ship this feature on every fork".
+Orch sees it on the next poll tick (≤ `poll_interval`).
 
 ## Tips
 
 - **Use specific labels.** A generic `bug` label that exists on every
   target makes routing ambiguous. Prefer `<project>-bug`.
-- **Bot-author the inbox.** Filing issues from the macOS Capture app
-  (see [Capture](/docs/capture)) is the lowest-friction path — voice
-  → draft → labeled inbox issue.
 - **Inbox != work repo.** Keep the inbox repo private if you want;
   the work PRs land wherever `target.repo` points.

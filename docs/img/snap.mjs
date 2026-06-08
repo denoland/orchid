@@ -31,12 +31,6 @@ const shots = [
       if (s) { await s.click(); await page.waitForTimeout(700) }
     },
   },
-  { file: 'capture.png',        path: '/', after: async (page) => {
-      const cap = await page.$('button[title="Capture (file a new issue)"]')
-      if (cap) await cap.click()
-      await page.waitForTimeout(500)
-    },
-  },
   { file: 'landing.png',        url: 'https://orchid.littledivy.com/' },
 ]
 

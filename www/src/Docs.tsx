@@ -70,13 +70,6 @@ const PAGES: Page[] = [
     lede: 'Shared, git-backed knowledge base the swarm accumulates across sessions.',
   },
   {
-    slug: 'capture',
-    title: 'Capture',
-    file: 'capture.md',
-    section: 'integrate',
-    lede: 'macOS, iOS, and watchOS draft intake apps.',
-  },
-  {
     slug: 'supervision',
     title: 'Supervision',
     file: 'SUPERVISION.md',

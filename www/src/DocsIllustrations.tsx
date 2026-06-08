@@ -90,7 +90,7 @@ export function ChatVine() {
   </>)
 }
 
-// Microphone — capture.
+// Microphone — voice intake.
 export function HandBud() {
   return frame(<>
     <rect x="-10" y="-32" width="20" height="36" rx="10" />

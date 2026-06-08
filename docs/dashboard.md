@@ -25,9 +25,6 @@ The dashboard is a row of tabs in the header:
   search, markdown rendering, and backlinks. See [Memory](/docs/memory).
 - **Settings** — every `swarm.hcl` field, editable in place.
 
-**Composer** — file inbox issues without leaving the browser; fans out
-across multiple targets in one click.
-
 **Pane viewer** — click a session to see the live tmux pane. Frames are
 gzipped and streamed over the WS; off-screen panes pause to save bandwidth.
 
@@ -54,7 +51,6 @@ The **Settings** tab edits everything in `swarm.hcl`:
   Hot-applies, no restart.
 - **Targets** — label-to-repo routing. See [Targets](/docs/targets).
 - **VMs** — worker hosts, capacity, join tokens. See [VMs](/docs/vms).
-- **Capture** — the macOS / iOS draft intake token + endpoint URL.
 
 Most changes need an `orch restart`; `allowed_logins` hot-applies.
 
@@ -63,7 +59,6 @@ Most changes need an `orch restart`; `allowed_logins` hot-applies.
 | Key | Action |
 |-----|--------|
 | `?` | Open shortcut help. |
-| `/` | Focus the Composer. |
 | `Esc` | Close any open modal. |
 
 ## Mobile

@@ -16,7 +16,6 @@
 #   ORCHID_VERSION   release tag to install (default: latest)
 #   INBOX_REPO       inbox repo (prompted; central only)
 #   HTTP_SECRET      dashboard token (default: random 32 hex)
-#   CAPTURE_TOKEN    capture API token (default: random 32 hex)
 #
 # Idempotent: re-running upgrades the binary in place + restarts.
 
@@ -112,9 +111,8 @@ if [ -z "${INBOX_REPO:-}" ]; then
 fi
 
 HTTP_SECRET=${HTTP_SECRET:-$(openssl rand -hex 16)}
-CAPTURE_TOKEN=${CAPTURE_TOKEN:-$(openssl rand -hex 16)}
 
-$SUDO mkdir -p "$ORCHID_ETC" "$ORCHID_HOME/captures" "$ORCHID_HOME/vm-keys" "$ORCHID_HOME/orch-work"
+$SUDO mkdir -p "$ORCHID_ETC" "$ORCHID_HOME/vm-keys" "$ORCHID_HOME/orch-work"
 $SUDO chown -R "$ORCHID_USER:$ORCHID_USER" "$ORCHID_HOME"
 # /etc/orchid needs to be writable by the orchid daemon — both the
 # dashboard's Settings save and `orch join vm` rewrite swarm.hcl in
@@ -136,11 +134,6 @@ orchestrator {
   workdir_root  = "$ORCHID_HOME/orch-work"
   http_addr     = ":8000"
   http_secret   = "$HTTP_SECRET"
-
-  capture {
-    auth_token = "$CAPTURE_TOKEN"
-    assets_dir = "$ORCHID_HOME/captures"
-  }
 }
 
 vm "local" {
@@ -202,8 +195,6 @@ cat <<EOF
 \033[1;32m✓ orchid is running\033[0m
 
   dashboard : http://${IP:-localhost}:8000/?token=$HTTP_SECRET
-  capture   : http://${IP:-localhost}:8000/api/drafts
-                 header X-Capture-Token: $CAPTURE_TOKEN
   config    : $ORCHID_ETC/swarm.hcl
   state     : $ORCHID_HOME/state.db
   log       : journalctl -u orchid -f

@@ -4,7 +4,6 @@ import { marked } from 'marked'
 import type { Job, State, AgentMeter, VM } from './types'
 import { attention, ciStatus, LEVEL_COLOR, type AttentionLevel } from './attention'
 import { Pane } from './Pane'
-import { Composer } from './Composer'
 import { mockJobs, mockVMs } from './mock'
 import { OrchidArt } from './OrchidArt'
 import { AgentLogo } from './AgentLogo'
@@ -89,7 +88,6 @@ function DashboardInner({ state: rawState, relay }: Props) {
     if (MOCK_COUNT === 0) return rawState
     return { ...rawState, jobs, vms: [...mockVMs(), ...(rawState.vms ?? [])] }
   }, [rawState, jobs])
-  const inbox = state.inbox ?? ''
   const jobsByTmuxRef = useRef<Map<string, Job>>(new Map())
   // Shared events-WS bus from App.tsx — see WSBusContext. Used here for
   // inbound `activity` pushes that beat the slower /api/state poll.
@@ -98,7 +96,6 @@ function DashboardInner({ state: rawState, relay }: Props) {
   const [tab, setTab] = useState<Tab>('sessions')
   const [q, setQ] = useState('') // search, lives in the nav (GitHub-style)
   const openSettings = useCallback((s: SectionId) => setTab(sectionToTab(s)), [])
-  const [showCapture, setShowCapture] = useState(false)
   const [showStats, setShowStats] = useState(false) // mobile: usage sidebar drawer
   // Clicking a list row opens this session in a modal pane.
   const [listExpanded, setListExpanded] = useState<string | null>(null)
@@ -139,7 +136,6 @@ function DashboardInner({ state: rawState, relay }: Props) {
         setTab={setTab}
         q={q}
         setQ={setQ}
-        onOpenCapture={() => setShowCapture(true)}
         onToggleStats={() => setShowStats((v) => !v)}
       />
       <div className="flex items-start">
@@ -182,7 +178,6 @@ function DashboardInner({ state: rawState, relay }: Props) {
           </>
         )}
       </div>
-      {showCapture && <CapturePage jobs={jobs} inbox={inbox} onClose={() => setShowCapture(false)} />}
       {listExpanded && (
         <PaneModal tmux={listExpanded} jobsByTmuxRef={jobsByTmuxRef} onClose={() => setListExpanded(null)} />
       )}
@@ -281,7 +276,7 @@ function Sidebar({ state, open, onClose }: { state: State; open: boolean; onClos
 }
 
 function TopBar({
-  count, vmCount, tab, setTab, q, setQ, onOpenCapture, onToggleStats,
+  count, vmCount, tab, setTab, q, setQ, onToggleStats,
 }: {
   count: number
   vmCount: number
@@ -289,7 +284,6 @@ function TopBar({
   setTab: (t: Tab) => void
   q: string
   setQ: (s: string) => void
-  onOpenCapture: () => void
   onToggleStats: () => void
 }) {
   const tabs: { id: Tab; label: string; count?: number }[] = [
@@ -330,7 +324,6 @@ function TopBar({
           </svg>
         </button>
         <HeaderBtnBar>
-          <CaptureButton onClick={onOpenCapture} />
           <ThemeToggle />
           <LogoutButton />
         </HeaderBtnBar>
@@ -570,117 +563,6 @@ function HeaderBtnBar({ children }: { children: React.ReactNode }) {
   return <div className="flex items-center gap-0.5">{children}</div>
 }
 
-function CaptureButton({ onClick }: { onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      title="Capture — file a new issue"
-      className="w-7 h-7 rounded-md flex items-center justify-center transition-colors text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-800 dark:hover:text-zinc-100"
-    >
-      {/* feather-style paper-plane: "send a thought into the inbox" */}
-      <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-        <line x1="22" y1="2" x2="11" y2="13" />
-        <polygon points="22 2 15 22 11 13 2 9 22 2" />
-      </svg>
-    </button>
-  )
-}
-
-function CapturePage({ jobs, inbox, onClose }: { jobs: Job[]; inbox: string; onClose: () => void }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
-
-  // Most-recent inbox-driven jobs. Captures land here once orch picks
-  // them up and labels them; until then the user sees their own
-  // composed item bubble to the top on the next /api/state poll.
-  const recent = useMemo(
-    () => [...jobs].sort((a, b) => b.issue - a.issue).slice(0, 12),
-    [jobs],
-  )
-
-  return (
-    <div
-      className="fixed inset-0 z-40 grid place-items-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm p-4 sm:p-8"
-      onClick={onClose}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="bg-white dark:bg-zinc-950 rounded-2xl ring-1 ring-zinc-200 dark:ring-zinc-700 shadow-2xl w-full max-w-[680px] max-h-[80vh] flex flex-col"
-      >
-        <div className="px-6 h-12 flex items-center gap-3 border-b border-zinc-200 dark:border-zinc-800 flex-shrink-0">
-          <span className="serif italic text-[20px] text-zinc-900 dark:text-zinc-100">Capture</span>
-          <span className="mono text-[12px] text-zinc-500 dark:text-zinc-400">spawn an idea</span>
-          <div className="flex-1" />
-          <button
-            onClick={onClose}
-            className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 rounded p-1"
-            title="Close (esc)"
-          >
-            <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
-              <line x1="18" y1="6" x2="6" y2="18" />
-              <line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
-          </button>
-        </div>
-
-        <div className="flex-1 min-h-0 overflow-auto">
-          <div className="px-6 py-6 space-y-8">
-            <Composer autoFocus onSent={() => onClose()} onCancel={onClose} />
-
-            <div>
-              <div className="serif italic text-[16px] text-zinc-900 dark:text-zinc-100 mb-2">Recent</div>
-              {recent.length === 0 && (
-                <p className="text-[13px] text-zinc-500 dark:text-zinc-400">
-                  Nothing here yet. Type above to file your first capture.
-                </p>
-              )}
-              <div className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
-                {recent.map((j) => (
-                  <RecentCaptureRow key={j.issue} job={j} inbox={inbox} />
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function RecentCaptureRow({ job, inbox }: { job: Job; inbox: string }) {
-  const attn = attention(job)
-  const color = LEVEL_COLOR[attn.level]
-  const repo = job.target_repo ? job.target_repo.split('/')[1] : job.target || '—'
-  const issueURL = inbox ? `https://github.com/${inbox}/issues/${job.issue}` : `#${job.issue}`
-  return (
-    <a
-      href={issueURL}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="group flex items-center gap-4 px-1 py-3 hover:bg-zinc-50/80 dark:hover:bg-zinc-900/40 transition-colors"
-    >
-      <span className={`w-2 h-2 rounded-full ${color.bar} flex-shrink-0`} />
-      <div className="flex-1 min-w-0">
-        <div className="text-[14px] text-zinc-900 dark:text-zinc-100 truncate">
-          {job.issue_title || job.tmux || `#${job.issue}`}
-        </div>
-        <div className="mt-0.5 mono text-[11px] text-zinc-500 dark:text-zinc-400 truncate">
-          #{job.issue} · {repo}{job.pr ? ` · PR #${job.pr}` : ''}
-        </div>
-      </div>
-      <span className="text-zinc-300 dark:text-zinc-600 opacity-0 group-hover:opacity-100 transition-opacity">
-        <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-          <line x1="7" y1="17" x2="17" y2="7" />
-          <polyline points="7 7 17 7 17 17" />
-        </svg>
-      </span>
-    </a>
-  )
-}
-
 function DocsButton() {
   return (
     <a
@@ -696,9 +578,8 @@ function DocsButton() {
   )
 }
 
-// Stacked top-center warnings. Lives above the header (z-50) so the
-// capture composer doesn't sit on top of it. Each row is dismissed by
-// fixing the underlying config (GitHub auth, target repos, etc), not
+// Stacked top-center warnings. Lives above the header (z-50). Each row
+// is dismissed by fixing the underlying config (GitHub auth, target repos, etc), not
 // by a close button — keeps the dashboard honest about whether orchid
 // can actually do anything.
 function WarningStack({
@@ -799,11 +680,6 @@ function SettingsButton({ onClick }: { onClick: () => void }) {
   )
 }
 
-interface CaptureCfg {
-  auth_token?: string
-  assets_dir?: string
-  public_url?: string
-}
 interface OrchestratorCfg {
   poll_interval?: string
   state_db?: string
@@ -815,7 +691,6 @@ interface OrchestratorCfg {
   bot_email?: string
   ntfy_topic?: string
   allowed_logins?: string[]
-  capture?: CaptureCfg
 }
 type GhCfg = { inbox_repo?: string }
 interface VMCfg {
@@ -845,14 +720,6 @@ interface RepoOption {
   description?: string | null
   pushed_at?: string | null
   avatar?: string
-}
-
-function cryptoToken(): string {
-  // 16 random bytes as hex — same shape as the install.sh-generated
-  // capture token, suitable for X-Capture-Token.
-  const buf = new Uint8Array(16)
-  crypto.getRandomValues(buf)
-  return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 function useRepos(enabled: boolean) {
@@ -1033,7 +900,7 @@ function timeAgo(iso?: string | null): string {
   return `${Math.floor(mo / 12)}y`
 }
 
-type SectionId = 'orch' | 'access' | 'capture' | 'vms' | 'targets' | 'usage' | 'danger'
+type SectionId = 'orch' | 'access' | 'vms' | 'targets' | 'usage' | 'danger'
 
 interface MemNote { name: string; file: string; target: string; summary: string; links: string[]; backlinks: string[] }
 interface LogEntry { commit: string; short: string; author: string; date: string; subject: string }
@@ -1294,7 +1161,7 @@ function MemoryPage() {
 
 // Top-level tabs. Sessions is the list; the rest open SettingsPage focused on a
 // section — Machines (VMs), Analytics (usage), Integrations get their own tab;
-// Settings holds the rest (orch/access/capture/targets/danger) via its own nav.
+// Settings holds the rest (orch/access/targets/danger) via its own nav.
 type Tab = 'sessions' | 'machines' | 'analytics' | 'memory' | 'settings'
 const TAB_SECTION: Record<Exclude<Tab, 'sessions' | 'memory' | 'analytics' | 'machines'>, SectionId> = {
   settings: 'orch',
@@ -1324,7 +1191,7 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
   // here they render as a single bare section. The "Settings" tab (orch)
   // flattens everything that's left into one scroll page — no inner nav.
   const flat = !initialSection || initialSection === 'orch'
-  const FLAT_IDS: SectionId[] = ['orch', 'access', 'capture', 'targets', 'danger']
+  const FLAT_IDS: SectionId[] = ['orch', 'access', 'targets', 'danger']
   const vis = (id: SectionId) => flat ? FLAT_IDS.includes(id) : initialSection === id
   const pageTitle = initialSection === 'vms' ? 'Machines'
     : initialSection === 'usage' ? 'Analytics'
@@ -1365,15 +1232,9 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
     setStatus('saving')
     const patch: Record<string, any> = {}
 
-    // Singletons. Strip the nested `capture` so it doesn't accidentally
-    // try to serialise as an attribute — capture lives under its own
-    // `orchestrator.capture` patch key.
-    const orchTop: any = { ...cfg }
-    const capture = orchTop.capture
-    delete orchTop.capture
-    patch.orchestrator = orchTop
+    // Singletons.
+    patch.orchestrator = { ...cfg }
     patch.github = gh
-    if (capture) patch['orchestrator.capture'] = capture
 
     // Targets — keyed-block patches. Diff against original. VMs aren't
     // patched from the dashboard: the VMs section is read-only and
@@ -1422,9 +1283,6 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
   const setGhField = <K extends keyof GhCfg>(k: K, v: GhCfg[K]) => {
     setGh((g) => g ? { ...g, [k]: v } : g)
   }
-  const setCaptureField = <K extends keyof CaptureCfg>(k: K, v: CaptureCfg[K]) => {
-    setCfg((c) => c ? { ...c, capture: { ...(c.capture ?? {}), [k]: v } } : c)
-  }
 
   // Aggregate "live" tmux sessions per VM from the polled job list.
   const sessionsByVM = useMemo(() => {
@@ -1441,7 +1299,6 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
   const navItems: { id: SectionId; label: string }[] = [
     { id: 'orch',         label: 'Orchestrator' },
     { id: 'access',       label: 'Access' },
-    { id: 'capture',      label: 'Capture' },
     { id: 'vms',          label: 'VMs' },
     { id: 'targets',      label: 'Targets' },
     { id: 'usage',        label: 'Usage' },
@@ -1509,64 +1366,6 @@ function SettingsPage({ jobs, state, relay, initialSection, onClose }: {
                   onChange={(v) => setField('allowed_logins', v)}
                 />
               </Section>
-            )}
-
-            {vis('capture') && (
-              <>
-                <Section
-                  title="Connect Orchid Capture"
-                  subtitle="One-click handoff to the macOS app — or copy the values into the iOS app's Settings."
-                >
-                  {cfg?.capture?.auth_token && (
-                    <div className="mb-4">
-                      <a
-                        href={`orchid://configure?endpoint=${encodeURIComponent(`https://${location.host}/api/drafts`)}&token=${encodeURIComponent(cfg.capture.auth_token)}`}
-                        className="inline-flex items-center gap-2 text-[12.5px] mono px-3 py-2 rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 hover:opacity-90"
-                      >
-                        <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                          <polyline points="15 3 21 3 21 9" />
-                          <line x1="10" y1="14" x2="21" y2="3" />
-                          <path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5" />
-                        </svg>
-                        Open in macOS app
-                      </a>
-                    </div>
-                  )}
-                  <Field label="Endpoint">
-                    <CopyValue value={`https://${location.host}/api/drafts`} />
-                  </Field>
-                  <Field label="Auth token" hint="X-Capture-Token. Rotate any time — clients pick up the new value on next request.">
-                    <div className="flex items-center gap-2">
-                      <div className="flex-1">
-                        <Input
-                          value={cfg?.capture?.auth_token ?? ''}
-                          onChange={(v) => setCaptureField('auth_token', v)}
-                          placeholder="…"
-                          secret
-                        />
-                      </div>
-                      <button
-                        onClick={() => setCaptureField('auth_token', cryptoToken())}
-                        className="mono text-[11px] px-3 py-2 rounded-md ring-1 ring-zinc-300 dark:ring-zinc-700 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                      >regenerate</button>
-                    </div>
-                  </Field>
-                  <Field label="Assets dir" hint="Where uploaded screenshots / clips are stored.">
-                    <Input
-                      value={cfg?.capture?.assets_dir ?? ''}
-                      onChange={(v) => setCaptureField('assets_dir', v)}
-                      placeholder="/root/orch/captures"
-                    />
-                  </Field>
-                  <Field label="Public URL" hint="Base URL used to embed images in issue bodies. Leave blank if you don't have one.">
-                    <Input
-                      value={cfg?.capture?.public_url ?? ''}
-                      onChange={(v) => setCaptureField('public_url', v)}
-                      placeholder={`https://${location.host}`}
-                    />
-                  </Field>
-                </Section>
-              </>
             )}
 
             {vis('vms') && (
@@ -3470,39 +3269,6 @@ function LogoutButton() {
         <line x1="21" y1="12" x2="9" y2="12" />
       </svg>
     </a>
-  )
-}
-
-function FloatingComposer({ at, onDismiss }: { at: { x: number; y: number }; onDismiss: () => void }) {
-  // Clamp so the 460px composer never overflows the viewport.
-  const W = 460
-  const H = 180
-  const margin = 12
-  const vw = window.innerWidth
-  const vh = window.innerHeight
-  const left = Math.min(Math.max(margin, at.x - W / 2), vw - W - margin)
-  const top  = Math.min(Math.max(margin, at.y - 16), vh - H - margin)
-
-  // Dismiss on outside click.
-  const ref = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    const onDown = (e: PointerEvent) => {
-      if (!ref.current?.contains(e.target as globalThis.Node)) onDismiss()
-    }
-    // Defer so the pane-click event that opened us doesn't immediately close.
-    const id = setTimeout(() => window.addEventListener('pointerdown', onDown), 0)
-    return () => { clearTimeout(id); window.removeEventListener('pointerdown', onDown) }
-  }, [onDismiss])
-
-  return (
-    <div
-      ref={ref}
-      className="fixed z-50"
-      style={{ left, top, width: W }}
-      onPointerDown={(e) => e.stopPropagation()}
-    >
-      <Composer autoFocus onSent={() => onDismiss()} onCancel={onDismiss} />
-    </div>
   )
 }
 

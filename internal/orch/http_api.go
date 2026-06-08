@@ -1033,10 +1033,6 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 		}
 	}))
 
-	if cfg.Orch.Capture != nil {
-		registerCaptureRoutes(mux, cfg)
-	}
-
 	// Background pusher: when the daemon broadcasts a state change
 	// (tick saves state, VM health flips, usage tick), push the latest
 	// /api/state JSON to every connected dashboard. Saves the SPA the

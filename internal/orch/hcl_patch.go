@@ -36,33 +36,6 @@ func patchHCL(src []byte, patch map[string]map[string]any) ([]byte, error) {
 			return nil, fmt.Errorf("block %q is not editable via the dashboard", blockName)
 		}
 
-		if head == "orchestrator" && len(parts) == 2 && parts[1] == "capture" {
-			var orch *hclwrite.Block
-			for _, b := range f.Body().Blocks() {
-				if b.Type() == "orchestrator" {
-					orch = b
-					break
-				}
-			}
-			if orch == nil {
-				orch = f.Body().AppendNewBlock("orchestrator", nil)
-			}
-			var cap *hclwrite.Block
-			for _, b := range orch.Body().Blocks() {
-				if b.Type() == "capture" {
-					cap = b
-					break
-				}
-			}
-			if cap == nil {
-				cap = orch.Body().AppendNewBlock("capture", nil)
-			}
-			if err := writeAttrs(cap.Body(), fields, blockName); err != nil {
-				return nil, err
-			}
-			continue
-		}
-
 		if kind == blockKeyed {
 			if len(parts) != 2 {
 				return nil, fmt.Errorf("%q requires a label (e.g. %q)", head, head+".name")

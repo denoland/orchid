@@ -20,7 +20,7 @@ const mockState = () => ({
     {
       issue: 178, vm: 'paris', tmux: 'claude-2',
       target: 'clawpatrol', target_repo: 'denoland/clawpatrol',
-      branch: 'orch/divybot-177', issue_title: 'Wire end-to-end capture pipeline',
+      branch: 'orch/divybot-177', issue_title: 'Wire end-to-end ingest pipeline',
       lifecycle: 'oneshot', schedule: '', pr: 178, next_fire_at: '',
       last_check_conclusions: { build: 'SUCCESS', test: 'SUCCESS' },
       activity: Array(28).fill(0),
@@ -93,20 +93,6 @@ export default defineConfig({
           // POST-only mock — keystrokes are swallowed.
           res.statusCode = 204
           res.end()
-        })
-        server.middlewares.use('/api/drafts', (req: any, res: any) => {
-          let body = ''
-          req.on('data', (c: any) => { body += c })
-          req.on('end', () => {
-            const fake = 200 + Math.floor(Math.random() * 50)
-            res.setHeader('content-type', 'application/json')
-            res.end(JSON.stringify({
-              ok: true,
-              id: 'mock-' + Date.now(),
-              issue_url: `https://github.com/denoland/orchid/issues/${fake}`,
-              asset_url: '',
-            }))
-          })
         })
       },
     },

@@ -114,17 +114,11 @@ app.use('*', async (c, next) => {
     return do_.fetch(c.req.raw)
   }
 
-  // Capture intake bypasses the session-cookie gate — orch's own
-  // X-Capture-Token header is the actual auth for these requests, and
-  // the macOS / iOS apps don't carry a relay session cookie. Anything
-  // unauthenticated still has to satisfy orch's per-endpoint check.
-  //
-  // /api/vm/join (worker joining a swarm) gets the same bypass: the
-  // worker only has the bearer invite token (= orch's http_secret), not
-  // a relay user session — orch's auth() still requires the bearer
-  // match, so this just lets the request reach the agent.
-  const isCapture = c.req.raw.method === 'POST' &&
-    (url.pathname === '/api/drafts' || url.pathname.startsWith('/captures/'))
+  // /api/vm/join (worker joining a swarm) bypasses the session-cookie
+  // gate: the worker only has the bearer invite token (= orch's
+  // http_secret), not a relay user session — orch's auth() still
+  // requires the bearer match, so this just lets the request reach the
+  // agent.
   const isVMJoin = c.req.raw.method === 'POST' && url.pathname === '/api/vm/join'
   // Any /api/* request that already carries a Bearer token gets to skip
   // the session-cookie gate — orch will reject the bearer itself if wrong.
@@ -134,11 +128,11 @@ app.use('*', async (c, next) => {
     (c.req.raw.headers.get('authorization') ?? '').toLowerCase().startsWith('bearer ')
 
   // currentUser() runs an HMAC verify on the session cookie; skip it for
-  // capture POSTs and /api/vm/join which never carry a session cookie
-  // (they carry their own bearer tokens checked inside orch). user stays
-  // null in those cases — DO-side auth is the real gate.
+  // /api/vm/join which never carries a session cookie (it carries its
+  // own bearer token checked inside orch). user stays null in those
+  // cases — DO-side auth is the real gate.
   let user: Awaited<ReturnType<typeof currentUser>> = null
-  if (!isCapture && !isVMJoin && !isApiBearer) {
+  if (!isVMJoin && !isApiBearer) {
     // Everything else on a subdomain is private. Two ways in:
     //   1. Owner (cookie.subdomain === host's subdomain).
     //   2. Allowed login (operator-defined list pushed by the agent from
@@ -222,9 +216,9 @@ app.use('*', async (c, next) => {
     }))
   }
 
-  // Proxy /api/* and /captures/ to the agent. WS upgrades go through a
-  // dedicated DO path that pairs a WebSocketPair and multiplexes frames.
-  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/captures/')) {
+  // Proxy /api/* to the agent. WS upgrades go through a dedicated DO
+  // path that pairs a WebSocketPair and multiplexes frames.
+  if (url.pathname.startsWith('/api/')) {
     if (c.req.raw.headers.get('upgrade')?.toLowerCase() === 'websocket') {
       const do_ = c.env.USER.get(c.env.USER.idFromName(sub))
       const innerHeaders: [string, string][] = []

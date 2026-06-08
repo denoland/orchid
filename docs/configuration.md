@@ -38,7 +38,7 @@ orchestrator {
 | `orchestrator.branch_prefix` | Per-issue branch name prefix. |
 | `orchestrator.workdir_root` | Where each Claude session clones into. |
 | `orchestrator.http_addr` | Local bind for the dashboard server. |
-| `orchestrator.http_secret` | Bearer token for the dashboard + capture endpoint. |
+| `orchestrator.http_secret` | Bearer token for the dashboard. |
 | `orchestrator.bot_login` | GitHub login Claude commits as. |
 | `orchestrator.ntfy_topic` | Optional ntfy.sh topic for PR-merged push notifications. |
 | `orchestrator.allowed_logins` | Extra GitHub usernames allowed to read your dashboard (used by the optional relay's OAuth). |
@@ -178,18 +178,3 @@ provision its auth files however you provision the rest of the box. GitHub auth
 is the same: give the box a `gh auth login` / token / deploy key so the bot can
 push and open PRs. A VM's `account` field only labels which login a slot uses;
 orchid never reads, stores, or ships those secrets.
-
-## Capture
-
-If you want the macOS / iOS Orchid Capture apps to deposit drafts as
-issues, add a `capture` block:
-
-```hcl
-capture {
-  auth_token  = "<32-hex>"
-  assets_dir  = "/home/divy/.orch/captures"
-  public_url  = "http://<host>:8000"
-}
-```
-
-See [Capture](/docs/capture) for the apps and draft payload.

@@ -153,34 +153,6 @@ export function SettingsMockup() {
   )
 }
 
-// ─── capture composer ───────────────────────────────────────────────
-export function CaptureMockup() {
-  return (
-    <Frame url="divy.orchid.littledivy.com">
-      <div className="dm-head">
-        <span className="dm-brand">Capture <em className="dm-faint">spawn an idea</em></span>
-      </div>
-      <div className="dm-composer">
-        <div className="dm-input">Tray icon flickers when state changes…</div>
-        <div className="dm-input-bar">
-          <span className="dm-chip">clawpatrol ▾</span>
-          <span className="dm-go">spawn ↵</span>
-        </div>
-      </div>
-      <div className="dm-recent">Recent</div>
-      <div className="dm-row"><span className="dm-dot rose" />
-        <div><div className="dm-title">Tray icon flickers when state changes</div><div className="dm-meta">#184 · clawpatrol</div></div>
-      </div>
-      <div className="dm-row"><span className="dm-dot amber" />
-        <div><div className="dm-title">Wire end-to-end capture pipeline</div><div className="dm-meta">#178 · clawpatrol</div></div>
-      </div>
-      <div className="dm-row"><span className="dm-dot emerald" />
-        <div><div className="dm-title">Add Node lazy-init for child_process</div><div className="dm-meta">#160 · deno</div></div>
-      </div>
-    </Frame>
-  )
-}
-
 // ─── install terminal ────────────────────────────────────────────────
 // A terminal-only mockup (no browser frame) showing the curl install +
 // install one-liner → self-hosted dashboard URL.
@@ -340,7 +312,6 @@ export function TelegramMockup() {
 export const MOCKUPS: Record<string, React.FC> = {
   dashboard: DashboardMockup,
   settings:  SettingsMockup,
-  capture:   CaptureMockup,
   install:   InstallMockup,
   targets:   TargetsMockup,
   config:    ConfigMockup,

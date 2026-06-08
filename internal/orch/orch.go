@@ -118,19 +118,8 @@ type OrchBlock struct {
 	BotEmail      string         `hcl:"bot_email,optional" json:"bot_email,omitempty"`
 	BotGithubKey  string         `hcl:"bot_github_key,optional" json:"bot_github_key,omitempty"`
 	Mentions      *MentionsBlock `hcl:"mentions,block" json:"mentions,omitempty"`
-	Capture       *CaptureBlock  `hcl:"capture,block" json:"capture,omitempty"`
 	Throttle      *ThrottleBlock `hcl:"throttle,block" json:"throttle,omitempty"`
 	Memory        *MemoryBlock   `hcl:"memory,block" json:"memory,omitempty"`
-}
-
-type CaptureBlock struct {
-	AuthToken     string   `hcl:"auth_token" json:"auth_token"`
-	AssetsDir     string   `hcl:"assets_dir,optional" json:"assets_dir,omitempty"`
-	PublicURL     string   `hcl:"public_url,optional" json:"public_url,omitempty"`
-	DefaultRepo   string   `hcl:"default_repo,optional" json:"default_repo,omitempty"`
-	DefaultLabels []string `hcl:"default_labels,optional" json:"default_labels,omitempty"`
-	MaxBodyMB     int      `hcl:"max_body_mb,optional" json:"max_body_mb,omitempty"`
-	AllowedRepos  []string `hcl:"allowed_repos,optional" json:"allowed_repos,omitempty"`
 }
 
 type MentionsBlock struct {

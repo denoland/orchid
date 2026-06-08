@@ -60,8 +60,6 @@ files in the same dir get auto-imported once and renamed
 - **Dashboard / API** — `Authorization: Bearer <http_secret>` for
   direct hits, or the relay session cookie when fronted by the
   optional relay.
-- **Capture intake** — `X-Capture-Token: <auth_token>` (separate
-  from `http_secret` so leaking it doesn't grant dashboard access).
 - **Worker join** — central `http_secret` doubles as the bearer the
   worker's `orch join vm` presents.
 - **Agent ↔ relay** — when the relay is deployed, a one-time agent

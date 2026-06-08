@@ -84,13 +84,6 @@ By default the orch HTTP listener binds `0.0.0.0:8000`. The bearer
   (`cf/`), let the dashboard be reached only through it and lock the
   local HTTP listener to loopback so even the LAN can't hit it.
 
-## Capture intake
-
-The macOS / iOS Capture apps post to `/api/drafts` with their own
-`capture.auth_token`. Keep it separate from `http_secret` so
-leaking one doesn't grant the other. Anyone with the capture token
-can file issues but can't read state.
-
 ## Dashboard ACL
 
 `orchestrator.allowed_logins` defines which GitHub logins can read
