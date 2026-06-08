@@ -1,8 +1,8 @@
 ## orchid 
 
-High velocity coding agent orchestration. 
+High velocity agent orchestration
 
-It integrates well with Github issues for scheduling work and opening PRs while trying to solve the speed and scaling problems with agents:
+It integrates with Github issues for scheduling work and opening PRs while trying to solve the speed and scaling problems with agents:
 
 - **Scaling**: from a couple of sessions to hundreds, fanned across bit of compute.
 - **Usage-limit throttle**: adaptive pacing against your weekly quota.
