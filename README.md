@@ -4,6 +4,29 @@ High velocity coding agent orchestration
 
 <img width="601" height="419" alt="image" src="https://github.com/user-attachments/assets/0bc63b69-6f92-406c-befa-aba122fb31d2" />
 
+## What does it do?
+
+File a GitHub issue, orchid spins up a coding agent to ship the PR — then
+relays reviews and CI back into the session until it merges. Scale that
+from one session to a whole fleet.
+
+![Sessions dashboard](docs/img/dash-sessions.png)
+
+- **Scale** — from a couple of sessions to hundreds, fanned across every
+  core you give it.
+- **Load balancing** — run sessions across a cluster of machines over
+  plain SSH. Add a box, it joins the pool.
+- **Mix harnesses** — Claude, Codex, Pi, or opencode, side by side in the
+  same swarm.
+- **Usage-limit throttle** — adaptive pacing against your weekly quota so
+  the swarm never runs out of tokens mid-flight.
+- **Shared memory** — Karpathy-style memory notes the whole cluster reads
+  and writes.
+- **Git-native** — prioritize and manage work through GitHub issues and
+  PRs, nothing else to learn.
+
+![Machine cluster](docs/img/dash-machines.png)
+
 ### Setup
 
 The orch daemon runs on Linux (systemd + tmux + ssh). To self-host:
