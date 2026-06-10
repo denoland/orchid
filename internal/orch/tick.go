@@ -763,6 +763,16 @@ func tick(cfg *Config, st *State) {
 					}
 				}
 				if pr == nil {
+					// No PR yet (branch has no commits). Poke idle sessions so a
+					// stuck or rate-limited worker can continue toward opening one.
+					if idle, _, _ := tmuxIdle(*vm, j.Tmux); idle {
+						if j.LastPokeAt.IsZero() || time.Since(j.LastPokeAt) >= defaultPokeMinInterval {
+							log.Printf("issue #%d: no PR yet, idle poke", n)
+							_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s C-m", j.Tmux))
+							j.LastPokeAt = time.Now()
+							saveStateLogged(st)
+						}
+					}
 					continue
 				}
 			}
