@@ -369,14 +369,18 @@ func cycleBloatedSession(cfg *Config, st *State, vm *VMBlock, n int, j *Job) boo
 		ci = "  (no CI results yet)\n"
 	}
 	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
+	issueHdr := ""
+	if j.IssueTitle != "" {
+		issueHdr = fmt.Sprintf("Issue: %s\n", j.IssueTitle)
+	}
 	msg := fmt.Sprintf(`Your context was reset to save tokens (it had grown large). You are still on the same task.
 
-PR: #%d (%s)
+%sPR: #%d (%s)
 Branch: %s
 Last known CI:
 %s
 Re-read the PR and its diff, check what's implemented, address any open review comments or CI failures, push fixes if needed. If everything is already addressed and CI is green, stop and wait.`,
-		j.PR, prURL, j.Branch, ci)
+		issueHdr, j.PR, prURL, j.Branch, ci)
 	if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
 		log.Printf("issue #%d: context-cycle re-orient paste failed: %v", n, err)
 	}
