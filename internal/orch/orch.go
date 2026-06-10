@@ -120,6 +120,10 @@ type OrchBlock struct {
 	Mentions      *MentionsBlock `hcl:"mentions,block" json:"mentions,omitempty"`
 	Throttle      *ThrottleBlock `hcl:"throttle,block" json:"throttle,omitempty"`
 	Memory        *MemoryBlock   `hcl:"memory,block" json:"memory,omitempty"`
+	// TriageCmd runs a one-shot agent (e.g. `claude -p` behind clawpatrol) for
+	// the discovery passes: issue triage comments and PR postmortem lessons.
+	// The prompt arrives on stdin; stdout is the report. Empty disables both.
+	TriageCmd string `hcl:"triage_cmd,optional" json:"triage_cmd,omitempty"`
 }
 
 type MentionsBlock struct {
@@ -937,7 +941,12 @@ if [ "$AGENT" = "claude" ]; then
       printf '%%s' "$ASK_HOOK_B64" | base64 -d > "$HOOKSH" && chmod +x "$HOOKSH"
       HOOKARG='.hooks.PreToolUse = [{"matcher":"AskUserQuestion|ExitPlanMode","hooks":[{"type":"command","command":$hook}]}]'
     fi
-    jq --arg amd "$CHOME/.claude/auto-memory" --arg hook "$CHOME/.claude/orchid-ask-hook.sh" ".hooks.Notification = [{\"hooks\":[{\"type\":\"command\",\"command\":\"tee -a \$HOME/.claude/notify.jsonl >/dev/null\"}]}] | .hooks.UserPromptSubmit = [{\"hooks\":[{\"type\":\"command\",\"command\":\"tee -a \$HOME/.claude/notify.jsonl >/dev/null\"}]}] | .autoMemoryEnabled = true | .autoMemoryDirectory = \$amd | $HOOKARG" "$SJ" > "$SJ.tmp" && mv "$SJ.tmp" "$SJ"
+    # Lifecycle hooks (SessionStart/Stop/SessionEnd) feed the same notify.jsonl
+    # the orchestrator already tails: claude self-reports alive/idle/exited, so
+    # orch stops inferring state from pane pixels (blind 6-minute spawn waits,
+    # prompt-marker idle scraping).
+    local NTEE='[{"hooks":[{"type":"command","command":"tee -a $HOME/.claude/notify.jsonl >/dev/null"}]}]'
+    jq --arg amd "$CHOME/.claude/auto-memory" --arg hook "$CHOME/.claude/orchid-ask-hook.sh" --argjson ntee "$NTEE" ".hooks.Notification = \$ntee | .hooks.UserPromptSubmit = \$ntee | .hooks.SessionStart = \$ntee | .hooks.Stop = \$ntee | .hooks.SessionEnd = \$ntee | .autoMemoryEnabled = true | .autoMemoryDirectory = \$amd | $HOOKARG" "$SJ" > "$SJ.tmp" && mv "$SJ.tmp" "$SJ"
   }
   stamp_trust "$HOME"
   stamp_hooks "$HOME"
@@ -1739,6 +1748,7 @@ func tearDown(cfg *Config, st *State, issue int) {
 		pruneWorkdir(*vm, vmWorkdirRoot(cfg.Orch, *vm), issue)
 	}
 	delete(st.Jobs, issue)
+	clearSessionState(issue)
 	log.Printf("issue #%d: torn down (was on %s/%s)", issue, j.VM, j.Tmux)
 }
 
@@ -1756,6 +1766,10 @@ func closeInboxIssue(cfg *Config, issue int, prState, repo string, pr int) {
 		return
 	}
 	log.Printf("issue #%d: closed inbox issue (PR %s)", issue, strings.ToLower(prState))
+	// Outcome reached — distill a one-line lesson into shared memory so future
+	// workers inherit what merged smoothly vs what got rejected. Async +
+	// best-effort; never holds the tick.
+	go runPostmortem(cfg, issue, prState, repo, pr)
 }
 
 // pruneWorkdir removes the per-issue workdir (git worktree + build artifacts).

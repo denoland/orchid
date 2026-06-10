@@ -1,6 +1,9 @@
 package orch
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // Real token_count line shape captured from a codex session rollout
 // (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl). primary = 5h window,
@@ -89,5 +92,61 @@ func TestVMAccount(t *testing.T) {
 	}
 	if got := vmAccount(VMBlock{}); got != "claude" {
 		t.Fatalf("empty account = %q, want claude", got)
+	}
+}
+
+// The lifecycle hook feed (SessionStart/Stop/SessionEnd alongside the existing
+// Notification/UserPromptSubmit) drives spawn readiness + idle verdicts so the
+// orchestrator stops inferring claude state from pane pixels.
+func TestIngestNotifyLifecycleEvents(t *testing.T) {
+	const n = 4242
+	clearSessionState(n)
+	defer clearSessionState(n)
+
+	if booted := sessionBootedSince(n, time.Time{}); booted {
+		t.Fatal("no events yet: must not report booted")
+	}
+	if _, ok := eventIdleForIssue(n); ok {
+		t.Fatal("no events yet: idle verdict must be not-ok (pane fallback)")
+	}
+
+	t0 := time.Now().Add(-time.Second)
+	ingestNotify([]byte(`{"hook_event_name":"SessionStart","cwd":"/var/lib/orchid/orch-work/issue-4242","session_id":"s1"}`))
+	if !sessionBootedSince(n, t0) {
+		t.Fatal("SessionStart after t0 must report booted")
+	}
+	if idle, ok := eventIdleForIssue(n); !ok || idle {
+		t.Fatalf("SessionStart: want busy verdict (idle=false ok=true), got idle=%v ok=%v", idle, ok)
+	}
+
+	ingestNotify([]byte(`{"hook_event_name":"Stop","cwd":"/var/lib/orchid/orch-work/issue-4242","session_id":"s1"}`))
+	if idle, ok := eventIdleForIssue(n); !ok || !idle {
+		t.Fatalf("Stop: want idle verdict, got idle=%v ok=%v", idle, ok)
+	}
+
+	ingestNotify([]byte(`{"hook_event_name":"UserPromptSubmit","cwd":"/var/lib/orchid/orch-work/issue-4242","session_id":"s1"}`))
+	if idle, ok := eventIdleForIssue(n); !ok || idle {
+		t.Fatalf("UserPromptSubmit: want busy verdict, got idle=%v ok=%v", idle, ok)
+	}
+
+	ingestNotify([]byte(`{"hook_event_name":"Notification","cwd":"/var/lib/orchid/orch-work/issue-4242","session_id":"s1","message":"Claude is waiting for your input"}`))
+	if idle, ok := eventIdleForIssue(n); !ok || !idle {
+		t.Fatalf("Notification: want idle verdict, got idle=%v ok=%v", idle, ok)
+	}
+	if !needsInputForIssue(n) {
+		t.Fatal("Notification must set needs-input")
+	}
+
+	ingestNotify([]byte(`{"hook_event_name":"SessionEnd","cwd":"/var/lib/orchid/orch-work/issue-4242","session_id":"s1"}`))
+	if _, ok := eventIdleForIssue(n); ok {
+		t.Fatal("SessionEnd: verdict must fall back to pane logic")
+	}
+	if needsInputForIssue(n) {
+		t.Fatal("SessionEnd must clear needs-input")
+	}
+
+	clearSessionState(n)
+	if ev, _ := sessionEventForIssue(n); ev != "" {
+		t.Fatalf("clearSessionState left event %q", ev)
 	}
 }

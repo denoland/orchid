@@ -46,9 +46,19 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 	// never fires; (b) we bail FAST on a genuine auth failure instead of
 	// blocking the serial tick loop for the full window.
 	const idleWaitTimeout = 6 * time.Minute
+	spawnT0 := time.Now().Add(-2 * time.Second) // pre-launch margin: hook event clock vs ours
 	deadline := time.Now().Add(idleWaitTimeout)
 	sawIdle := false
+	eventReady := false
 	for i := 0; time.Now().Before(deadline); i++ {
+		// Hook sideband first: any lifecycle event after launch proves the CLI
+		// booted, authenticated, and is rendering — no need to wait for a pane
+		// prompt marker (which a launch dialog can mask for the full window).
+		if vmAgent(*vm).name == "claude" && sessionBootedSince(is.Number, spawnT0) {
+			sawIdle = true
+			eventReady = true
+			break
+		}
 		if idle, _, err := tmuxIdle(*vm, session); err == nil && idle {
 			sawIdle = true
 			break
@@ -75,6 +85,11 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 		pane, _, _ := sshExec(*vm, fmt.Sprintf("tmux capture-pane -p -t %s | tail -15", session))
 		tmuxKill(*vm, session)
 		return fmt.Errorf("session never reached idle prompt within %s (claude not authenticated?); pane tail:\n%s", idleWaitTimeout, strings.TrimSpace(pane))
+	}
+	if eventReady {
+		// Booted per the hook event; give the TUI a beat to finish first paint
+		// before pasting the bootstrap.
+		time.Sleep(2 * time.Second)
 	}
 	tmpl := cfg.BootstrapPrompt
 	if vm.BootstrapPrompt != "" {
@@ -173,12 +188,18 @@ func spawnResume(cfg *Config, st *State, vm *VMBlock, n int, j *Job) error {
 	// single fixed-delay wake-keystroke misses it and the session hangs on the
 	// dialog forever. Poll for it and answer with Enter (picks the default
 	// summary) before the normal wake + idle wait.
+	resumeT0 := time.Now().Add(-2 * time.Second)
 	dismissResumePrompt(*vm, session)
 	time.Sleep(2 * time.Second)
 	_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s C-m", session))
 	deadline := time.Now().Add(3 * time.Minute)
 	resumeIdle := false
 	for time.Now().Before(deadline) {
+		if vmAgent(*vm).name == "claude" && sessionBootedSince(n, resumeT0) {
+			resumeIdle = true
+			time.Sleep(2 * time.Second) // let the TUI finish first paint
+			break
+		}
 		if idle, _, err := tmuxIdle(*vm, session); err == nil && idle {
 			resumeIdle = true
 			break
@@ -479,6 +500,15 @@ func tick(cfg *Config, st *State) {
 				open[is.Number] = routed{is: is, target: t}
 				break
 			}
+		}
+	}
+
+	// Pre-flight triage scout for issues that don't have a job yet (new or
+	// still queued). Async — admission below proceeds without waiting, the
+	// report lands as an issue comment the worker reads at bootstrap.
+	for n, r := range open {
+		if _, exists := st.Jobs[n]; !exists {
+			triageIssue(cfg, st, r.is, r.target.Repo)
 		}
 	}
 
@@ -864,10 +894,20 @@ func tick(cfg *Config, st *State) {
 			continue
 		}
 		resurface := outstanding && !primaryVisible && len(extResults) == 0
-		idle, detected, err := tmuxIdle(*vm, j.Tmux)
-		if err != nil {
-			log.Printf("issue #%d: idle check failed: %v", n, err)
-			continue
+		// Idle verdict: prefer claude's self-reported lifecycle events (hook
+		// sideband) over scraping the pane for a prompt marker; pane scraping
+		// stays for codex and homes without the hooks yet.
+		var idle bool
+		var detected string
+		if evIdle, ok := eventIdleForIssue(n); ok && vmAgent(*vm).name == "claude" {
+			idle = evIdle
+		} else {
+			var err error
+			idle, detected, err = tmuxIdle(*vm, j.Tmux)
+			if err != nil {
+				log.Printf("issue #%d: idle check failed: %v", n, err)
+				continue
+			}
 		}
 		if detected != "" {
 			if want := sessionName(n, detected); want != j.Tmux {

@@ -282,6 +282,69 @@ func needsInputForIssue(n int) bool {
 	return needsInputByIssue[n]
 }
 
+// Session lifecycle events, fed by the same notify.jsonl hook feed
+// (SessionStart/Stop/SessionEnd are stamped alongside Notification /
+// UserPromptSubmit). This is claude reporting its OWN state — strictly more
+// reliable than scraping the pane for prompt markers, which is blind to
+// blocking dialogs and costs an ssh round-trip per check. Pane scraping
+// remains the fallback for codex and for homes the hooks haven't reached yet.
+type sessionEv struct {
+	ev string
+	ts time.Time
+}
+
+var (
+	sessionEvMu      sync.RWMutex
+	sessionEvByIssue = map[int]sessionEv{}
+)
+
+func sessionEventForIssue(n int) (string, time.Time) {
+	sessionEvMu.RLock()
+	defer sessionEvMu.RUnlock()
+	e := sessionEvByIssue[n]
+	return e.ev, e.ts
+}
+
+// sessionBootedSince reports whether ANY hook event for the issue arrived
+// after t0 — proof the CLI started, authenticated, and is rendering. Used by
+// the spawn wait loop to confirm liveness in seconds instead of polling the
+// pane for up to 6 minutes.
+func sessionBootedSince(n int, t0 time.Time) bool {
+	_, ts := sessionEventForIssue(n)
+	return ts.After(t0)
+}
+
+// eventIdleForIssue maps the last self-reported event to an idle verdict.
+// ok=false means no fresh event signal — fall back to pane scraping.
+// Stop = turn finished, sitting at the prompt. Notification = waiting on
+// input. UserPromptSubmit = a prompt was just submitted (mid-turn).
+// SessionStart = booting (bootstrap paste imminent) — treat as busy for one
+// tick rather than poke into a half-rendered TUI.
+func eventIdleForIssue(n int) (idle, ok bool) {
+	ev, ts := sessionEventForIssue(n)
+	if ev == "" || time.Since(ts) > 24*time.Hour {
+		return false, false
+	}
+	switch ev {
+	case "Stop", "Notification":
+		return true, true
+	case "UserPromptSubmit", "SessionStart":
+		return false, true
+	}
+	return false, false // SessionEnd etc: pane logic decides
+}
+
+// clearSessionState drops per-issue event state on teardown so a future job
+// reusing the issue number never inherits stale signals.
+func clearSessionState(n int) {
+	needsInputMu.Lock()
+	delete(needsInputByIssue, n)
+	needsInputMu.Unlock()
+	sessionEvMu.Lock()
+	delete(sessionEvByIssue, n)
+	sessionEvMu.Unlock()
+}
+
 // ingestNotify processes one notify.jsonl line: a Notification sets the issue's
 // needs-input flag (surfaced as a dashboard badge); UserPromptSubmit clears it.
 // issue is resolved from the event cwd.
@@ -307,10 +370,16 @@ func ingestNotify(line []byte) {
 		if rising {
 			log.Printf("issue #%d: needs input (notify: %s)", n, strings.TrimSpace(e.Message))
 		}
-	case "UserPromptSubmit", "Stop":
+	case "UserPromptSubmit", "Stop", "SessionEnd":
 		needsInputMu.Lock()
 		needsInputByIssue[n] = false
 		needsInputMu.Unlock()
+	}
+	switch e.HookEventName {
+	case "SessionStart", "Stop", "SessionEnd", "Notification", "UserPromptSubmit":
+		sessionEvMu.Lock()
+		sessionEvByIssue[n] = sessionEv{ev: e.HookEventName, ts: time.Now()}
+		sessionEvMu.Unlock()
 	}
 }
 
