@@ -768,7 +768,7 @@ func tick(cfg *Config, st *State) {
 					if idle, _, _ := tmuxIdle(*vm, j.Tmux); idle {
 						if j.LastPokeAt.IsZero() || time.Since(j.LastPokeAt) >= defaultPokeMinInterval {
 							log.Printf("issue #%d: no PR yet, idle poke", n)
-							_, _, _ = sshExec(*vm, fmt.Sprintf("tmux send-keys -t %s C-m", j.Tmux))
+							_ = tmuxPaste(*vm, j.Tmux, "continue")
 							j.LastPokeAt = time.Now()
 							saveStateLogged(st)
 						}
