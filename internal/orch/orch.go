@@ -1053,8 +1053,40 @@ tmux new-session -d -c "$WORKDIR" -s "$SESSION" "$LAUNCH"
 	return nil
 }
 
+// tmuxKill tears down a session AND reaps its process tree. A bare
+// `tmux kill-session` only SIGHUPs the pane's foreground process group, so any
+// descendant that setsid'd into its OWN session/group survives and keeps
+// spinning on the dead PTY (observed: codex under `--dangerously-bypass...`
+// and clawpatrol-wrapped agents detach this way → 60+ orphans pinning the box
+// at load ~80, each ~19% CPU in a futex spin). So before killing the session we
+// snapshot the pane pid(s), walk the full descendant closure (ppid chain is
+// still intact while the pane lives), collect every distinct pgid in that
+// subtree, then kill-session and `kill -9` each captured PROCESS GROUP (negative
+// pid) plus any straggler pids. Killing by pgid is what reaches the setsid'd
+// codex tree. Safe: tmux puts each pane in its own session, so the captured
+// groups belong only to this pane's subtree — never the tmux server (the pane's
+// parent, not a descendant) or orch. Piped through `bash -s` so it runs under
+// bash regardless of the remote login shell (mac's is zsh, which won't
+// word-split the unquoted pid lists). Best-effort; every step is `|| true`.
 func tmuxKill(vm VMBlock, session string) {
-	_, _, _ = sshExec(vm, fmt.Sprintf("tmux kill-session -t %s 2>/dev/null", session))
+	script := fmt.Sprintf(`
+S=%s
+ROOTS=$(tmux list-panes -t "$S" -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ')
+PIDS=""; PGIDS=""
+if [ -n "$ROOTS" ]; then
+  PIDS=$(ps -A -o pid=,ppid= 2>/dev/null | awk -v roots="$ROOTS" '
+    BEGIN{n=split(roots,r," ");for(i=1;i<=n;i++)if(r[i]!="")keep[r[i]]=1}
+    {pid[NR]=$1;par[NR]=$2}
+    END{c=1;while(c){c=0;for(i=1;i<=NR;i++)if(!(pid[i] in keep)&&(par[i] in keep)){keep[pid[i]]=1;c=1}}
+        for(k in keep)print k}')
+  for p in $PIDS; do g=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$g" ] && PGIDS="$PGIDS $g"; done
+  PGIDS=$(echo "$PGIDS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+fi
+tmux kill-session -t "$S" 2>/dev/null || true
+for g in $PGIDS; do kill -9 -"$g" 2>/dev/null || true; done
+for p in $PIDS; do kill -9 "$p" 2>/dev/null || true; done
+`, session)
+	_, _, _ = sshExecIn(vm, script, "bash -s")
 }
 
 // tmuxSignalGroup sends sig (STOP/CONT) to the ENTIRE process group of the
