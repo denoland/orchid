@@ -108,7 +108,7 @@ Output exactly this markdown, nothing else, max ~25 lines:
 			return
 		}
 		if out == "" || !strings.Contains(out, "## Triage") {
-			log.Printf("issue #%d: triage produced no usable report, skipping comment", is.Number)
+			log.Printf("issue #%d: triage produced no usable report, skipping comment; output head: %q", is.Number, oneLine(out, 300))
 			return
 		}
 		comment := triageMarker + "\n" + out
