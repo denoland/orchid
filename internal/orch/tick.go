@@ -115,11 +115,18 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 		return err
 	}
 	branch := cfg.Orch.BranchPrefix + fmt.Sprint(is.Number)
+	goal := truncateGoal(is.Body) // fallback: raw issue body
+	if st.store != nil {
+		if v, _ := st.store.GetKV(fmt.Sprintf("goal_%d", is.Number)); len(v) > 0 {
+			goal = string(v) // triage already ran: use the authoritative goal statement
+		}
+	}
 	st.Jobs[is.Number] = &Job{
 		VM: vm.Name, Tmux: sessionName(is.Number, vmAgent(*vm).name),
 		Target: target.Name, TargetRepo: target.Repo,
 		Branch: branch, Lifecycle: "oneshot",
 		IssueTitle: is.Title,
+		IssueGoal:  goal,
 		prTracker:  prTracker{LastCheckConclusions: map[string]string{}},
 		SpawnedAt:  time.Now(),
 	}
@@ -315,6 +322,16 @@ func tickCron(cfg *Config, st *State, n int, j *Job, is Issue, target TargetBloc
 	saveStateLogged(st)
 }
 
+// truncateGoal keeps the first 2000 chars of an issue body for goal injection.
+// Long bodies (boilerplate, huge context) don't add value beyond that in pokes.
+func truncateGoal(body string) string {
+	const max = 2000
+	if len(body) <= max {
+		return body
+	}
+	return body[:max] + "\n[...truncated]"
+}
+
 // cycleBloatedSession resets a long-lived session's context when it has grown
 // past the configured ceiling (or the session is too old) — the dominant token
 // sink, since every turn re-reads the whole conversation as cache_read, so a
@@ -369,18 +386,26 @@ func cycleBloatedSession(cfg *Config, st *State, vm *VMBlock, n int, j *Job) boo
 		ci = "  (no CI results yet)\n"
 	}
 	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", j.TargetRepo, j.PR)
-	issueHdr := ""
+	goalSection := ""
 	if j.IssueTitle != "" {
-		issueHdr = fmt.Sprintf("Issue: %s\n", j.IssueTitle)
+		goalSection = "Goal: " + j.IssueTitle + "\n"
+		if j.IssueGoal != "" {
+			goalSection += j.IssueGoal + "\n"
+		}
+		goalSection += "\nYou are not done until every requirement above is fully and completely implemented. No partial work. Time and difficulty are not excuses to stop early.\n\n"
 	}
-	msg := fmt.Sprintf(`Your context was reset to save tokens (it had grown large). You are still on the same task.
+	msg := fmt.Sprintf(`Your context was reset to save tokens. YOU ARE STILL ON THE SAME TASK. Do not stop.
 
 %sPR: #%d (%s)
 Branch: %s
 Last known CI:
 %s
-Re-read the PR and its diff, check what's implemented, address any open review comments or CI failures, push fixes if needed. If everything is already addressed and CI is green, stop and wait.`,
-		issueHdr, j.PR, prURL, j.Branch, ci)
+1. Run: gh issue view %d — re-read the FULL original requirements.
+2. Run: git diff origin/main...HEAD — check what is already implemented.
+3. List every requirement NOT yet in the diff.
+4. Implement every missing item. Push.
+You are not done until the complete goal is implemented. Do not declare done based on CI alone.`,
+		goalSection, j.PR, prURL, j.Branch, ci)
 	if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
 		log.Printf("issue #%d: context-cycle re-orient paste failed: %v", n, err)
 	}
@@ -545,6 +570,7 @@ func tick(cfg *Config, st *State) {
 				Schedule:   cron.ScheduleStr,
 				Timeout:    cron.TimeoutStr,
 				IssueTitle: r.is.Title,
+				IssueGoal:  truncateGoal(r.is.Body),
 				Priority:   prio,
 			}
 			log.Printf("issue #%d: registered cron job (target=%s, schedule=%s, timeout=%s, priority=%d)",
@@ -663,6 +689,16 @@ func tick(cfg *Config, st *State) {
 		}
 		if r, routedOpen := open[n]; routedOpen {
 			j.IssueTitle = r.is.Title
+			if j.IssueGoal == "" {
+				j.IssueGoal = truncateGoal(r.is.Body)
+			}
+			// Upgrade to triage goal if it arrived after spawn.
+			if st.store != nil {
+				goalKey := fmt.Sprintf("goal_%d", n)
+				if v, _ := st.store.GetKV(goalKey); len(v) > 0 && string(v) != j.IssueGoal {
+					j.IssueGoal = string(v)
+				}
+			}
 			// Re-sync priority live so editing the issue frontmatter retunes
 			// the governor's ordering without a restart.
 			if p := parsePriorityFrontmatter(r.is.Body); p != 0 || cfg.Orch.Throttle != nil {
@@ -987,6 +1023,14 @@ func tick(cfg *Config, st *State) {
 			parts = append(parts, resurfaceMsg(reviewBlocking, failingChecks))
 		}
 		msg := strings.Join(parts, "\n\n")
+		if j.IssueTitle != "" {
+			goal := "Goal: " + j.IssueTitle
+			if j.IssueGoal != "" {
+				goal += "\n" + j.IssueGoal
+			}
+			goal += "\n\nYou are not done until every requirement above is fully and completely implemented. No partial work. Time and difficulty are not excuses to stop early — keep going until the goal is 100% complete."
+			msg = goal + "\n\n---\n\n" + msg
+		}
 		if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
 			log.Printf("issue #%d: poke failed: %v", n, err)
 			continue

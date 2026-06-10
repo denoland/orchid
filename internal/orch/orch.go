@@ -201,6 +201,7 @@ type Job struct {
 	TargetRepo    string    `json:"target_repo"`
 	Branch        string    `json:"branch"`
 	IssueTitle    string    `json:"issue_title,omitempty"`
+	IssueGoal     string    `json:"issue_goal,omitempty"` // issue body excerpt, re-injected on every poke
 	Lifecycle     string    `json:"lifecycle,omitempty"`
 	Schedule      string    `json:"schedule,omitempty"`
 	Timeout       string    `json:"timeout,omitempty"`
@@ -2109,7 +2110,7 @@ func summarize(v *PRView, nr, ntc, nic []string, pushed bool, checks []string, m
 	case "MERGEABLE":
 		b.WriteString("- PR conflicts resolved — mergeable again. No action required for this item.\n")
 	}
-	b.WriteString("\nAddress these, push fixes if needed, then stop and wait for the next message.")
+	b.WriteString("\nAddress every item above. After pushing fixes, re-read the original issue and explicitly verify: is EVERY requirement fully implemented in the PR? If anything remains, keep working. Do NOT stop until the full goal is done.")
 	return b.String()
 }
 

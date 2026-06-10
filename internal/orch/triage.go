@@ -93,12 +93,13 @@ Investigate with the gh CLI (read-only):
 3. Pointers: the most likely source files/dirs/tests in %s to start from (search the repo with gh search code or your knowledge of it).
 4. Size: S (single sitting), M (a day), or L (multi-session port) with one line of rationale.
 
-Output exactly this markdown, nothing else, max ~25 lines:
+Output exactly this markdown, nothing else, max ~30 lines:
 ## Triage
 **Existing work:** <PR links + one-line status each, or "none found">
 **Duplicate inbox issues:** <links or "none found">
 **Pointers:** <files/dirs, key functions>
-**Size:** <S|M|L> — <rationale>`,
+**Size:** <S|M|L> — <rationale>
+<!-- orchid-goal: <2-3 sentence imperative mandate for the worker. State the COMPLETE scope — what "done" means with zero ambiguity. Use ALL-caps emphasis for scope words: ALL, EVERY, ZERO, COMPLETE. Explicitly state that time and difficulty are not excuses to stop early. Example: "Port ALL WebCrypto operations to Rust with ZERO JS fallbacks remaining. EVERY WPT test must pass against the native implementation. Do not stop early because it seems hard or time-consuming — the job is not done until the full API surface is covered."> -->`,
 			cfg.GitHub.InboxRepo, is.Number, is.Title, targetRepo, body,
 			targetRepo, targetRepo, targetRepo,
 			cfg.GitHub.InboxRepo, cfg.GitHub.InboxRepo, targetRepo)
@@ -111,6 +112,21 @@ Output exactly this markdown, nothing else, max ~25 lines:
 			log.Printf("issue #%d: triage produced no usable report, skipping comment; output head: %q", is.Number, oneLine(out, 300))
 			return
 		}
+
+		// Extract and persist the goal statement for poke injection.
+		goal := extractTriageGoal(out)
+		if goal != "" && st.store != nil {
+			goalKey := fmt.Sprintf("goal_%d", is.Number)
+			_ = st.store.PutKV(goalKey, []byte(goal))
+			// Update the job in-place if it already exists (spawn can race triage).
+			st.mu.Lock()
+			if j, ok := st.Jobs[is.Number]; ok {
+				j.IssueGoal = goal
+			}
+			st.mu.Unlock()
+			log.Printf("issue #%d: triage goal stored (%d chars)", is.Number, len(goal))
+		}
+
 		comment := triageMarker + "\n" + out
 		if _, errStr, err := run("gh", "issue", "comment", fmt.Sprint(is.Number),
 			"--repo", cfg.GitHub.InboxRepo, "--body", comment); err != nil {
@@ -186,4 +202,20 @@ printf '%%s\n' %s >> "$DIR/lessons.md"`, dir, shellSingleQuote(line))
 
 func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// extractTriageGoal parses the <!-- orchid-goal: ... --> marker from triage output.
+func extractTriageGoal(out string) string {
+	const prefix = "<!-- orchid-goal: "
+	const suffix = " -->"
+	i := strings.Index(out, prefix)
+	if i < 0 {
+		return ""
+	}
+	rest := out[i+len(prefix):]
+	j := strings.Index(rest, suffix)
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:j])
 }
