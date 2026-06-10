@@ -111,17 +111,36 @@ func startSession(cfg *Config, vm *VMBlock, is Issue, target TargetBlock, lifecy
 // fireCron instead, since their Job is created on first sighting and the
 // session is fired/refired on a schedule.
 func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) error {
+	branch := cfg.Orch.BranchPrefix + fmt.Sprint(is.Number)
+
+	// Pre-create the branch + draft PR on GitHub before the VM's git setup runs.
+	// tmuxStart's ls-remote check detects the existing branch and checks it out
+	// from origin, so the worker starts from our placeholder commit and pushes
+	// real commits on top. This gives instant PR visibility (seconds vs minutes).
+	prDesc := ""
+	if st.store != nil {
+		if v, _ := st.store.GetKV(fmt.Sprintf("pr_desc_%d", is.Number)); len(v) > 0 {
+			prDesc = string(v)
+		}
+	}
+	preflightPR := 0
+	if prN, err := orchPreflightPR(target.Repo, branch, cfg.GitHub.InboxRepo, is.Number, is.Title, prDesc); err != nil {
+		log.Printf("issue #%d: preflight PR failed (non-fatal, will create on first commit): %v", is.Number, err)
+	} else {
+		log.Printf("issue #%d: preflight PR #%d opened", is.Number, prN)
+		preflightPR = prN
+	}
+
 	if err := startSession(cfg, vm, is, target, "oneshot", ""); err != nil {
 		return err
 	}
-	branch := cfg.Orch.BranchPrefix + fmt.Sprint(is.Number)
 	goal := truncateGoal(is.Body) // fallback: raw issue body
 	if st.store != nil {
 		if v, _ := st.store.GetKV(fmt.Sprintf("goal_%d", is.Number)); len(v) > 0 {
 			goal = string(v) // triage already ran: use the authoritative goal statement
 		}
 	}
-	st.Jobs[is.Number] = &Job{
+	j := &Job{
 		VM: vm.Name, Tmux: sessionName(is.Number, vmAgent(*vm).name),
 		Target: target.Name, TargetRepo: target.Repo,
 		Branch: branch, Lifecycle: "oneshot",
@@ -130,6 +149,10 @@ func spawn(cfg *Config, st *State, vm *VMBlock, is Issue, target TargetBlock) er
 		prTracker:  prTracker{LastCheckConclusions: map[string]string{}},
 		SpawnedAt:  time.Now(),
 	}
+	if preflightPR > 0 {
+		j.PR = preflightPR // skip ghAutoCreatePR; tick goes straight to poking
+	}
+	st.Jobs[is.Number] = j
 	log.Printf("issue #%d: spawned on %s/%s, target=%s (%s), branch=%s",
 		is.Number, vm.Name, sessionName(is.Number, vmAgent(*vm).name), target.Name, target.Repo, branch)
 	_, _, err := run("gh", "api", "-X", "POST",
@@ -1054,6 +1077,8 @@ func tick(cfg *Config, st *State) {
 			}
 		}
 		saveStateLogged(st)
+		// Update the PR description's status block — non-blocking, best-effort.
+		go updatePRStatus(j.TargetRepo, j.PR, v, time.Since(j.SpawnedAt))
 		switch {
 		case resurface:
 			log.Printf("issue #%d: re-surfaced unaddressed review/CI on PR #%d (nudge %d/%d)", n, j.PR, j.RelayPokes, maxReviewRepokes)

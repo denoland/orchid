@@ -99,7 +99,8 @@ Output exactly this markdown, nothing else, max ~30 lines:
 **Duplicate inbox issues:** <links or "none found">
 **Pointers:** <files/dirs, key functions>
 **Size:** <S|M|L> — <rationale>
-<!-- orchid-goal: <2-3 sentence imperative mandate for the worker. State the COMPLETE scope — what "done" means with zero ambiguity. Use ALL-caps emphasis for scope words: ALL, EVERY, ZERO, COMPLETE. Explicitly state that time and difficulty are not excuses to stop early. Example: "Port ALL WebCrypto operations to Rust with ZERO JS fallbacks remaining. EVERY WPT test must pass against the native implementation. Do not stop early because it seems hard or time-consuming — the job is not done until the full API surface is covered."> -->`,
+<!-- orchid-goal: <2-3 sentence imperative mandate for the worker. State the COMPLETE scope — what "done" means with zero ambiguity. Use ALL-caps emphasis for scope words: ALL, EVERY, ZERO, COMPLETE. Explicitly state that time and difficulty are not excuses to stop early. Example: "Port ALL WebCrypto operations to Rust with ZERO JS fallbacks remaining. EVERY WPT test must pass against the native implementation. Do not stop early because it seems hard or time-consuming — the job is not done until the full API surface is covered."> -->
+<!-- orchid-pr-desc: <1-3 sentence PR description a human developer would write. Technical, specific, no bot language. Just what the PR does and why. Example: "Ports SubtleCrypto from the JS implementation in ext/crypto to a native Rust cppgc object, eliminating the JS bridge entirely. Covers all operations: encrypt/decrypt, sign/verify, deriveBits/deriveKey, wrapKey/unwrapKey, and all key import/export formats."> -->`,
 			cfg.GitHub.InboxRepo, is.Number, is.Title, targetRepo, body,
 			targetRepo, targetRepo, targetRepo,
 			cfg.GitHub.InboxRepo, cfg.GitHub.InboxRepo, targetRepo)
@@ -113,18 +114,43 @@ Output exactly this markdown, nothing else, max ~30 lines:
 			return
 		}
 
-		// Extract and persist the goal statement for poke injection.
-		goal := extractTriageGoal(out)
-		if goal != "" && st.store != nil {
-			goalKey := fmt.Sprintf("goal_%d", is.Number)
-			_ = st.store.PutKV(goalKey, []byte(goal))
-			// Update the job in-place if it already exists (spawn can race triage).
-			st.mu.Lock()
-			if j, ok := st.Jobs[is.Number]; ok {
+		// Extract and persist the goal statement and PR description for later use.
+		goal := extractMarker(out, "orchid-goal")
+		prDesc := extractMarker(out, "orchid-pr-desc")
+		if st.store != nil {
+			if goal != "" {
+				_ = st.store.PutKV(fmt.Sprintf("goal_%d", is.Number), []byte(goal))
+			}
+			if prDesc != "" {
+				_ = st.store.PutKV(fmt.Sprintf("pr_desc_%d", is.Number), []byte(prDesc))
+			}
+		}
+		// Update live job if it already exists (spawn can race triage).
+		st.mu.Lock()
+		j, jobExists := st.Jobs[is.Number]
+		if jobExists {
+			if goal != "" {
 				j.IssueGoal = goal
 			}
-			st.mu.Unlock()
+		}
+		var liveRepo string
+		var livePR int
+		if jobExists {
+			liveRepo = j.TargetRepo
+			livePR = j.PR
+		}
+		st.mu.Unlock()
+
+		if goal != "" {
 			log.Printf("issue #%d: triage goal stored (%d chars)", is.Number, len(goal))
+		}
+		// If the stub PR was already opened with a bare description, upgrade it now.
+		if prDesc != "" && liveRepo != "" && livePR > 0 {
+			if _, _, err := run("gh", "pr", "edit", fmt.Sprint(livePR), "--repo", liveRepo, "--body", prDesc); err != nil {
+				log.Printf("issue #%d: update stub PR description failed: %v", is.Number, err)
+			} else {
+				log.Printf("issue #%d: stub PR #%d description updated from triage", is.Number, livePR)
+			}
 		}
 
 		comment := triageMarker + "\n" + out
@@ -204,9 +230,9 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// extractTriageGoal parses the <!-- orchid-goal: ... --> marker from triage output.
-func extractTriageGoal(out string) string {
-	const prefix = "<!-- orchid-goal: "
+// extractMarker parses <!-- orchid-<name>: ... --> from triage output.
+func extractMarker(out, name string) string {
+	prefix := "<!-- orchid-" + name + ": "
 	const suffix = " -->"
 	i := strings.Index(out, prefix)
 	if i < 0 {
