@@ -672,8 +672,9 @@ func readBotGithubKey(configured string) (priv, pub string) {
 // remaining args. Centralised so adding a new top-level command means
 // adding one entry here — no chained `if os.Args[1] == ...` ladders.
 var subcommands = map[string]func([]string){
-	"join": runJoin,
-	"run":  runRun,
+	"join":  runJoin,
+	"run":   runRun,
+	"spawn": runSpawn,
 }
 
 // defaultConfigPath is where a no-flag `orch` reads/creates its config:
@@ -810,51 +811,93 @@ func readWorkerEnv() (url, token, vm string, err error) {
 	return
 }
 
-// runRun is the worker-side `orch run <title>` entry point — pings
-// central to spawn a tmux session on this host running the configured
-// agent. The title becomes the card label; lifecycle is adhoc so the
-// job sticks around until the operator kills the pane.
-func runRun(args []string) {
-	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
-		fmt.Fprintln(os.Stderr, "usage: orch run <title>")
-		os.Exit(2)
-	}
-	title := strings.Join(args, " ")
-	centralURL, token, vmName, err := readWorkerEnv()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "orch run: %v\n  (this host hasn't been joined yet — run `orch join vm <central-url> <token>` first)\n", err)
-		os.Exit(1)
-	}
+func requestAdhocSessionClient(centralURL, token, vmName, title string) (string, error) {
 	body, _ := json.Marshal(map[string]string{"title": title, "vm": vmName})
 	req, _ := http.NewRequest(http.MethodPost, strings.TrimRight(centralURL, "/")+"/api/adhoc", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := (&http.Client{Timeout: adhocHTTPTimeout}).Do(req)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "orch run: central unreachable: %v\n", err)
-		os.Exit(1)
+		return "", fmt.Errorf("central unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, errBodySnippet))
-		fmt.Fprintf(os.Stderr, "orch run: central returned %d: %s\n", resp.StatusCode, strings.TrimSpace(string(msg)))
-		os.Exit(1)
+		return "", fmt.Errorf("central returned %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	var reply struct {
 		Tmux string `json:"tmux"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&reply)
-	fmt.Printf("orch run: started %s — attaching (detach with Ctrl-b d).\n", reply.Tmux)
+	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
+		return "", fmt.Errorf("decode /api/adhoc response: %w", err)
+	}
+	if strings.TrimSpace(reply.Tmux) == "" {
+		return "", fmt.Errorf("central returned an empty tmux session name")
+	}
+	return reply.Tmux, nil
+}
+
+func requestAdhocSession(title string) string {
+	centralURL, token, vmName, err := readWorkerEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "orch run: %v\n  (this host hasn't been joined yet — run `orch join vm <central-url> <token>` first)\n", err)
+		os.Exit(1)
+	}
+	tmuxSession, err := requestAdhocSessionClient(centralURL, token, vmName, title)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "orch run: %v\n", err)
+		os.Exit(1)
+	}
+	return tmuxSession
+}
+
+// runRun is the worker-side `orch run <title>` entry point — pings
+// central to spawn a tmux session on this host running the configured
+// agent. The title becomes the card label; lifecycle is adhoc so the
+// job sticks around until the operator kills the pane. By default it
+// replaces itself with `tmux attach`; pass --detach to just print the
+// session name and return.
+func runRun(args []string) {
+	fs := flag.NewFlagSet("orch run", flag.ExitOnError)
+	detach := fs.Bool("detach", false, "spawn the session without attaching to tmux")
+	args = reorderFlagsFirst(args)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	pos := fs.Args()
+	if len(pos) == 0 || strings.TrimSpace(pos[0]) == "" {
+		fmt.Fprintln(os.Stderr, "usage: orch run [--detach] <title>")
+		os.Exit(2)
+	}
+	title := strings.Join(pos, " ")
+	tmuxSession := requestAdhocSession(title)
+	if *detach {
+		fmt.Printf("orch run: started %s — detached. Attach later with: tmux attach -t %s\n", tmuxSession, tmuxSession)
+		return
+	}
+	fmt.Printf("orch run: started %s — attaching (detach with Ctrl-b d).\n", tmuxSession)
 	tmux, err := exec.LookPath("tmux")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "orch run: tmux not on PATH (%v) — pane is live on this host, attach manually: tmux attach -t %s\n", err, reply.Tmux)
+		fmt.Fprintf(os.Stderr, "orch run: tmux not on PATH (%v) — pane is live on this host, attach manually: tmux attach -t %s\n", err, tmuxSession)
 		return
 	}
 	// Replace ourselves with tmux so the user lands directly in the
 	// pane and Ctrl-C / detach behave normally.
-	if err := syscall.Exec(tmux, []string{"tmux", "attach-session", "-t", reply.Tmux}, os.Environ()); err != nil {
+	if err := syscall.Exec(tmux, []string{"tmux", "attach-session", "-t", tmuxSession}, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "orch run: exec tmux: %v\n", err)
 	}
+}
+
+// runSpawn is a non-attaching alias for `orch run --detach <title>`.
+// It exists for operators driving local workers programmatically:
+// spawn, return the tmux session name, and let Claude notifications /
+// hooks surface progress instead of holding the caller open in tmux.
+func runSpawn(args []string) {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		fmt.Fprintln(os.Stderr, "usage: orch spawn <title>")
+		os.Exit(2)
+	}
+	runRun(append([]string{"--detach"}, args...))
 }
 
 func Main() {
@@ -1111,7 +1154,6 @@ func Main() {
 	go runQuotaSampleLoop(ctx, st.store, &cfg)
 	// At-a-glance list signal: per-session git WIP stats (branch diff vs base).
 	go runWipLoop(ctx, &cfg, st)
-
 
 	if cfg.Orch.Mentions != nil {
 		// Probe the org-members read once for an early, visible warning — but do

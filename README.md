@@ -16,6 +16,17 @@ Get started at https://orchid.littledivy.com/docs/getting-started
 curl -fsSL https://orchid.littledivy.com/install.sh | bash
 ```
 
+For local tmux workers on a joined machine:
+
+```bash
+orch run "triage flaky windows test"          # spawn + attach
+orch run --detach "triage flaky windows test" # spawn + return
+orch spawn "triage flaky windows test"        # alias for --detach
+```
+
+Detached mode is meant for operators and bots that want Claude's
+`~/.claude/notify.jsonl` hooks to drive follow-ups instead of blocking in tmux.
+
 ### Cluster
 
 A machine is anything that runs `tmux` + your agent over SSH. orchid drives
