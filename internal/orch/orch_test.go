@@ -290,6 +290,57 @@ func TestSlugifyHostname(t *testing.T) {
 	}
 }
 
+func TestFreeVMAllowSkipsCooled(t *testing.T) {
+	cfg := &Config{VMs: []VMBlock{
+		{Name: "boxa", Host: "boxa", Agent: "claude", Capacity: 1},
+		{Name: "boxb", Host: "boxb", Agent: "claude", Capacity: 1},
+	}}
+	st := &State{}
+	allow := func(string) bool { return true }
+	cool := func() time.Time { return time.Now().Add(spawnFailCooldown) }
+
+	// Both idle (load 0): name tiebreak picks boxa.
+	if vm := freeVMAllow(cfg, st, allow); vm == nil || vm.Name != "boxa" {
+		t.Fatalf("baseline: want boxa, got %v", vm)
+	}
+
+	// A single failure must NOT cool boxa (threshold is 3) — it's still picked.
+	if tripped := st.RecordSpawnFail("boxa", spawnFailThreshold, cool()); tripped {
+		t.Fatal("1 failure should not trip cooldown")
+	}
+	if vm := freeVMAllow(cfg, st, allow); vm == nil || vm.Name != "boxa" {
+		t.Fatalf("after 1 failure: boxa should still be eligible, got %v", vm)
+	}
+	// A success resets the tally — failures must not accumulate across it.
+	st.RecordSpawnOK("boxa")
+	st.RecordSpawnFail("boxa", spawnFailThreshold, cool())
+	st.RecordSpawnFail("boxa", spawnFailThreshold, cool())
+	if st.VMSpawnCooled("boxa", time.Now()) {
+		t.Fatal("2 failures after a reset should not have cooled boxa")
+	}
+
+	// Reaching the threshold cools boxa: admission falls through to boxb.
+	st.RecordSpawnOK("boxa")
+	var tripped bool
+	for i := 0; i < spawnFailThreshold; i++ {
+		tripped = st.RecordSpawnFail("boxa", spawnFailThreshold, cool())
+	}
+	if !tripped {
+		t.Fatalf("%d consecutive failures should trip cooldown", spawnFailThreshold)
+	}
+	if vm := freeVMAllow(cfg, st, allow); vm == nil || vm.Name != "boxb" {
+		t.Fatalf("after cooling boxa: want boxb, got %v", vm)
+	}
+
+	// Cool boxb too: no admittable VM.
+	for i := 0; i < spawnFailThreshold; i++ {
+		st.RecordSpawnFail("boxb", spawnFailThreshold, cool())
+	}
+	if vm := freeVMAllow(cfg, st, allow); vm != nil {
+		t.Fatalf("both cooled: want nil, got %v", vm)
+	}
+}
+
 func TestAllocVMName(t *testing.T) {
 	cfg := &Config{VMs: []VMBlock{{Name: "local"}, {Name: "worker01"}, {Name: "vm-1"}}}
 	if got := allocVMName(cfg, "worker01.dc.example.com"); got != "vm-2" {

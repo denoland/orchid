@@ -428,7 +428,7 @@ Last known CI:
 3. List every requirement NOT yet in the diff.
 4. Implement every missing item. Push.
 You are not done until the complete goal is implemented. Do not declare done based on CI alone.`,
-		goalSection, j.PR, prURL, j.Branch, ci)
+		goalSection, j.PR, prURL, j.Branch, ci, n)
 	if err := tmuxPaste(*vm, j.Tmux, msg); err != nil {
 		log.Printf("issue #%d: context-cycle re-orient paste failed: %v", n, err)
 	}
@@ -668,9 +668,20 @@ func tick(cfg *Config, st *State) {
 			agent = "claude"
 		}
 		if err := spawn(cfg, st, vm, r.is, r.target); err != nil {
-			log.Printf("issue #%d: spawn failed on %s: %v", n, vm.Name, err)
+			// Tally the failure. A genuinely wedged VM fails on issue after
+			// issue and trips a cooldown (freeVMAllow then skips it, so the
+			// next candidate falls through to a healthy VM instead of starving
+			// on this one every tick). A one-off issue-specific failure on a
+			// healthy VM just bumps the count, which the next issue's success
+			// there resets — so it never benches a good box.
+			if st.RecordSpawnFail(vm.Name, spawnFailThreshold, time.Now().Add(spawnFailCooldown)) {
+				log.Printf("issue #%d: spawn failed on %s: %v (cooling %s for %s after %d consecutive)", n, vm.Name, err, vm.Name, spawnFailCooldown, spawnFailThreshold)
+			} else {
+				log.Printf("issue #%d: spawn failed on %s: %v", n, vm.Name, err)
+			}
 			continue
 		}
+		st.RecordSpawnOK(vm.Name)
 		// Stamp priority on the freshly-created job.
 		if j := st.Jobs[n]; j != nil {
 			p := parsePriorityFrontmatter(r.is.Body)

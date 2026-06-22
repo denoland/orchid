@@ -523,6 +523,37 @@ func TestFiveBucketSkippedWhenNoReset(t *testing.T) {
 	}
 }
 
+func TestDeepHeadroomRelax(t *testing.T) {
+	// Live regression: a near-empty weekly bucket (6% used, 99h to reset) with a
+	// MILD over-pace burn must NOT be soft-paced — the old behavior pinned the
+	// cap and paused sessions off a linear projection (6% + ~1%/h*99h => ~109%)
+	// despite 94% headroom. Below govEngageFloorPct the soft governor relaxes:
+	// no cap, no pauses. The hard gate + 5h bucket remain the real ceiling guard.
+	reset := govNow.Add(99 * time.Hour).Unix()
+	// Rising history at ~1%/h ending at 6% — a real (if mild) over-target burn.
+	s := weeklySamples(8, 15*time.Minute, 6, 1.0, reset)
+	seven := RateLimit{UsedPct: 6, ResetsAt: reset}
+	d := GovernorDecide(govNow, RateLimit{}, seven, true, s, 13, 11, govCfg())
+	if d.PausedTarget != 0 {
+		t.Errorf("PausedTarget=%d, want 0 (deep headroom => no duty-cycle pause)", d.PausedTarget)
+	}
+	// Relaxed bucket contributes the full configured allowance, not a braked cap:
+	// EffectiveCap == maxActive (>= active), so admission is unconstrained.
+	maxA := govCfg().withDefaults().MaxActive
+	if d.EffectiveCap != maxA {
+		t.Errorf("EffectiveCap=%d, want maxActive(%d) (deep headroom => no brake below max)", d.EffectiveCap, maxA)
+	}
+
+	// Just above the floor the soft governor re-engages and paces a hot burn.
+	reset2 := govNow.Add(48 * time.Hour).Unix()
+	s2 := weeklySamples(8, 15*time.Minute, 60, 40, reset2)
+	seven2 := RateLimit{UsedPct: 60, ResetsAt: reset2}
+	d2 := GovernorDecide(govNow, RateLimit{}, seven2, true, s2, 4, 4, govCfg())
+	if d2.PausedTarget == 0 {
+		t.Error("PausedTarget=0 at 60% used with a hot burn, want >0 (governor still engaged above the floor)")
+	}
+}
+
 func TestDutyTarget(t *testing.T) {
 	// controlBucket directly: active=4, burn=2x target => overFrac=0.5 =>
 	// pausedTarget=ceil(4*0.5)=2, and active-2=2 >= minActive(1) ok.

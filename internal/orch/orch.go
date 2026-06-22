@@ -268,6 +268,20 @@ type State struct {
 	// fills in within one probe interval.
 	healthMu sync.RWMutex
 	health   map[string]VMHealth
+	// spawnCooldown records, per VM, a time before which the scheduler should
+	// not route new spawns to that VM. Set when a VM racks up enough
+	// CONSECUTIVE spawn failures (spawnFailCool) to look genuinely wedged —
+	// e.g. a host where openpty/workspace-create errors but the SSH probe
+	// still reports Online. Without it, freeVMAllow keeps returning the same
+	// dead VM (a failed spawn adds no load, so it sorts first by load every
+	// tick) and the whole admission pass starves on one box while healthy VMs
+	// idle. spawnFails is the per-VM consecutive-failure tally feeding it; it
+	// resets to 0 on any successful spawn, so an issue-specific failure (bad
+	// branch, dirty worktree) that fails on a healthy VM never trips the
+	// cooldown — the next good issue's success on that VM clears the count.
+	// Both guarded by healthMu (share the health map's lifecycle/lock).
+	spawnCooldown map[string]time.Time
+	spawnFails    map[string]int
 
 	// lastThrottleModeByAgent is each agent's throttle mode observed on the
 	// previous tick, used to log only on mode transitions (not every tick).
@@ -319,6 +333,47 @@ func (s *State) VMHealth(name string) VMHealth {
 	return s.health[name]
 }
 
+// RecordSpawnFail bumps vm's consecutive-failure tally. Once it reaches
+// threshold the VM is put in a spawn cooldown until now+cool (and the tally
+// reset), so the scheduler falls through to healthy VMs instead of re-picking
+// a wedged one every tick. Returns true if this failure tripped the cooldown.
+// Threshold > 1 so a single issue-specific failure on an otherwise-healthy VM
+// doesn't bench it — only a VM failing across multiple issues does.
+func (s *State) RecordSpawnFail(name string, threshold int, until time.Time) bool {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	if s.spawnFails == nil {
+		s.spawnFails = map[string]int{}
+	}
+	s.spawnFails[name]++
+	if s.spawnFails[name] >= threshold {
+		if s.spawnCooldown == nil {
+			s.spawnCooldown = map[string]time.Time{}
+		}
+		s.spawnCooldown[name] = until
+		s.spawnFails[name] = 0
+		return true
+	}
+	return false
+}
+
+// RecordSpawnOK clears vm's consecutive-failure tally after a successful spawn.
+func (s *State) RecordSpawnOK(name string) {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	if s.spawnFails != nil {
+		delete(s.spawnFails, name)
+	}
+}
+
+// VMSpawnCooled reports whether vm is in a post-failure spawn cooldown as of t.
+func (s *State) VMSpawnCooled(name string, t time.Time) bool {
+	s.healthMu.RLock()
+	defer s.healthMu.RUnlock()
+	until, ok := s.spawnCooldown[name]
+	return ok && t.Before(until)
+}
+
 // SetGovernorState records one agent's latest governor verdict for /api/state.
 // Called from tick() (which already holds st.mu); takes only govMu, so the HTTP
 // reader never contends with the scheduler pass. Lock order is always st.mu →
@@ -368,6 +423,17 @@ func (c *MaintainerCache) has(login string) bool {
 const runAttempts = 4
 
 const maxKillsPerTick = 2
+
+// spawnFailCooldown is how long a VM is skipped for new spawns once it trips
+// the cooldown. Long enough to stop a wedged host from swallowing every
+// admission attempt; short enough that a recovered host rejoins within minutes.
+const spawnFailCooldown = 5 * time.Minute
+
+// spawnFailThreshold is how many CONSECUTIVE spawn failures a VM must rack up
+// (with no intervening success) before it's benched. >1 so an issue-specific
+// failure on a healthy VM doesn't cool it; a genuinely wedged VM fails on every
+// issue and trips it within a tick or two.
+const spawnFailThreshold = 3
 
 const vmHealthProbeInterval = 15 * time.Second
 
@@ -493,18 +559,20 @@ func sshArgs(vm VMBlock) []string {
 }
 
 // sshExec runs a shell command on the VM. For localhost, skips SSH overhead.
+// Prepends ~/.local/bin to PATH so the herdr tmux shim (installed user-local
+// on VMs without sudo) is found ahead of the real tmux at /usr/bin/tmux.
 func sshExec(vm VMBlock, remote string) (string, string, error) {
 	if isLocal(vm) {
-		return run("bash", "-c", remote)
+		return run("bash", "-c", `export PATH="$HOME/.local/bin:$PATH"; `+remote)
 	}
-	return run("ssh", append(sshArgs(vm), remote)...)
+	return run("ssh", append(sshArgs(vm), `export PATH="$HOME/.local/bin:$PATH"; `+remote)...)
 }
 
 func sshExecIn(vm VMBlock, stdin, remote string) (string, string, error) {
 	if isLocal(vm) {
-		return runIn(stdin, "bash", "-c", remote)
+		return runIn("export PATH=\"$HOME/.local/bin:$PATH\"\n"+stdin, "bash", "-c", remote)
 	}
-	return runIn(stdin, "ssh", append(sshArgs(vm), remote)...)
+	return runIn("export PATH=\"$HOME/.local/bin:$PATH\"\n"+stdin, "ssh", append(sshArgs(vm), remote)...)
 }
 
 type Issue struct {
@@ -1495,6 +1563,13 @@ func freeVMAllow(cfg *Config, st *State, allow func(agent string) bool) *VMBlock
 			if !h.LastOK.IsZero() && !h.Online {
 				continue
 			}
+		}
+		// Skip VMs in a post-spawn-failure cooldown. The SSH probe can
+		// report Online (tmux/ssh work) while spawns still fail on a wedged
+		// host (e.g. openpty exhaustion) — cooldown is the only signal that
+		// catches that, and lets admission fall through to healthy VMs.
+		if st.VMSpawnCooled(vm.Name, time.Now()) {
+			continue
 		}
 		idx = append(idx, i)
 	}

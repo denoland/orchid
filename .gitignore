@@ -70,3 +70,6 @@ cfrelaytun/go/example/example
 
 # cross-compiled orch binaries (build artifacts)
 orch.linux-*
+
+# herdr build artifact
+/orch-linux-herdr

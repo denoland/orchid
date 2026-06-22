@@ -39,6 +39,8 @@ const (
 	govCapDeadband  = 0.15             // |normErr| within this => leave the cap unchanged (hysteresis)
 	govDutyDeadband = 0.10             // overFrac change within this => don't re-target duty (anti-thrash)
 	govSlewPerTick  = 1                // cap may move at most this many slots per tick
+
+	govEngageFloorPct = 10.0 // below this used%, the SOFT governor relaxes (see relaxBucket)
 )
 
 // QuotaSample is one persisted reading of both rate-limit buckets at a wall
@@ -197,6 +199,28 @@ func targetRatePerHour(now time.Time, curReset int64, usedNow, ceilingPct float6
 	return remainingBudget / hours(remaining)
 }
 
+// relaxBucket reports whether a bucket's usage is so low that the SOFT governor
+// should not pace it at all this tick — leave the cap uncapped and pause
+// nothing. Below govEngageFloorPct the proactive controller does more harm than
+// good and we deliberately fail it open. Rationale:
+//
+//   - Signal quality: rate-limit readings are integer percent. Near zero a
+//     single +1% quantization step reads as a full ~1%/h of "burn", so the
+//     estimator paces against noise — e.g. 6% used with 94% headroom got its
+//     cap pinned and sessions paused off a 1.05%/h artifact.
+//   - Safety is elsewhere: the governor is only the proactive SOFT layer. The
+//     hard binary gate (ThrottleDecide) still slams at the real ceiling, and
+//     the fast 5h bucket engages on any genuine burst (its used% crosses the
+//     floor long before the weekly bucket could), so relaxing the weekly soft
+//     pace while deeply under budget cannot overrun the ceiling.
+//
+// Burn-independent on purpose: keying the relax on used% alone (monotone within
+// a window) keeps it from toggling as the controller changes burn, so the cap
+// slew / convergence behavior is undisturbed.
+func relaxBucket(used float64) bool {
+	return used < govEngageFloorPct
+}
+
 // bucketControl is the per-bucket controller output.
 type bucketControl struct {
 	ok           bool
@@ -302,6 +326,11 @@ func GovernorDecide(now time.Time, five, seven RateLimit, ok bool,
 		seven.ResetsAt); bok {
 		tr := targetRatePerHour(now, seven.ResetsAt, seven.UsedPct, ceiling)
 		weekly = controlBucket(rate, tr, active, prevCap, minActive, maxActive)
+		// Deep-headroom relax: don't soft-pace a near-empty weekly bucket.
+		if relaxBucket(seven.UsedPct) {
+			weekly.cap = maxActive
+			weekly.pausedTarget = 0
+		}
 	}
 
 	// 5h bucket — skipped entirely when there is no live 5h reset.
@@ -313,6 +342,10 @@ func GovernorDecide(now time.Time, five, seven RateLimit, ok bool,
 			five.ResetsAt); bok {
 			tr := targetRatePerHour(now, five.ResetsAt, five.UsedPct, ceiling)
 			fiveB = controlBucket(rate, tr, active, prevCap, minActive, maxActive)
+			if relaxBucket(five.UsedPct) {
+				fiveB.cap = maxActive
+				fiveB.pausedTarget = 0
+			}
 		}
 	}
 
