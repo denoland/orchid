@@ -94,6 +94,12 @@ type Gov struct {
 	Slack        float64 `json:"slack_pct"`          // throttle to MinActive within this of the ceiling (default 8)
 	MaxActive    int     `json:"max_active"`         // global cap on concurrent agents (default 16)
 	MinActive    int     `json:"min_active"`         // never fully stall under budget (default 1)
+	// WeeklyTokenBudget paces against claude's OWN transcript token counts (no
+	// clawpatrol, no API key): the governor sums input+output+cache-creation
+	// tokens across the fleet's transcripts over the rolling 7 days and treats
+	// used/budget as the weekly utilization. Set it to your Max plan's effective
+	// weekly token allowance. 0 => token-budget pacing off (static cap).
+	WeeklyTokenBudget int64 `json:"weekly_token_budget"`
 }
 
 func (c *Config) withDefaults() {
@@ -777,71 +783,38 @@ type quota struct {
 	ok      bool
 }
 
-var rlRe = regexp.MustCompile(`(?i)anthropic-ratelimit-unified-(5h|7d|7day|week|weekly)-(used|status|limit|reset|remaining)\s*:\s*(\S+)`)
-
-// sampleQuota curls Anthropic's API with the synced oauth token and parses the
-// unified rate-limit response headers (5h + weekly used%). Coordinator-side, so
-// it uses the canonical creds directly — no clawpatrol, no per-host probe.
-func (a *AuthStore) sampleQuota(ctx context.Context) quota {
-	a.mu.Lock()
-	credsPath := a.ClaudeCreds
-	a.mu.Unlock()
-	tok := oauthFromCreds(credsPath)
-	if tok == "" {
-		return quota{}
-	}
-	body := `{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`
-	cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
-	defer cancel()
-	out, _ := run(cctx, "curl", "-s", "-D", "-", "-o", "/dev/null", "-X", "POST",
-		"https://api.anthropic.com/v1/messages",
-		"-H", "authorization: Bearer "+tok,
-		"-H", "anthropic-version:2023-06-01",
-		"-H", "content-type:application/json",
-		"-d", body)
-	q := quota{at: time.Now()}
-	for _, m := range rlRe.FindAllStringSubmatch(out, -1) {
-		bucket, field, val := strings.ToLower(m[1]), strings.ToLower(m[2]), m[3]
-		weekly := bucket == "7d" || bucket == "7day" || bucket == "week" || bucket == "weekly"
-		switch field {
-		case "used", "status":
-			if f, err := strconv.ParseFloat(strings.TrimSuffix(val, "%"), 64); err == nil {
-				if weekly {
-					q.used7d, q.ok = f, true
-				} else {
-					q.used5h = f
-				}
-			}
-		case "reset":
-			if ts, err := strconv.ParseInt(val, 10, 64); err == nil && weekly {
-				q.reset7d = time.Unix(ts, 0)
-			}
-		}
-	}
-	return q
+// tokenSumScript sums input+output+cache-creation tokens from a host's claude
+// transcripts touched in the last 7 days (cache-read is ~free, excluded). Pure
+// local read of claude's own JSONL — no API, no clawpatrol.
+func (h Host) tokenSumScript() string {
+	home := h.agentHome()
+	return fmt.Sprintf(`export HOME=%s
+find "$HOME/.claude/projects" -name '*.jsonl' -mtime -7 2>/dev/null -print0 \
+ | xargs -0 cat 2>/dev/null \
+ | jq -r 'try (.message.usage | (.input_tokens // 0)+(.output_tokens // 0)+(.cache_creation_input_tokens // 0)) catch empty' 2>/dev/null \
+ | awk '{s+=$1} END{print s+0}'`, shq(home))
 }
 
-// oauthFromCreds reads the sk-ant-oat access token from a claude credentials file.
-func oauthFromCreds(path string) string {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
+// sampleQuota computes weekly utilization from the fleet's transcript token sums
+// vs the configured budget. No clawpatrol, no API key — reads claude's own data.
+func (c *Coord) sampleQuota(ctx context.Context) quota {
+	budget := c.cfg.Governor.WeeklyTokenBudget
+	if budget <= 0 {
+		return quota{}
 	}
-	var raw map[string]any
-	if json.Unmarshal(b, &raw) != nil {
-		return ""
-	}
-	for _, key := range []string{"claudeAiOauth", "oauthAccount"} {
-		if m, ok := raw[key].(map[string]any); ok {
-			if t, ok := m["accessToken"].(string); ok && t != "" {
-				return t
-			}
+	var total int64
+	for _, h := range c.cfg.Hosts {
+		cctx, cancel := context.WithTimeout(ctx, 40*time.Second)
+		out, err := h.runRemote(cctx, h.tokenSumScript())
+		cancel()
+		if err != nil {
+			continue
+		}
+		if n, e := strconv.ParseInt(strings.TrimSpace(out), 10, 64); e == nil {
+			total += n
 		}
 	}
-	if t, ok := raw["accessToken"].(string); ok {
-		return t
-	}
-	return ""
+	return quota{used7d: float64(total) / float64(budget) * 100, ok: total > 0, at: time.Now()}
 }
 
 // govCap returns the max concurrent agents the governor allows right now. Slim
@@ -983,7 +956,7 @@ func (c *Coord) governorLoop(ctx context.Context) {
 	t := time.NewTicker(5 * time.Minute)
 	defer t.Stop()
 	for {
-		q := c.auth.sampleQuota(ctx)
+		q := c.sampleQuota(ctx)
 		if q.ok {
 			c.gov.mu.Lock()
 			c.gov.q = q
@@ -1349,7 +1322,7 @@ func (c *Coord) supervise(ctx context.Context, n int, j *Job, status map[int]age
 	// re-delivers the task, not a bare Enter — fixes the gcp strandings). Debounced
 	// to once per 10m and gated to idle only (not "done", which is often just
 	// between-turns) so we never poke-storm healthy sessions.
-	if known && ref.Status == "idle" && j.PR == 0 && j.Pane != "" && time.Since(j.LastPoke) > 10*time.Minute {
+	if known && (ref.Status == "idle" || ref.Status == "done") && j.PR == 0 && j.Pane != "" && time.Since(j.LastPoke) > 10*time.Minute {
 		gctx, gcancel := context.WithTimeout(ctx, 15*time.Second)
 		if host.send(gctx, j.Pane, "continue — implement the assigned issue fully, then open a PR. "+j.Goal) == nil {
 			j.LastPoke = time.Now()
