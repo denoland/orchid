@@ -993,20 +993,27 @@ func (c *Coord) activeHosts() []Host {
 }
 
 func (c *Coord) tick(ctx context.Context) {
-	open, allOpen := c.pollIssues(ctx)
+	open, allOpen, pollOK := c.pollIssues(ctx)
 
-	// Teardown jobs whose inbox issue is gone.
-	c.st.mu.Lock()
-	for n, j := range c.st.Jobs {
-		if _, ok := allOpen[n]; !ok {
-			jc := j
-			c.st.mu.Unlock()
-			c.teardown(ctx, n, jc)
-			c.st.mu.Lock()
-			delete(c.st.Jobs, n)
+	// Teardown jobs whose inbox issue is gone — but ONLY when the poll was
+	// reliable. A flaky gh list (error, or a transient empty result) must never
+	// be read as "all issues closed" and wipe the swarm. Fail-safe: skip teardown
+	// unless every target listed cleanly AND we got a non-empty open set.
+	if pollOK && len(allOpen) > 0 {
+		c.st.mu.Lock()
+		for n, j := range c.st.Jobs {
+			if _, ok := allOpen[n]; !ok {
+				jc := j
+				c.st.mu.Unlock()
+				c.teardown(ctx, n, jc)
+				c.st.mu.Lock()
+				delete(c.st.Jobs, n)
+			}
 		}
+		c.st.mu.Unlock()
+	} else if !pollOK {
+		log.Printf("poll incomplete — skipping teardown pass (never-strand guard)")
 	}
-	c.st.mu.Unlock()
 
 	status := c.fleetStatus(ctx)
 
@@ -1045,13 +1052,18 @@ func (c *Coord) tick(ctx context.Context) {
 	c.st.save()
 }
 
-func (c *Coord) pollIssues(ctx context.Context) (map[int]Issue, map[int]bool) {
-	open := map[int]Issue{}
-	all := map[int]bool{}
+// pollIssues returns the open issues plus ok=false if ANY target's gh list
+// errored — so the caller can skip teardown on a flaky poll and never wipe the
+// swarm over a transient gh hiccup.
+func (c *Coord) pollIssues(ctx context.Context) (open map[int]Issue, all map[int]bool, ok bool) {
+	open = map[int]Issue{}
+	all = map[int]bool{}
+	ok = true
 	for _, tgt := range c.cfg.Targets {
 		issues, err := ghIssues(ctx, c.cfg.Inbox, tgt.Label)
 		if err != nil {
 			log.Printf("poll %s/%s: %v", c.cfg.Inbox, tgt.Label, err)
+			ok = false
 			continue
 		}
 		for _, is := range issues {
@@ -1059,7 +1071,7 @@ func (c *Coord) pollIssues(ctx context.Context) (map[int]Issue, map[int]bool) {
 			all[is.Number] = true
 		}
 	}
-	return open, all
+	return open, all, ok
 }
 
 // agentRef is a live herdr agent resolved to an issue number, with the handles
