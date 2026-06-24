@@ -718,8 +718,11 @@ func httpHandler(cfg *Config, st *State) http.Handler {
 
 		// Visible viewport only — see runCapture in relay_agent.go for why
 		// dropping -S (scrollback) is what kills the flicker.
+		// PATH prefix so `tmux` resolves to the herdr shim (~/.local/bin), not the
+		// real /usr/bin/tmux — without it, capture on herdr hosts like gcp prints
+		// "can't find pane". Mirrors sshExec's prefix + runCapture in relay_agent.
 		remote := fmt.Sprintf(
-			`while :; do tmux capture-pane -p -e -t %s 2>&1; printf '\x1e'; sleep 0.2; done`,
+			`export PATH="$HOME/.local/bin:$PATH"; while :; do tmux capture-pane -p -e -t %s 2>&1; printf '\x1e'; sleep 0.2; done`,
 			session,
 		)
 		var cmd *exec.Cmd

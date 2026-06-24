@@ -394,7 +394,12 @@ func (p *paneMux) runCapture(ctx context.Context, c *cfrelaytun.Client, id strin
 	// every 200ms. Replaces the tmux pipe-pane + FIFO approach (herdr has
 	// no pipe-pane equivalent). Same full-frame format as the SSE fallback
 	// in http_api.go:722; the frontend handles mode 'F' (full repaint).
-	script := fmt.Sprintf(`S=%s
+	// PATH must include ~/.local/bin so `tmux` hits the herdr shim, not the real
+	// /usr/bin/tmux — on herdr hosts whose shim lives there (e.g. gcp), a bare
+	// tmux finds no herdr workspace and prints "can't find pane". sshExec adds
+	// this prefix; this manual ssh command must too.
+	script := fmt.Sprintf(`export PATH="$HOME/.local/bin:$PATH"
+S=%s
 while :; do
   tmux capture-pane -p -e -t "$S" 2>&1
   printf '\000FULLEND\000'
