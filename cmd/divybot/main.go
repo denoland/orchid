@@ -349,53 +349,53 @@ func (h Host) agentList(ctx context.Context) ([]AgentInfo, error) {
 	return r.Agents, nil
 }
 
-// spawnAgent creates a DEDICATED workspace and starts a BARE agent in it (no
-// clawpatrol). The workspace is created first and passed via --workspace so each
-// agent is isolated — otherwise `agent start` piles every agent into the current
-// workspace (which crammed 6 unrelated sessions into one earlier).
-func (h Host) spawnAgent(ctx context.Context, label, cwd string, env map[string]string, argv ...string) (pane, ws string, err error) {
+// spawnAgent creates a DEDICATED single-pane workspace and launches a BARE agent
+// in its root pane (no clawpatrol). Each agent gets its own workspace — earlier,
+// `agent start` without an isolated workspace piled every agent into one (10+
+// unrelated sessions crammed together). We run the agent IN the root pane via
+// `pane run` (env exported inline + exec) so the workspace stays exactly 1 pane,
+// rather than `agent start` adding a second pane beside an idle shell.
+func (h Host) spawnAgent(ctx context.Context, label, cwd string, env map[string]string, agentCmd string) (pane, ws string, err error) {
 	wout, werr := h.herdr(ctx, "workspace", "create", "--label", label, "--cwd", cwd, "--no-focus")
 	if werr != nil {
 		return "", "", fmt.Errorf("workspace create: %v: %.120q", werr, wout)
 	}
-	if wraw, e := herdrUnwrap(wout); e == nil {
-		var wr struct {
+	wraw, e := herdrUnwrap(wout)
+	if e != nil {
+		return "", "", e
+	}
+	// workspace_id/root pane are NOT at result top-level — they're under
+	// .workspace / .root_pane.
+	var wr struct {
+		Workspace struct {
 			WorkspaceID string `json:"workspace_id"`
-		}
-		_ = json.Unmarshal(wraw, &wr)
-		ws = wr.WorkspaceID
+		} `json:"workspace"`
+		RootPane struct {
+			PaneID      string `json:"pane_id"`
+			WorkspaceID string `json:"workspace_id"`
+		} `json:"root_pane"`
 	}
-	args := []string{"agent", "start", label, "--cwd", cwd, "--no-focus"}
-	if ws != "" {
-		args = append(args, "--workspace", ws)
+	_ = json.Unmarshal(wraw, &wr)
+	ws = wr.Workspace.WorkspaceID
+	if ws == "" {
+		ws = wr.RootPane.WorkspaceID
 	}
+	pane = wr.RootPane.PaneID
+	if ws == "" || pane == "" {
+		return "", "", fmt.Errorf("workspace create returned no id/pane: %.160q", wout)
+	}
+	// Build the launch command: PATH guard, export env, then exec the agent.
+	var b strings.Builder
+	b.WriteString(`export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"; `)
 	for k, v := range env {
 		if v != "" {
-			args = append(args, "--env", k+"="+v)
+			fmt.Fprintf(&b, "export %s=%s; ", k, shq(v))
 		}
 	}
-	args = append(args, "--")
-	args = append(args, argv...)
-	out, err := h.herdr(ctx, args...)
-	if err != nil {
-		return "", "", fmt.Errorf("%v: %.200q", err, out)
-	}
-	raw, err := herdrUnwrap(out)
-	if err != nil {
-		return "", "", err
-	}
-	var r struct {
-		PaneID      string `json:"pane_id"`
-		TerminalID  string `json:"terminal_id"`
-		WorkspaceID string `json:"workspace_id"`
-	}
-	_ = json.Unmarshal(raw, &r)
-	pane = r.PaneID
-	if pane == "" {
-		pane = r.TerminalID
-	}
-	if r.WorkspaceID != "" {
-		ws = r.WorkspaceID
+	b.WriteString("exec ")
+	b.WriteString(agentCmd)
+	if out, err := h.herdr(ctx, "pane", "run", pane, b.String()); err != nil {
+		return "", "", fmt.Errorf("pane run: %v: %.160q", err, out)
 	}
 	return pane, ws, nil
 }
@@ -1277,16 +1277,14 @@ git checkout -fB %s 2>/dev/null || { git reset --hard >/dev/null 2>&1 || true; g
 	// — herdr spawns argv with a bare system PATH. exec replaces the shell so the
 	// agent is the foreground process herdr's integration detects. The --env vars
 	// (creds/token/git identity/memory override) survive into the login shell.
-	var argv []string
+	agentCmd := "claude --dangerously-skip-permissions"
 	if agent == "codex" {
-		argv = []string{"bash", "-lc", "exec codex --dangerously-bypass-approvals-and-sandbox"}
-	} else {
-		argv = []string{"bash", "-lc", "exec claude --dangerously-skip-permissions"}
+		agentCmd = "codex --dangerously-bypass-approvals-and-sandbox"
 	}
 
-	// 3. Spawn BARE (no clawpatrol).
+	// 3. Spawn BARE (no clawpatrol), one agent per dedicated single-pane workspace.
 	sctx, scancel := context.WithTimeout(ctx, 40*time.Second)
-	pane, ws, err := host.spawnAgent(sctx, label, workdir, env, argv...)
+	pane, ws, err := host.spawnAgent(sctx, label, workdir, env, agentCmd)
 	if err != nil {
 		scancel()
 		log.Printf("issue #%d: spawn on %s failed: %v", n, host.Name, err)
