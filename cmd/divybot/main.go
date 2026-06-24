@@ -47,6 +47,22 @@ type Config struct {
 	Hosts        []Host   `json:"hosts"`
 	Targets      []Target `json:"targets"`
 	Governor     Gov      `json:"governor"`
+	Memory       Mem      `json:"memory"`
+}
+
+// Mem configures the git-backed shared memory. Reuses the inbox repo
+// (denoland/divybot) on main, subtree memory/. Each host keeps a clone; claude's
+// autoMemoryDirectory points at <clone>/memory so workers read the union and
+// write locally. Robustness: the coordinator syncs hosts SERIALLY (one committer
+// at a time → no push race), memory/.gitattributes sets `* merge=union` (concurrent
+// writes MERGE, never override), and the repo subtree is memory-only so auth is
+// never in the blast radius.
+type Mem struct {
+	Enabled  bool   `json:"enabled"`
+	Repo     string `json:"repo"`     // default: inbox
+	Branch   string `json:"branch"`   // default: main
+	Dir      string `json:"dir"`      // subtree, default: memory
+	Interval string `json:"interval"` // default: 5m
 }
 
 // Host is one reachable box on the tailnet running a herdr server. No "join": a
@@ -107,6 +123,18 @@ func (c *Config) withDefaults() {
 			c.Hosts[i].Capacity = 4
 		}
 	}
+	if c.Memory.Repo == "" {
+		c.Memory.Repo = c.Inbox
+	}
+	if c.Memory.Branch == "" {
+		c.Memory.Branch = "main"
+	}
+	if c.Memory.Dir == "" {
+		c.Memory.Dir = "memory"
+	}
+	if c.Memory.Interval == "" {
+		c.Memory.Interval = "5m"
+	}
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -137,7 +165,9 @@ type tracker struct {
 type Job struct {
 	Issue     int       `json:"issue"`
 	Host      string    `json:"host"`
-	Label     string    `json:"label"` // herdr agent label = the handle
+	Label     string    `json:"label"`     // display name (claude-<n>)
+	Pane      string    `json:"pane"`      // herdr send/read target (pane id)
+	Workspace string    `json:"workspace"` // herdr teardown handle
 	Target    string    `json:"target"`
 	Repo      string    `json:"repo"`
 	Branch    string    `json:"branch"`
@@ -146,6 +176,7 @@ type Job struct {
 	Goal      string    `json:"goal"`
 	PR        int       `json:"pr"`
 	SpawnedAt time.Time `json:"spawned_at"`
+	LastPoke  time.Time `json:"last_poke"`
 	Track     tracker   `json:"track"`
 }
 
@@ -313,7 +344,7 @@ func (h Host) agentList(ctx context.Context) ([]AgentInfo, error) {
 }
 
 // spawnAgent creates a workspace and starts a BARE agent (no clawpatrol).
-func (h Host) spawnAgent(ctx context.Context, label, cwd string, env map[string]string, argv ...string) error {
+func (h Host) spawnAgent(ctx context.Context, label, cwd string, env map[string]string, argv ...string) (pane, ws string, err error) {
 	args := []string{"agent", "start", label, "--cwd", cwd, "--no-focus"}
 	for k, v := range env {
 		if v != "" {
@@ -324,12 +355,23 @@ func (h Host) spawnAgent(ctx context.Context, label, cwd string, env map[string]
 	args = append(args, argv...)
 	out, err := h.herdr(ctx, args...)
 	if err != nil {
-		return fmt.Errorf("%v: %.200q", err, out)
+		return "", "", fmt.Errorf("%v: %.200q", err, out)
 	}
-	if _, err := herdrUnwrap(out); err != nil {
-		return err
+	raw, err := herdrUnwrap(out)
+	if err != nil {
+		return "", "", err
 	}
-	return nil
+	var r struct {
+		PaneID      string `json:"pane_id"`
+		TerminalID  string `json:"terminal_id"`
+		WorkspaceID string `json:"workspace_id"`
+	}
+	_ = json.Unmarshal(raw, &r)
+	pane = r.PaneID
+	if pane == "" {
+		pane = r.TerminalID
+	}
+	return pane, r.WorkspaceID, nil
 }
 
 // send injects literal text then submits with Enter.
@@ -466,6 +508,76 @@ func (a *AuthStore) refreshLocal(ctx context.Context) {
 		a.GHToken = t
 		a.mu.Unlock()
 	}
+}
+
+// ============================ shared memory ============================
+
+// memRepoDir is the persistent memory clone path on a host.
+func (h Host) memRepoDir() string {
+	return h.agentHome() + "/.orch/memory-repo"
+}
+
+// ensureMemory makes a host ready for shared memory (idempotent, run at spawn):
+// clone the memory repo if absent, install the union merge driver scoped to the
+// memory subtree, and point claude's autoMemoryDirectory at <clone>/<dir>. Auth
+// for the clone/push uses the gh credential helper (hosts.yml the coordinator
+// already wrote), so no token ever lands on a command line.
+func (h Host) ensureMemory(ctx context.Context, m Mem, bot, email string) error {
+	home := h.agentHome()
+	repoURL := "https://github.com/" + m.Repo + ".git"
+	clone := h.memRepoDir()
+	memdir := clone + "/" + m.Dir
+	script := fmt.Sprintf(`set -e
+export HOME=%s
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+command -v gh >/dev/null 2>&1 && gh auth setup-git >/dev/null 2>&1 || true
+R=%s
+if [ ! -d "$R/.git" ]; then rm -rf "$R"; mkdir -p "$(dirname "$R")"; git clone --depth=1 -b %s %s "$R" >/dev/null 2>&1 || git clone --depth=1 %s "$R" >/dev/null 2>&1 || true; fi
+[ -d "$R/.git" ] || exit 0
+git -C "$R" config user.name %s >/dev/null 2>&1 || true
+git -C "$R" config user.email %s >/dev/null 2>&1 || true
+mkdir -p %s
+# union merge ONLY within the memory subtree → concurrent writes merge, never override
+printf '%%s\n' '* merge=union' > %s/.gitattributes
+# point claude auto-memory at the shared clone (settings.json, separate from creds)
+SJ="$HOME/.claude/settings.json"; mkdir -p "$HOME/.claude"; [ -f "$SJ" ] || echo '{}' > "$SJ"
+if command -v jq >/dev/null 2>&1; then t=$(mktemp); jq --arg d %s '.autoMemoryEnabled=true | .autoMemoryDirectory=$d' "$SJ" > "$t" 2>/dev/null && mv "$t" "$SJ" || rm -f "$t"; fi
+`,
+		shq(home), shq(clone), shq(m.Branch), shq(repoURL), shq(repoURL),
+		shq(bot), shq(email), shq(memdir), shq(memdir), shq(memdir))
+	out, err := h.runRemote(ctx, script)
+	if err != nil {
+		return fmt.Errorf("ensureMemory %s: %v: %.120q", h.Name, err, out)
+	}
+	return nil
+}
+
+// syncMemory commits the host's local memory writes and integrates the remote.
+// The coordinator calls this SERIALLY across hosts (one committer at a time), so
+// pushes never race; the union merge driver makes any same-file overlap merge
+// rather than clobber. Scoped to the memory subtree — code and auth untouched.
+func (h Host) syncMemory(ctx context.Context, m Mem, bot, email string) error {
+	home := h.agentHome()
+	clone := h.memRepoDir()
+	script := fmt.Sprintf(`set -e
+export HOME=%s
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+R=%s; DIR=%s
+[ -d "$R/.git" ] || exit 0
+cd "$R"
+git config user.name %s >/dev/null 2>&1 || true
+git config user.email %s >/dev/null 2>&1 || true
+git add "$DIR" >/dev/null 2>&1 || true
+if ! git diff --cached --quiet 2>/dev/null; then git commit -q -m "memory sync $(hostname) $(date -u +%%FT%%TZ)" >/dev/null 2>&1 || true; fi
+git pull --rebase --autostash origin %s >/dev/null 2>&1 || { git rebase --abort >/dev/null 2>&1 || true; }
+git push origin HEAD:%s >/dev/null 2>&1 || true
+`,
+		shq(home), shq(clone), shq(m.Dir), shq(bot), shq(email), shq(m.Branch), shq(m.Branch))
+	out, err := h.runRemote(ctx, script)
+	if err != nil {
+		return fmt.Errorf("syncMemory %s: %v: %.120q", h.Name, err, out)
+	}
+	return nil
 }
 
 // ============================ gh helpers ============================
@@ -756,10 +868,40 @@ type Coord struct {
 	st    *State
 	auth  *AuthStore
 	hosts map[string]Host
+	dry   bool // dry-run: log spawn/adopt decisions, take no spawning action
 	gov   struct {
 		mu sync.Mutex
 		q  quota
 	}
+}
+
+// adopt recognizes a live herdr agent for issue n (migration / restart safety)
+// and records it WITHOUT spawning — so a cutover or restart supervises existing
+// sessions instead of duplicating them.
+func (c *Coord) adopt(n int, is Issue, status map[int]agentRef) (*Job, bool) {
+	tgt, ok := c.targetFor(is)
+	if !ok {
+		return nil, false
+	}
+	ref, found := status[n]
+	if !found {
+		return nil, false
+	}
+	agent := ref.Agent
+	if agent == "" {
+		agent = "claude"
+	}
+	j := &Job{
+		Issue: n, Host: ref.Host, Label: agent + "-" + strconv.Itoa(n),
+		Pane: ref.Pane, Workspace: ref.Workspace,
+		Target: tgt.Label, Repo: tgt.Repo, Branch: fmt.Sprintf("%s%d", c.cfg.BranchPrefix, n),
+		Agent: agent, Title: is.Title, Goal: truncate(is.Body, 1500), SpawnedAt: time.Now(),
+	}
+	c.st.mu.Lock()
+	c.st.Jobs[n] = j
+	c.st.mu.Unlock()
+	log.Printf("issue #%d: ADOPTED live %s on %s (pane %s)", n, j.Label, ref.Host, ref.Pane)
+	return j, true
 }
 
 func newCoord(cfg *Config) *Coord {
@@ -773,6 +915,7 @@ func newCoord(cfg *Config) *Coord {
 func (c *Coord) run(ctx context.Context) {
 	go c.authSyncLoop(ctx)
 	go c.governorLoop(ctx)
+	go c.memoryLoop(ctx)
 	iv := durOr(c.cfg.PollInterval, 30*time.Second)
 	t := time.NewTicker(iv)
 	defer t.Stop()
@@ -803,6 +946,31 @@ func (c *Coord) authSyncLoop(ctx context.Context) {
 				if err := c.auth.syncToHost(ctx, h); err != nil {
 					log.Printf("authsync: %v", err)
 				}
+			}
+		}
+	}
+}
+
+// memoryLoop syncs shared memory SERIALLY across hosts (one committer at a time
+// → no push race; union merge → no override). Scoped to the memory subtree.
+func (c *Coord) memoryLoop(ctx context.Context) {
+	if !c.cfg.Memory.Enabled {
+		return
+	}
+	iv := durOr(c.cfg.Memory.Interval, 5*time.Minute)
+	t := time.NewTicker(iv)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			for _, h := range c.cfg.Hosts {
+				cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				if err := h.syncMemory(cctx, c.cfg.Memory, c.cfg.BotLogin, c.cfg.BotEmail); err != nil {
+					log.Printf("memory: %v", err)
+				}
+				cancel()
 			}
 		}
 	}
@@ -884,7 +1052,17 @@ func (c *Coord) tick(ctx context.Context) {
 			c.supervise(ctx, n, j, status)
 			continue
 		}
+		// Adopt a live session before spawning (cutover / restart migration).
+		if j2, ok := c.adopt(n, is, status); ok {
+			c.supervise(ctx, n, j2, status)
+			continue
+		}
 		if budget <= 0 {
+			continue
+		}
+		if c.dry {
+			log.Printf("issue #%d: would spawn (dry-run)", n)
+			budget--
 			continue
 		}
 		if c.spawn(ctx, n, is) {
@@ -911,23 +1089,48 @@ func (c *Coord) pollIssues(ctx context.Context) (map[int]Issue, map[int]bool) {
 	return open, all
 }
 
-func (c *Coord) fleetStatus(ctx context.Context) map[string]AgentInfo {
-	out := map[string]AgentInfo{}
-	for _, h := range c.hosts {
+// agentRef is a live herdr agent resolved to an issue number, with the handles
+// needed to drive it (pane for send/read, workspace for close).
+type agentRef struct {
+	Host      string
+	Agent     string // claude | codex
+	Status    string // idle|working|blocked|done|unknown
+	Pane      string // send/read target
+	Workspace string // teardown handle
+}
+
+var issueCwdRe = regexp.MustCompile(`issue-(\d+)`)
+
+// issueFromCwd extracts the issue number from a worktree cwd like
+// ".../orch-work/issue-590" (or a memory path). 0 if none.
+func issueFromCwd(cwd string) int {
+	m := issueCwdRe.FindStringSubmatch(cwd)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+// fleetStatus reads agent_status from every host once and keys by ISSUE number
+// (from the agent's cwd) — the reliable adoption key, since agent objects don't
+// carry the workspace label.
+func (c *Coord) fleetStatus(ctx context.Context) map[int]agentRef {
+	out := map[int]agentRef{}
+	for name, h := range c.hosts {
 		cctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 		agents, err := h.agentList(cctx)
 		cancel()
 		if err != nil {
+			log.Printf("fleetStatus %s: %v", name, err)
 			continue
 		}
 		for _, a := range agents {
-			key := a.Label
-			if key == "" {
-				key = a.Name
+			n := issueFromCwd(a.Cwd)
+			if n == 0 {
+				continue
 			}
-			if key != "" {
-				out[key] = a
-			}
+			out[n] = agentRef{Host: name, Agent: a.Agent, Status: a.AgentStatus, Pane: a.PaneID, Workspace: a.WorkspaceID}
 		}
 	}
 	return out
@@ -998,14 +1201,28 @@ func (c *Coord) spawn(ctx context.Context, n int, is Issue) bool {
 
 	// 2. Worktree (clone + branch) before the agent runs.
 	pctx, pcancel := context.WithTimeout(ctx, 120*time.Second)
-	prep := fmt.Sprintf(`set -e; mkdir -p %s; cd %s; if [ ! -d .git ]; then git clone --depth=1 https://github.com/%s . ; fi; git checkout -B %s`,
-		shq(workdir), shq(workdir), tgt.Repo, shq(branch))
+	prep := fmt.Sprintf(`set -e
+mkdir -p %s; cd %s
+if [ ! -d .git ]; then find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true; git clone --depth=1 https://github.com/%s . ; fi
+git fetch --depth=1 origin %s >/dev/null 2>&1 || true
+git checkout -fB %s 2>/dev/null || { git reset --hard >/dev/null 2>&1 || true; git clean -fdx >/dev/null 2>&1 || true; git checkout -B %s; }`,
+		shq(workdir), shq(workdir), tgt.Repo, shq(branch), shq(branch), shq(branch))
 	if out, err := host.runRemote(pctx, prep); err != nil {
 		pcancel()
 		log.Printf("issue #%d: worktree prep on %s failed: %v: %.120q", n, host.Name, err, out)
 		return false
 	}
 	pcancel()
+
+	// Shared memory: ensure the clone + union driver + autoMemoryDirectory are in
+	// place BEFORE claude starts, so it reads the union and writes to the clone.
+	if c.cfg.Memory.Enabled {
+		mctx, mcancel := context.WithTimeout(ctx, 60*time.Second)
+		if err := host.ensureMemory(mctx, c.cfg.Memory, c.cfg.BotLogin, c.cfg.BotEmail); err != nil {
+			log.Printf("issue #%d: memory setup on %s: %v", n, host.Name, err)
+		}
+		mcancel()
+	}
 
 	env := map[string]string{
 		"GH_TOKEN":            c.auth.token(),
@@ -1015,24 +1232,59 @@ func (c *Coord) spawn(ctx context.Context, n int, is Issue) bool {
 		"GIT_COMMITTER_NAME":  c.cfg.BotLogin,
 		"GIT_COMMITTER_EMAIL": c.cfg.BotEmail,
 	}
+	// Per-target shared memory: claude-native per-process override (no settings
+	// race between concurrent sessions). Points at the EXISTING per-target notes
+	// in the synced clone — memory/<owner>/<repo>/ — so prior knowledge is reused.
+	if c.cfg.Memory.Enabled && agent == "claude" {
+		memOverride := host.memRepoDir() + "/" + c.cfg.Memory.Dir + "/" + tgt.Repo
+		octx, ocancel := context.WithTimeout(ctx, 15*time.Second)
+		_, _ = host.runRemote(octx, "mkdir -p "+shq(memOverride))
+		ocancel()
+		env["CLAUDE_COWORK_MEMORY_PATH_OVERRIDE"] = memOverride
+	}
+	// Launch via a login shell so PATH resolves claude/codex (~/.local/bin etc.)
+	// — herdr spawns argv with a bare system PATH. exec replaces the shell so the
+	// agent is the foreground process herdr's integration detects. The --env vars
+	// (creds/token/git identity/memory override) survive into the login shell.
 	var argv []string
 	if agent == "codex" {
-		argv = []string{"codex", "--dangerously-bypass-approvals-and-sandbox"}
+		argv = []string{"bash", "-lc", "exec codex --dangerously-bypass-approvals-and-sandbox"}
 	} else {
-		argv = []string{"claude", "--dangerously-skip-permissions"}
+		argv = []string{"bash", "-lc", "exec claude --dangerously-skip-permissions"}
 	}
 
 	// 3. Spawn BARE (no clawpatrol).
 	sctx, scancel := context.WithTimeout(ctx, 40*time.Second)
-	if err := host.spawnAgent(sctx, label, workdir, env, argv...); err != nil {
+	pane, ws, err := host.spawnAgent(sctx, label, workdir, env, argv...)
+	if err != nil {
 		scancel()
 		log.Printf("issue #%d: spawn on %s failed: %v", n, host.Name, err)
 		return false
 	}
 	scancel()
 
+	// herdr's agent-start result doesn't always carry the pane id; resolve it from
+	// the live fleet by cwd so the goal Enter lands on a real pane (send-keys needs
+	// a pane id, not a label).
+	if pane == "" {
+		rc, rcancel := context.WithTimeout(ctx, 12*time.Second)
+		if agents, e := host.agentList(rc); e == nil {
+			for _, a := range agents {
+				if issueFromCwd(a.Cwd) == n {
+					pane = a.PaneID
+					if ws == "" {
+						ws = a.WorkspaceID
+					}
+					break
+				}
+			}
+		}
+		rcancel()
+	}
+
 	j := &Job{
-		Issue: n, Host: host.Name, Label: label, Target: tgt.Label, Repo: tgt.Repo,
+		Issue: n, Host: host.Name, Label: label, Pane: pane, Workspace: ws,
+		Target: tgt.Label, Repo: tgt.Repo,
 		Branch: branch, Agent: agent, Title: is.Title, Goal: truncate(is.Body, 1500), SpawnedAt: time.Now(),
 	}
 	c.st.mu.Lock()
@@ -1044,8 +1296,12 @@ func (c *Coord) spawn(ctx context.Context, n int, is Issue) bool {
 		"You are implementing %s issue #%d in this repo (branch %s, this is the worktree). Title: %s\n\n%s\n\n"+
 			"Read the issue, implement the COMPLETE fix, add tests, build and run the relevant tests, then commit and open a PR to %s referencing the issue. Do not stop until the full goal is done.",
 		tgt.Repo, n, branch, is.Title, truncate(is.Body, 1500), tgt.Repo)
+	target := pane
+	if target == "" {
+		target = label
+	}
 	gctx, gcancel := context.WithTimeout(ctx, 20*time.Second)
-	if err := host.send(gctx, label, goal); err != nil {
+	if err := host.send(gctx, target, goal); err != nil {
 		log.Printf("issue #%d: goal inject failed: %v", n, err)
 	}
 	gcancel()
@@ -1053,44 +1309,56 @@ func (c *Coord) spawn(ctx context.Context, n int, is Issue) bool {
 	return true
 }
 
-func (c *Coord) supervise(ctx context.Context, n int, j *Job, status map[string]AgentInfo) {
+func (c *Coord) supervise(ctx context.Context, n int, j *Job, status map[int]agentRef) {
 	host, ok := c.hosts[j.Host]
 	if !ok {
 		return
 	}
-	info, known := status[j.Label]
+	ref, known := status[n]
+	if known {
+		// Refresh the live handles each tick (pane/workspace survive across a
+		// herdr restart by re-resolving from the agent's cwd).
+		j.Pane, j.Workspace = ref.Pane, ref.Workspace
+	}
+	if c.dry {
+		log.Printf("issue #%d: supervise %s/%s status=%s pr=%d (dry-run, no action)", n, j.Host, j.Label, ref.Status, j.PR)
+		return
+	}
 
-	// Auth-dead detection → resync creds + respawn.
-	if known && info.AgentStatus != "working" {
+	// Auth-dead detection: resync creds + escalate, but NEVER auto-teardown — a
+	// string match on pane scrollback is far too fragile to kill a live session
+	// over (stale 401s sit deep in scrollback; central auth-sync prevents real
+	// auth-death anyway). Read only the last few lines, and only when idle/blocked.
+	if known && (ref.Status == "idle" || ref.Status == "blocked") && j.Pane != "" {
 		rctx, rcancel := context.WithTimeout(ctx, 8*time.Second)
-		txt := host.read(rctx, j.Label, 12)
+		txt := host.read(rctx, j.Pane, 4)
 		rcancel()
-		if strings.Contains(txt, "Invalid bearer") || strings.Contains(txt, "run /login") || strings.Contains(txt, "not trusted") {
-			log.Printf("issue #%d: auth-dead on %s — resync + respawn", n, host.Name)
+		if strings.Contains(txt, "Invalid bearer") || strings.Contains(txt, "Please run /login") {
+			log.Printf("issue #%d: possible auth-dead on %s — resyncing creds (no teardown)", n, host.Name)
 			sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
 			_ = c.auth.syncToHost(sctx, host)
 			scancel()
-			c.teardown(ctx, n, j)
-			c.st.mu.Lock()
-			delete(c.st.Jobs, n)
-			c.st.mu.Unlock()
-			return
+			c.notify(fmt.Sprintf("issue #%d possible auth-dead on %s", n, host.Name))
 		}
 	}
 
 	// PR poll + relay (orchid's existing polling, delivered via herdr send).
 	c.pollPR(ctx, n, j, host)
 
-	// Stranded: idle/done but no PR → re-inject the goal (a poke that actually
-	// re-delivers the task, not a bare Enter — fixes today's gcp strandings).
-	if known && (info.AgentStatus == "idle" || info.AgentStatus == "done") && j.PR == 0 {
+	// Stranded: persistently idle with no PR → re-inject the goal (a poke that
+	// re-delivers the task, not a bare Enter — fixes the gcp strandings). Debounced
+	// to once per 10m and gated to idle only (not "done", which is often just
+	// between-turns) so we never poke-storm healthy sessions.
+	if known && ref.Status == "idle" && j.PR == 0 && j.Pane != "" && time.Since(j.LastPoke) > 10*time.Minute {
 		gctx, gcancel := context.WithTimeout(ctx, 15*time.Second)
-		_ = host.send(gctx, j.Label, "continue — implement the assigned issue fully, then open a PR. "+j.Goal)
+		if host.send(gctx, j.Pane, "continue — implement the assigned issue fully, then open a PR. "+j.Goal) == nil {
+			j.LastPoke = time.Now()
+		}
 		gcancel()
 	}
 
 	// Blocked: agent waiting for input it can't get in the swarm → escalate.
-	if known && info.AgentStatus == "blocked" {
+	if known && ref.Status == "blocked" {
 		log.Printf("issue #%d: BLOCKED (needs input) on %s", n, host.Name)
 		c.notify(fmt.Sprintf("issue #%d blocked — needs input", n))
 	}
@@ -1113,9 +1381,12 @@ func (c *Coord) pollPR(ctx context.Context, n int, j *Job, host Host) {
 	if !changed {
 		return
 	}
+	if j.Pane == "" {
+		return
+	}
 	msg := "New activity on your PR — address each item, push fixes, keep the PR green:\n" + strings.Join(lines, "\n")
 	rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
-	if err := host.send(rctx, j.Label, msg); err != nil {
+	if err := host.send(rctx, j.Pane, msg); err != nil {
 		log.Printf("issue #%d: relay failed: %v", n, err)
 	}
 	rcancel()
@@ -1126,17 +1397,22 @@ func (c *Coord) teardown(ctx context.Context, n int, j *Job) {
 	if !ok {
 		return
 	}
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
-	agents, err := host.agentList(cctx)
-	if err != nil {
-		return
-	}
-	for _, a := range agents {
-		if a.Label == j.Label || a.Name == j.Label {
-			_ = host.closeWorkspace(cctx, a.WorkspaceID)
-			break
+	ws := j.Workspace
+	if ws == "" {
+		// Resolve from the live fleet by issue cwd if we never recorded it.
+		if agents, err := host.agentList(cctx); err == nil {
+			for _, a := range agents {
+				if issueFromCwd(a.Cwd) == n {
+					ws = a.WorkspaceID
+					break
+				}
+			}
 		}
+	}
+	if ws != "" {
+		_ = host.closeWorkspace(cctx, ws)
 	}
 	log.Printf("issue #%d: torn down (was on %s/%s)", n, j.Host, j.Label)
 }
@@ -1179,6 +1455,7 @@ func truncate(s string, max int) string {
 func main() {
 	cfgPath := flag.String("config", "divybot.json", "path to config json")
 	once := flag.Bool("once", false, "run a single tick and exit (for testing)")
+	dry := flag.Bool("dryrun", false, "log spawn/adopt decisions, take no spawning/poking action")
 	flag.Parse()
 
 	cfg, err := loadConfig(*cfgPath)
@@ -1191,6 +1468,7 @@ func main() {
 	log.Printf("divybot: inbox=%s hosts=%d targets=%d governor=%v", cfg.Inbox, len(cfg.Hosts), len(cfg.Targets), cfg.Governor.Enabled)
 
 	c := newCoord(cfg)
+	c.dry = *dry
 	if c.auth.token() == "" {
 		log.Printf("WARNING: no gh token resolved (GH_TOKEN / gh auth token) — agents won't be able to push")
 	}
