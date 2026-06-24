@@ -349,9 +349,26 @@ func (h Host) agentList(ctx context.Context) ([]AgentInfo, error) {
 	return r.Agents, nil
 }
 
-// spawnAgent creates a workspace and starts a BARE agent (no clawpatrol).
+// spawnAgent creates a DEDICATED workspace and starts a BARE agent in it (no
+// clawpatrol). The workspace is created first and passed via --workspace so each
+// agent is isolated — otherwise `agent start` piles every agent into the current
+// workspace (which crammed 6 unrelated sessions into one earlier).
 func (h Host) spawnAgent(ctx context.Context, label, cwd string, env map[string]string, argv ...string) (pane, ws string, err error) {
+	wout, werr := h.herdr(ctx, "workspace", "create", "--label", label, "--cwd", cwd, "--no-focus")
+	if werr != nil {
+		return "", "", fmt.Errorf("workspace create: %v: %.120q", werr, wout)
+	}
+	if wraw, e := herdrUnwrap(wout); e == nil {
+		var wr struct {
+			WorkspaceID string `json:"workspace_id"`
+		}
+		_ = json.Unmarshal(wraw, &wr)
+		ws = wr.WorkspaceID
+	}
 	args := []string{"agent", "start", label, "--cwd", cwd, "--no-focus"}
+	if ws != "" {
+		args = append(args, "--workspace", ws)
+	}
 	for k, v := range env {
 		if v != "" {
 			args = append(args, "--env", k+"="+v)
@@ -377,7 +394,10 @@ func (h Host) spawnAgent(ctx context.Context, label, cwd string, env map[string]
 	if pane == "" {
 		pane = r.TerminalID
 	}
-	return pane, r.WorkspaceID, nil
+	if r.WorkspaceID != "" {
+		ws = r.WorkspaceID
+	}
+	return pane, ws, nil
 }
 
 // send injects literal text then submits with Enter.
@@ -1015,7 +1035,28 @@ func (c *Coord) tick(ctx context.Context) {
 		log.Printf("poll incomplete — skipping teardown pass (never-strand guard)")
 	}
 
-	status := c.fleetStatus(ctx)
+	status, up := c.fleetStatus(ctx)
+
+	// Respawn dead sessions: a tracked job whose host responded but whose agent
+	// is gone (issue still open) is stalled — drop it so it re-spawns fresh.
+	c.st.mu.Lock()
+	for n, j := range c.st.Jobs {
+		if _, alive := status[n]; alive {
+			continue
+		}
+		if !up[j.Host] {
+			continue // host unreachable — transient, don't respawn
+		}
+		if _, stillOpen := allOpen[n]; !stillOpen {
+			continue // handled by the teardown pass
+		}
+		if time.Since(j.SpawnedAt) < 3*time.Minute {
+			continue // freshly spawned/adopted — give herdr time to register the agent
+		}
+		log.Printf("issue #%d: agent gone on %s (host up) — dropping for respawn", n, j.Host)
+		delete(c.st.Jobs, n)
+	}
+	c.st.mu.Unlock()
 
 	// Admission budget = governor cap − currently running.
 	cap := c.curCap()
@@ -1100,8 +1141,12 @@ func issueFromCwd(cwd string) int {
 // fleetStatus reads agent_status from every host once and keys by ISSUE number
 // (from the agent's cwd) — the reliable adoption key, since agent objects don't
 // carry the workspace label.
-func (c *Coord) fleetStatus(ctx context.Context) map[int]agentRef {
+// fleetStatus returns the live agents keyed by issue, plus the set of hosts that
+// responded (so the caller can tell "agent died" from "host unreachable" and
+// only respawn in the former case).
+func (c *Coord) fleetStatus(ctx context.Context) (map[int]agentRef, map[string]bool) {
 	out := map[int]agentRef{}
+	up := map[string]bool{}
 	for name, h := range c.hosts {
 		cctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 		agents, err := h.agentList(cctx)
@@ -1110,6 +1155,7 @@ func (c *Coord) fleetStatus(ctx context.Context) map[int]agentRef {
 			log.Printf("fleetStatus %s: %v", name, err)
 			continue
 		}
+		up[name] = true
 		for _, a := range agents {
 			n := issueFromCwd(a.Cwd)
 			if n == 0 {
@@ -1118,7 +1164,7 @@ func (c *Coord) fleetStatus(ctx context.Context) map[int]agentRef {
 			out[n] = agentRef{Host: name, Agent: a.Agent, Status: a.AgentStatus, Pane: a.PaneID, Workspace: a.WorkspaceID}
 		}
 	}
-	return out
+	return out, up
 }
 
 func (c *Coord) targetFor(is Issue) (Target, bool) {
