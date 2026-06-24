@@ -1,0 +1,53 @@
+{
+  "inbox": "denoland/divybot",
+  "bot_login": "divybot",
+  "bot_email": "divybot@users.noreply.github.com",
+  "poll_interval": "30s",
+  "branch_prefix": "orch/divybot-",
+  "state_file": "/root/divybot/state.json",
+  "ntfy_topic": "orchid-divy-7f3k9",
+
+  "hosts": [
+    {
+      "name": "vultr-mumbai",
+      "ssh": "orchid@localhost",
+      "home": "/home/orchid",
+      "workdir_root": "/home/orchid/orch-work",
+      "capabilities": ["build-deno", "x86"],
+      "capacity": 6
+    },
+    {
+      "name": "gcp-mumbai",
+      "ssh": "orchid@100.112.121.20",
+      "key": "/root/orch/vm-keys/gcp-mumbai",
+      "home": "/var/lib/orchid",
+      "workdir_root": "/var/lib/orchid/orch-work",
+      "capabilities": ["build-deno", "x86"],
+      "capacity": 10
+    },
+    {
+      "name": "mac-mini",
+      "ssh": "divy@100.110.70.11",
+      "key": "/root/orch/vm-keys/mac-mini",
+      "home": "/Users/divy",
+      "workdir_root": "/Users/divy/orch-work",
+      "capabilities": ["build-deno", "arm64", "macos"],
+      "capacity": 7
+    }
+  ],
+
+  "targets": [
+    { "label": "deno", "repo": "denoland/deno", "agent": "claude", "need_cap": "build-deno" },
+    { "label": "dactyl", "repo": "denoland/dactyl", "agent": "claude" },
+    { "label": "fastwebsockets", "repo": "denoland/fastwebsockets", "agent": "claude" },
+    { "label": "clawpatrol", "repo": "denoland/clawpatrol", "agent": "claude" }
+  ],
+
+  "governor": {
+    "enabled": true,
+    "weekly_ceiling_pct": 92,
+    "slack_pct": 8,
+    "max_active": 16,
+    "min_active": 1
+  }
+}
