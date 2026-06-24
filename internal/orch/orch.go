@@ -536,6 +536,22 @@ func atoiClamp(s string, def, lo, hi int) int {
 	return n
 }
 
+// sanitizeSockName makes an agent Name safe for a ControlPath socket filename:
+// only [A-Za-z0-9._-], everything else → '_'. Keeps the path short and avoids
+// odd chars in the per-agent master socket.
+func sanitizeSockName(s string) string {
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' {
+			b = append(b, c)
+		} else {
+			b = append(b, '_')
+		}
+	}
+	return string(b)
+}
+
 func sshArgs(vm VMBlock) []string {
 	return []string{
 		"-o", "BatchMode=yes",
@@ -548,8 +564,14 @@ func sshArgs(vm VMBlock) []string {
 		// identification: Connection reset") and the worker goes unreachable while
 		// its already-open connections keep showing live. ControlPersist keeps the
 		// master warm between calls; %C hashes user/host/port into the socket name.
+		// vm.Name is prefixed so two agents on the SAME host+user (e.g. gcp-mumbai
+		// claude + gcp-mumbai-codex, both orchid@host) get SEPARATE master
+		// connections. sshd MaxSessions caps channels PER connection; sharing one
+		// master means both agents' idle-checks + 5Hz capture-pane polls + tailers
+		// compete for a single ~10-channel budget and spawn storms hit "Session
+		// open refused by peer". Per-agent masters give each its own budget.
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=/tmp/orch-ssh-%C",
+		"-o", "ControlPath=/tmp/orch-ssh-" + sanitizeSockName(vm.Name) + "-%C",
 		"-o", "ControlPersist=120s",
 		"-o", "ServerAliveInterval=30",
 		"-o", "ServerAliveCountMax=3",
