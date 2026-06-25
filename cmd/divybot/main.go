@@ -494,6 +494,55 @@ func (h Host) scpTo(ctx context.Context, local, dest string) error {
 	return nil
 }
 
+// scpFrom copies a file FROM a host to a local path (used to adopt the freshest
+// self-refreshed creds back as canonical).
+func (h Host) scpFrom(ctx context.Context, remote, local string) error {
+	_ = os.MkdirAll(filepath.Dir(local), 0o700)
+	if h.isLocal() {
+		_, err := run(ctx, "cp", remote, local)
+		return err
+	}
+	scp := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"}
+	if h.Key != "" {
+		scp = append(scp, "-i", expandHome(h.Key))
+	}
+	scp = append(scp, h.SSH+":"+remote, local)
+	if out, err := run(ctx, "scp", scp...); err != nil {
+		return fmt.Errorf("scp: %v: %.80q", err, out)
+	}
+	return nil
+}
+
+// credExpiry parses the oauth access-token expiry (ms epoch) from a claude
+// .credentials.json blob; 0 if absent/unparseable.
+func credExpiry(b []byte) int64 {
+	var d struct {
+		ClaudeAiOauth struct {
+			ExpiresAt int64 `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	if json.Unmarshal(b, &d) == nil {
+		return d.ClaudeAiOauth.ExpiresAt
+	}
+	return 0
+}
+
+func credExpiryFile(path string) int64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	return credExpiry(b)
+}
+
+func (h Host) credExpiryRemote(ctx context.Context) int64 {
+	out, err := h.runRemote(ctx, "cat "+shq(h.agentHome()+"/.claude/.credentials.json")+" 2>/dev/null")
+	if err != nil {
+		return 0
+	}
+	return credExpiry([]byte(out))
+}
+
 // syncToHost pushes all canonical creds to one host's agent home.
 func (a *AuthStore) syncToHost(ctx context.Context, h Host) error {
 	a.mu.Lock()
@@ -501,8 +550,17 @@ func (a *AuthStore) syncToHost(ctx context.Context, h Host) error {
 	a.mu.Unlock()
 	home := h.agentHome()
 	var errs []string
-	if err := h.scpTo(ctx, creds, filepath.Join(home, ".claude", ".credentials.json")); err != nil {
-		errs = append(errs, "claude:"+err.Error())
+	// Refresh-safe: push the canonical claude creds ONLY if the host has none or
+	// the host's are OLDER. claude rotates the oauth refresh token on every refresh;
+	// blindly overwriting a host's self-refreshed creds with a staler canonical
+	// reverts the rotation and eventually kills the whole refresh chain (the bug
+	// that 401'd the swarm). Codex/gh have no rotation, so push them unconditionally.
+	canonExp := credExpiryFile(creds)
+	hostExp := h.credExpiryRemote(ctx)
+	if hostExp == 0 || canonExp > hostExp {
+		if err := h.scpTo(ctx, creds, filepath.Join(home, ".claude", ".credentials.json")); err != nil {
+			errs = append(errs, "claude:"+err.Error())
+		}
 	}
 	_ = h.scpTo(ctx, cfg, filepath.Join(home, ".claude.json"))
 	_ = h.scpTo(ctx, codex, filepath.Join(home, ".codex", "auth.json"))
@@ -515,6 +573,13 @@ func (a *AuthStore) syncToHost(ctx context.Context, h Host) error {
 			errs = append(errs, fmt.Sprintf("gh:%v:%.60q", err, out))
 		}
 	}
+	// Worker Claude Code settings: kill the "Co-Authored-By: Claude" trailer +
+	// "Generated with Claude Code" footer (includeCoAuthoredBy=false) and skip the
+	// dangerous-mode prompt. Bot is the sole author. Merge-preserve any existing keys
+	// (e.g. autoMemoryDirectory written by ensureMemory). Runs every authsync.
+	settings := `SJ="$HOME/.claude/settings.json"; mkdir -p "$HOME/.claude"; [ -f "$SJ" ] || echo '{}' > "$SJ"
+if command -v jq >/dev/null 2>&1; then t=$(mktemp); jq '.includeCoAuthoredBy=false | .skipDangerousModePermissionPrompt=true' "$SJ" > "$t" 2>/dev/null && mv "$t" "$SJ" || rm -f "$t"; fi`
+	_, _ = h.runRemote(ctx, settings)
 	if len(errs) > 0 {
 		return fmt.Errorf("authsync %s: %s", h.Name, strings.Join(errs, "; "))
 	}
@@ -935,6 +1000,7 @@ func (c *Coord) authSyncLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			c.auth.refreshLocal(ctx)
+			c.refreshCanonicalFromHosts(ctx)
 			for _, h := range c.activeHosts() {
 				if err := c.auth.syncToHost(ctx, h); err != nil {
 					log.Printf("authsync: %v", err)
@@ -942,6 +1008,40 @@ func (c *Coord) authSyncLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// refreshCanonicalFromHosts adopts the freshest self-refreshed claude creds
+// across the fleet as the new canonical, so the coordinator's copy tracks the
+// latest rotation (for seeding stale/new hosts). Combined with the refresh-safe
+// gate in syncToHost, this makes oauth refresh fully decentralized: each host
+// self-refreshes, the freshest becomes canonical, and stale hosts get bootstrapped
+// — no single point that can clobber the rotation chain.
+func (c *Coord) refreshCanonicalFromHosts(ctx context.Context) {
+	c.auth.mu.Lock()
+	canon := c.auth.ClaudeCreds
+	c.auth.mu.Unlock()
+	best := credExpiryFile(canon)
+	var bestHost *Host
+	for _, h := range c.activeHosts() {
+		hctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		e := h.credExpiryRemote(hctx)
+		cancel()
+		if e > best {
+			best = e
+			hh := h
+			bestHost = &hh
+		}
+	}
+	if bestHost == nil {
+		return
+	}
+	fctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := bestHost.scpFrom(fctx, bestHost.agentHome()+"/.claude/.credentials.json", canon); err != nil {
+		log.Printf("refreshCanonical from %s: %v", bestHost.Name, err)
+		return
+	}
+	log.Printf("refreshCanonical: adopted %s creds (expiry %s)", bestHost.Name, time.UnixMilli(best).UTC().Format("15:04"))
 }
 
 // memoryLoop syncs shared memory SERIALLY across hosts (one committer at a time
@@ -1199,6 +1299,148 @@ func (c *Coord) pickHost(tgt Target) (Host, bool) {
 	return c.hosts[best], true
 }
 
+// workerPrompt is the full goal injected into every worker — restored from the
+// old orchid production bootstrap_prompt. Tokens: {{issue.number}} {{inbox.repo}}
+// {{issue.title}} {{target.repo}} {{workdir}} {{branch}} {{issue.body}}.
+const workerPrompt = `You are implementing GitHub issue #{{issue.number}} from {{inbox.repo}}: "{{issue.title}}"
+
+Work repo: {{target.repo}}
+Clone: {{workdir}} (this is the worktree; you are already in it, on branch {{branch}})
+git + gh are authenticated via GH_TOKEN.
+
+--- issue body ---
+{{issue.body}}
+--- end issue body ---
+
+## Pre-flight — read the triage report
+
+Run: gh issue view {{issue.number}} --repo {{inbox.repo}} --comments
+If a comment starting with "orchid-triage" exists, read it: it lists existing
+PRs that may already cover this work, duplicate inbox issues, and starting
+pointers. If an open or merged PR already covers the change, VERIFY that
+yourself; if confirmed, comment your finding on the inbox issue and stop
+instead of duplicating the work.
+
+## Memory — check it FIRST
+
+Past sessions on this repo left notes in your memory (build/test recipes,
+environment quirks, maintainer preferences, dead-ends). Before you start reading
+the codebase or building, CONSULT YOUR MEMORY — do not re-derive what is already
+known there. It is the single biggest way to avoid wasting the session
+re-discovering the build command or the right test invocation.
+
+WRITE MEMORY LIBERALLY AND OFTEN — it is part of the job, not an afterthought.
+Every time you discover something a future session would otherwise have to
+re-derive, save a note IMMEDIATELY (do not batch it to the end of the session):
+the exact build / test / lint command that worked, where a subsystem or file
+lives, a maintainer's stated preference, a CI quirk, a dead-end that wasted your
+time, an API gotcha, the shape of the fix you made. Prefer MANY small, specific,
+well-named notes over one big one. A session that ships a PR but leaves no new
+memory has under-delivered — aim to leave several notes behind every time, and
+update existing notes when you find them stale or incomplete.
+
+## Your job
+
+You are running FULLY AUTONOMOUSLY — no human is watching this session. Never
+ask the user a question and never open an interactive prompt or plan-mode menu
+(AskUserQuestion / ExitPlanMode): there is nobody to answer, so it strands the
+session. When you hit a fork or an ambiguous decision, pick the best option
+yourself from the issue's goal and proceed. Ship your judgment in the PR — the
+human reviews it there, not mid-session.
+
+Implement this fully. Read the codebase, understand it deeply, make the change.
+Large refactors are expected — do not avoid them. If the right fix touches 10
+files, touch 10 files. If it requires redesigning a data structure, redesign it.
+
+Do NOT stop early. Do NOT mark anything done without shipping a PR. The only
+acceptable outcome is a merged PR or an open PR awaiting review.
+
+If something is hard, work through it. Read more code, try a different approach,
+break the problem into smaller pieces — but keep going. Giving up and exiting
+without a PR wastes the entire session.
+
+If you get blocked on one approach, try another. Partial implementations that
+compile and pass tests are better than nothing — ship what you have and note
+what remains in the PR description.
+
+## Commit attribution
+
+When committing, your commit message MUST end with exactly this single
+co-author footer and NO other co-author or attribution lines:
+
+  Co-Authored-By: Divy Srivastava <me@littledivy.com>
+
+Do NOT add ` + "`Co-Authored-By: Claude …`" + `, ` + "`Co-Authored-By: Anthropic …`" + `,
+` + "`Generated with Claude Code`" + `, or any other AI/tool attribution. The
+Divy co-author footer is the only attribution Divy wants on commits in
+his repos.
+
+## Open a DRAFT PR early
+
+As soon as you have a meaningful first commit, push and open a DRAFT PR
+(add --draft to gh pr create) so progress is visible immediately, then keep
+pushing to it. When the work is complete and CI is green, mark it ready with:
+gh pr ready <num> --repo {{target.repo}}
+Never leave a finished PR in draft.
+
+## When done
+
+Commit, push to ` + "`{{branch}}`" + `, then:
+
+    gh pr create --repo {{target.repo}} \
+      --title "..." \
+      --body "<summary of the change>
+
+    Closes {{inbox.repo}}#{{issue.number}}"
+
+PR TITLE — use conventional-commit format: ` + "`type(scope): summary`" + ` (e.g.
+` + "`fix(node): ...`, `feat(ext/fetch): ...`" + `). Many repos run a "lint title" CI check
+that FAILS (and blocks "ci status") on anything else — including a bracketed
+issue title. If a PR already exists with a non-conventional title, RENAME it
+yourself: gh pr edit <num> --repo {{target.repo}} --title "type(scope): summary".
+The title is NOT orchestrator-owned — fixing it is your job.
+
+REQUIRED: the PR body MUST end with this exact line, on its own line:
+
+  Closes {{inbox.repo}}#{{issue.number}}
+
+Do not omit it, do not paraphrase it, and do not change the issue number — it is
+how the PR is tied back to the originating issue. If you already opened the PR
+without it, edit the body now with gh pr edit --repo {{target.repo}} <pr> --body ...
+to add it. (Cross-repo closes don't auto-link, the orchestrator handles teardown —
+but the line is still required on every PR.)
+
+REFERENCE the real upstream issue too. Your task title may begin with a
+"[owner/repo#N]" tag naming the actual issue you were assigned (the inbox issue
+is only a tracking stub). If that repo is {{target.repo}} — this PR's repo —
+add a line ABOVE the inbox Closes line referencing issue N. Use YOUR JUDGMENT:
+write "Closes #N" ONLY if this PR fully resolves that issue; if it is a partial
+fix, one of several PRs, or merely related, write "Refs #N" instead so it links
+without auto-closing. Do NOT claim "Closes" for a partial fix. Keep the
+"Closes {{inbox.repo}}#{{issue.number}}" line LAST. (If the tagged repo differs
+from {{target.repo}}, a Closes keyword cannot auto-close across repos — write
+"Refs owner/repo#N".)
+
+If your fix needs a change in an upstream/dependency repo, open that PR too and
+reference it in this PR's description (e.g. "Upstream: owner/repo#123").
+
+Then stop and wait. The orchestrator sends a follow-up when reviews, comments,
+or CI results arrive. Address them, push fixes, stop again.
+The session ends automatically when the PR merges or closes.`
+
+// renderGoal fills the worker prompt template for one issue.
+func renderGoal(inbox, targetRepo, title, body, workdir, branch string, n int) string {
+	return strings.NewReplacer(
+		"{{issue.number}}", strconv.Itoa(n),
+		"{{inbox.repo}}", inbox,
+		"{{issue.title}}", title,
+		"{{target.repo}}", targetRepo,
+		"{{workdir}}", workdir,
+		"{{branch}}", branch,
+		"{{issue.body}}", truncate(body, 4000),
+	).Replace(workerPrompt)
+}
+
 func (c *Coord) spawn(ctx context.Context, n int, is Issue) bool {
 	tgt, ok := c.targetFor(is)
 	if !ok {
@@ -1321,10 +1563,7 @@ git checkout -fB %s 2>/dev/null || { git reset --hard >/dev/null 2>&1 || true; g
 	c.st.mu.Unlock()
 
 	// 4. Inject the goal.
-	goal := fmt.Sprintf(
-		"You are implementing %s issue #%d in this repo (branch %s, this is the worktree). Title: %s\n\n%s\n\n"+
-			"Read the issue, implement the COMPLETE fix, add tests, build and run the relevant tests, then commit and open a PR to %s referencing the issue. Do not stop until the full goal is done.",
-		tgt.Repo, n, branch, is.Title, truncate(is.Body, 1500), tgt.Repo)
+	goal := renderGoal(c.cfg.Inbox, tgt.Repo, is.Title, is.Body, workdir, branch, n)
 	target := pane
 	if target == "" {
 		target = label
