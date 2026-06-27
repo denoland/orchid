@@ -411,6 +411,72 @@ func (h Host) send(ctx context.Context, target, text string) error {
 	return nil
 }
 
+// agentBareIdle reports whether the pane shows an idle, empty agent prompt
+// (the "bypass permissions" footer is present only when claude is sitting
+// at an empty input box). Used to detect (a) that the TUI has finished
+// booting and (b) after a send, that the input was NOT accepted — once a
+// task is submitted claude goes busy and the footer disappears.
+func agentBareIdle(pane string) bool {
+	return strings.Contains(pane, "bypass permissions")
+}
+
+// injectGoal delivers the goal to a freshly-spawned agent reliably. It
+// waits for the prompt to render, sends, then confirms the agent left the
+// bare prompt (i.e. accepted the task). A dropped keystroke during boot or
+// an Enter that raced ahead of a long paste both leave the worker idle;
+// this retries (nudging Enter, then clearing and resending) until the goal
+// registers or the context expires.
+func (h Host) injectGoal(ctx context.Context, target, goal string) error {
+	// Wait for the TUI to render its input prompt (up to ~the ctx budget).
+	for i := 0; i < 30; i++ {
+		if agentBareIdle(h.read(ctx, target, 6)) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := h.send(ctx, target, goal); err != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(4 * time.Second):
+		}
+		if !agentBareIdle(h.read(ctx, target, 12)) {
+			return nil // busy → task accepted
+		}
+		// Still at a bare prompt: the text may have landed but the Enter
+		// raced ahead of it. Nudge Enter once before a full resend.
+		_, _ = h.herdr(ctx, "pane", "send-keys", target, "Enter")
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+		if !agentBareIdle(h.read(ctx, target, 12)) {
+			return nil
+		}
+		// Neither took: clear whatever's in the box and retry from scratch.
+		_, _ = h.herdr(ctx, "pane", "send-keys", target, "Escape")
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+		}
+	}
+	return fmt.Errorf("goal did not register after retries")
+}
+
 func (h Host) read(ctx context.Context, target string, lines int) string {
 	out, _ := h.herdr(ctx, "agent", "read", target, "--source", "recent", "--lines", strconv.Itoa(lines), "--format", "text")
 	if raw, err := herdrUnwrap(out); err == nil {
@@ -713,6 +779,123 @@ func ghIssues(ctx context.Context, inbox, label string) ([]Issue, error) {
 		out = append(out, is)
 	}
 	return out, nil
+}
+
+// assignedIssue is one row from `gh api /search/issues?q=assignee:<bot>`.
+// We dedupe against NodeID — GitHub recycles issue numbers per repo, but
+// node ids are globally unique and stable across renames.
+type assignedIssue struct {
+	NodeID string
+	Repo   string
+	Number int
+	Title  string
+	Body   string
+	URL    string
+	Author string
+}
+
+// searchAssignments returns open issues in `repo` currently assigned to
+// `bot`. Caller dedupes via node id so a re-poll never re-creates the
+// inbox issue. No --paginate: assigned-issue counts per repo stay well
+// under one page (per_page=50), and --paginate concatenates per-page
+// JSON objects which would break the single-object Unmarshal below.
+func searchAssignments(ctx context.Context, repo, bot string) ([]assignedIssue, error) {
+	var resp struct {
+		Items []struct {
+			NodeID  string                 `json:"node_id"`
+			Number  int                    `json:"number"`
+			Title   string                 `json:"title"`
+			Body    string                 `json:"body"`
+			HTMLURL string                 `json:"html_url"`
+			User    struct{ Login string } `json:"user"`
+		} `json:"items"`
+	}
+	if err := ghJSON(ctx, &resp, "api", "-H", "Accept: application/vnd.github+json",
+		fmt.Sprintf("/search/issues?q=repo:%s+assignee:%s+is:issue+is:open&per_page=50", repo, bot)); err != nil {
+		return nil, err
+	}
+	res := make([]assignedIssue, 0, len(resp.Items))
+	for _, it := range resp.Items {
+		res = append(res, assignedIssue{
+			NodeID: it.NodeID, Repo: repo, Number: it.Number,
+			Title: it.Title, Body: it.Body, URL: it.HTMLURL, Author: it.User.Login,
+		})
+	}
+	return res, nil
+}
+
+// inboxMirrored returns the set of upstream refs ("owner/repo#N") that
+// already have an inbox issue, parsed from the "[owner/repo#N] ..."
+// title convention across BOTH open and closed inbox issues. The inbox
+// itself is the feeder's dedupe store — stateless, so a restart or a
+// closed-then-reassigned issue never double-files, and no seed set has
+// to be carried in state.json.
+var inboxTitleRef = regexp.MustCompile(`^\[([^\]]+#\d+)\]`)
+
+func inboxMirrored(ctx context.Context, inbox string) (map[string]bool, error) {
+	var raw []struct {
+		Title string `json:"title"`
+	}
+	if err := ghJSON(ctx, &raw, "issue", "list", "--repo", inbox,
+		"--state", "all", "--limit", "1000", "--json", "title"); err != nil {
+		return nil, err
+	}
+	have := make(map[string]bool, len(raw))
+	for _, r := range raw {
+		if m := inboxTitleRef.FindStringSubmatch(r.Title); m != nil {
+			have[m[1]] = true
+		}
+	}
+	return have, nil
+}
+
+// assignmentTick scans every target repo for issues assigned to the bot
+// and opens a matching inbox issue (labeled with the target's label) so
+// the swarm picks them up on the same cycle. This is the feeder that
+// turns "assign an upstream issue to @divybot" into work; without it the
+// inbox only fills by hand. Dedupe is against the existing inbox titles
+// (inboxMirrored) — if listing those fails we abort the tick rather than
+// risk a duplicate storm.
+func (c *Coord) assignmentTick(ctx context.Context) {
+	bot := c.cfg.BotLogin
+	if bot == "" {
+		return
+	}
+	have, err := inboxMirrored(ctx, c.cfg.Inbox)
+	if err != nil {
+		log.Printf("assignments: inbox list failed, skipping feed: %v", err)
+		return
+	}
+	for _, t := range c.cfg.Targets {
+		if t.Repo == "" || t.Repo == c.cfg.Inbox || t.Label == "" {
+			continue
+		}
+		issues, err := searchAssignments(ctx, t.Repo, bot)
+		if err != nil {
+			log.Printf("assignments: search %s × %s failed: %v", t.Repo, bot, err)
+			continue
+		}
+		for _, it := range issues {
+			ref := fmt.Sprintf("%s#%d", it.Repo, it.Number)
+			if have[ref] {
+				continue
+			}
+			title := fmt.Sprintf("[%s] %s", ref, it.Title)
+			body := fmt.Sprintf(
+				"Triggered by assignment of [%s](%s) to @%s.\n\nOpened by @%s.\n\n---\n\n%s",
+				ref, it.URL, bot, it.Author, truncate(it.Body, 2000))
+			out, err := run(ctx, "gh", "issue", "create",
+				"--repo", c.cfg.Inbox, "--label", t.Label, "--title", title, "--body", body)
+			if err != nil {
+				log.Printf("assignments: gh issue create failed for %s: %v: %s",
+					ref, err, strings.TrimSpace(out))
+				continue
+			}
+			have[ref] = true // guard against the same ref twice in one pass
+			log.Printf("assignments: opened inbox issue for %s (assignee=%s) → %s",
+				ref, bot, strings.TrimSpace(out))
+		}
+	}
 }
 
 type PRView struct {
@@ -1113,6 +1296,10 @@ func (c *Coord) activeHosts() []Host {
 }
 
 func (c *Coord) tick(ctx context.Context) {
+	// Feeder first: mirror any newly bot-assigned upstream issues into the
+	// inbox so they're visible to pollIssues on this same cycle.
+	c.assignmentTick(ctx)
+
 	open, allOpen, pollOK := c.pollIssues(ctx)
 
 	// Teardown jobs whose inbox issue is gone — but ONLY when the poll was
@@ -1562,14 +1749,18 @@ git checkout -fB %s 2>/dev/null || { git reset --hard >/dev/null 2>&1 || true; g
 	c.st.Jobs[n] = j
 	c.st.mu.Unlock()
 
-	// 4. Inject the goal.
+	// 4. Inject the goal — gated on TUI readiness. A freshly-spawned claude
+	// renders its prompt a few seconds after start; the old fire-and-forget
+	// send landed before then and was silently dropped, leaving the worker
+	// idle with no task. injectGoal waits for the prompt, then confirms the
+	// send registered and retries.
 	goal := renderGoal(c.cfg.Inbox, tgt.Repo, is.Title, is.Body, workdir, branch, n)
 	target := pane
 	if target == "" {
 		target = label
 	}
-	gctx, gcancel := context.WithTimeout(ctx, 20*time.Second)
-	if err := host.send(gctx, target, goal); err != nil {
+	gctx, gcancel := context.WithTimeout(ctx, 120*time.Second)
+	if err := host.injectGoal(gctx, target, goal); err != nil {
 		log.Printf("issue #%d: goal inject failed: %v", n, err)
 	}
 	gcancel()
