@@ -833,14 +833,12 @@ func searchAssignments(ctx context.Context, repo, bot string) ([]assignedIssue, 
 	return res, nil
 }
 
-// inboxMirrored returns the set of upstream refs ("owner/repo#N") that have an
-// OPEN inbox issue in flight, parsed from the "[owner/repo#N] ..." title
-// convention. Open-only is deliberate: a partial PR writes "Refs #N" (upstream
-// stays open) and "Closes inbox#M" (its stub closes on merge), so a closed stub
-// with a still-open+assigned upstream means there is MORE work to do. Deduping
-// against closed stubs too would permanently strand those continuations. The
-// open inbox is the in-flight store — a stub stays open until its PR merges, so
-// this also prevents double-spawning while a partial PR awaits review.
+// inboxMirrored returns the set of upstream refs ("owner/repo#N") that
+// already have an inbox issue, parsed from the "[owner/repo#N] ..."
+// title convention across BOTH open and closed inbox issues. The inbox
+// itself is the feeder's dedupe store — stateless, so a restart or a
+// closed-then-reassigned issue never double-files, and no seed set has
+// to be carried in state.json.
 var inboxTitleRef = regexp.MustCompile(`^\[([^\]]+#\d+)\]`)
 
 func inboxMirrored(ctx context.Context, inbox string) (map[string]bool, error) {
@@ -848,7 +846,7 @@ func inboxMirrored(ctx context.Context, inbox string) (map[string]bool, error) {
 		Title string `json:"title"`
 	}
 	if err := ghJSON(ctx, &raw, "issue", "list", "--repo", inbox,
-		"--state", "open", "--limit", "1000", "--json", "title"); err != nil {
+		"--state", "all", "--limit", "1000", "--json", "title"); err != nil {
 		return nil, err
 	}
 	have := make(map[string]bool, len(raw))
@@ -858,44 +856,6 @@ func inboxMirrored(ctx context.Context, inbox string) (map[string]bool, error) {
 		}
 	}
 	return have, nil
-}
-
-// priorMergedPRs returns the merged PRs already linked to an upstream issue,
-// via its timeline cross-references. A non-empty result means earlier sessions
-// landed PART of the issue (each wrote "Refs #N", leaving it open) — so the next
-// stub is a CONTINUATION and must tell the worker what already shipped, not redo
-// it. Best-effort: a timeline error yields nil (treated as a fresh first file).
-func priorMergedPRs(ctx context.Context, repo string, n int) []string {
-	var tl []struct {
-		Event  string `json:"event"`
-		Source struct {
-			Issue struct {
-				Number      int    `json:"number"`
-				Title       string `json:"title"`
-				PullRequest *struct {
-					MergedAt *string `json:"merged_at"`
-				} `json:"pull_request"`
-			} `json:"issue"`
-		} `json:"source"`
-	}
-	if err := ghJSON(ctx, &tl, "api", "-H", "Accept: application/vnd.github+json",
-		fmt.Sprintf("repos/%s/issues/%d/timeline?per_page=100", repo, n)); err != nil {
-		return nil
-	}
-	seen := map[int]bool{}
-	var out []string
-	for _, e := range tl {
-		pr := e.Source.Issue
-		if e.Event != "cross-referenced" || pr.PullRequest == nil || pr.PullRequest.MergedAt == nil {
-			continue
-		}
-		if pr.Number == 0 || seen[pr.Number] {
-			continue
-		}
-		seen[pr.Number] = true
-		out = append(out, fmt.Sprintf("- #%d %s", pr.Number, strings.TrimSpace(pr.Title)))
-	}
-	return out
 }
 
 // assignmentTick scans every target repo for issues assigned to the bot
@@ -930,21 +890,9 @@ func (c *Coord) assignmentTick(ctx context.Context) {
 				continue
 			}
 			title := fmt.Sprintf("[%s] %s", ref, it.Title)
-			// Continuation: if merged PRs already link this upstream issue, earlier
-			// sessions shipped part of it. Tell the worker what landed so it reads
-			// those PRs and tackles only the REMAINING tasks instead of redoing them.
-			var cont string
-			if prs := priorMergedPRs(ctx, it.Repo, it.Number); len(prs) > 0 {
-				cont = fmt.Sprintf(
-					"⚠️ CONTINUATION — these merged PRs already shipped part of this issue:\n%s\n\n"+
-						"Read them (gh pr diff) BEFORE starting. Do NOT redo landed work — "+
-						"implement only the REMAINING tasks. If nothing is left, write "+
-						"\"Closes #%d\" and close it out.\n\n---\n\n",
-					strings.Join(prs, "\n"), it.Number)
-			}
 			body := fmt.Sprintf(
-				"Triggered by assignment of [%s](%s) to @%s.\n\nOpened by @%s.\n\n---\n\n%s%s",
-				ref, it.URL, bot, it.Author, cont, truncate(it.Body, 2000))
+				"Triggered by assignment of [%s](%s) to @%s.\n\nOpened by @%s.\n\n---\n\n%s",
+				ref, it.URL, bot, it.Author, truncate(it.Body, 2000))
 			out, err := run(ctx, "gh", "issue", "create",
 				"--repo", c.cfg.Inbox, "--label", t.Label, "--title", title, "--body", body)
 			if err != nil {
