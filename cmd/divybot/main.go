@@ -190,17 +190,26 @@ type Job struct {
 type State struct {
 	mu   sync.Mutex
 	Jobs map[int]*Job `json:"jobs"`
-	path string
+	// Continued counts how many CONTINUATION stubs we've re-filed per upstream ref
+	// ("owner/repo#N"), so a never-closing upstream can't churn forever. Persisted.
+	Continued map[string]int `json:"continued"`
+	path      string
 }
 
 func loadState(path string) *State {
-	s := &State{Jobs: map[int]*Job{}, path: path}
+	s := &State{Jobs: map[int]*Job{}, Continued: map[string]int{}, path: path}
 	if b, err := os.ReadFile(path); err == nil {
 		var raw struct {
-			Jobs map[int]*Job `json:"jobs"`
+			Jobs      map[int]*Job   `json:"jobs"`
+			Continued map[string]int `json:"continued"`
 		}
-		if json.Unmarshal(b, &raw) == nil && raw.Jobs != nil {
-			s.Jobs = raw.Jobs
+		if json.Unmarshal(b, &raw) == nil {
+			if raw.Jobs != nil {
+				s.Jobs = raw.Jobs
+			}
+			if raw.Continued != nil {
+				s.Continued = raw.Continued
+			}
 		}
 	}
 	return s
@@ -210,8 +219,9 @@ func (s *State) save() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, err := json.MarshalIndent(struct {
-		Jobs map[int]*Job `json:"jobs"`
-	}{s.Jobs}, "", "  ")
+		Jobs      map[int]*Job   `json:"jobs"`
+		Continued map[string]int `json:"continued"`
+	}{s.Jobs, s.Continued}, "", "  ")
 	if err != nil {
 		return
 	}
@@ -1935,6 +1945,202 @@ func (c *Coord) teardown(ctx context.Context, n int, j *Job) {
 		_ = host.closeWorkspace(cctx, ws)
 	}
 	log.Printf("issue #%d: torn down (was on %s/%s)", n, j.Host, j.Label)
+
+	// A torn-down job means its inbox stub closed — usually because the PR merged.
+	// If that PR was a PARTIAL fix (the worker wrote "Refs #N", so the upstream
+	// issue did NOT auto-close on merge), re-file ONE continuation stub for the
+	// remaining work. This is EVENT-driven (one merge → at most one re-file),
+	// never a backlog scan, so it can't storm the way an open-only feeder dedupe
+	// did. Best-effort; failures just skip the continuation.
+	c.maybeContinue(ctx, j)
+}
+
+const maxContinuations = 3
+
+// maybeContinue re-files a continuation inbox stub when a tracked job's PR
+// merged but only PARTIALLY resolved its upstream issue. Gates (all required):
+//   - the job shipped a PR, and that PR is MERGED (real progress landed);
+//   - the upstream issue is SAME-repo and still OPEN (had the worker written
+//     "Closes #N", GitHub would have auto-closed it on merge — open ⇒ partial);
+//   - no open inbox stub already exists for the ref (not already in flight);
+//   - fewer than maxContinuations re-files for this ref (bounds churn on a
+//     hard/never-closing upstream).
+func (c *Coord) maybeContinue(ctx context.Context, j *Job) {
+	if j == nil || j.Repo == "" {
+		return
+	}
+	m := inboxTitleRef.FindStringSubmatch(j.Title)
+	if m == nil {
+		return // not an assignment-fed stub (no "[owner/repo#N]" tag)
+	}
+	ref := m[1] // "owner/repo#N"
+	hash := strings.LastIndex(ref, "#")
+	if hash < 0 {
+		return
+	}
+	refRepo := ref[:hash]
+	refNum, err := strconv.Atoi(ref[hash+1:])
+	if err != nil || refNum == 0 {
+		return
+	}
+	// Continuation hinges on GitHub's same-repo auto-close as the partial signal;
+	// a cross-repo ref can't auto-close, so we can't tell partial from done.
+	if refRepo != j.Repo {
+		return
+	}
+
+	// Resolve the PR (may not have been recorded if it merged fast); need it MERGED.
+	pr := j.PR
+	if pr == 0 {
+		pr = ghPRByBranch(ctx, j.Repo, j.Branch, c.cfg.BotLogin)
+	}
+	if pr == 0 || ghPRState(ctx, j.Repo, pr) != "MERGED" {
+		return
+	}
+	// Upstream still open ⇒ the merged PR was a partial ("Refs #N"). Done ⇒ skip.
+	if ghIssueStateByNum(ctx, j.Repo, refNum) != "OPEN" {
+		return
+	}
+	// Already a stub in flight for this ref? Don't double up.
+	if open, err := openStubFor(ctx, c.cfg.Inbox, ref); err != nil || open {
+		return
+	}
+	// Bound churn: at most maxContinuations re-files per ref, ever.
+	c.st.mu.Lock()
+	if c.st.Continued == nil {
+		c.st.Continued = map[string]int{}
+	}
+	if c.st.Continued[ref] >= maxContinuations {
+		c.st.mu.Unlock()
+		log.Printf("continuation: %s hit cap (%d) — not re-filing", ref, maxContinuations)
+		return
+	}
+	c.st.Continued[ref]++
+	attempt := c.st.Continued[ref]
+	c.st.mu.Unlock()
+
+	label := c.labelFor(j.Repo)
+	if label == "" {
+		return
+	}
+	upBody, _ := ghIssueBody(ctx, j.Repo, refNum)
+	prs := priorMergedPRs(ctx, j.Repo, refNum)
+	banner := fmt.Sprintf(
+		"⚠️ CONTINUATION (attempt %d/%d) — PR #%d merged but only PARTIALLY resolved this issue.\n",
+		attempt, maxContinuations, pr)
+	if len(prs) > 0 {
+		banner += "Merged PRs already shipped against it:\n" + strings.Join(prs, "\n") + "\n"
+	}
+	banner += "Read them (gh pr diff) BEFORE starting. Do NOT redo landed work — implement only the " +
+		"REMAINING tasks. If nothing is left, write \"Closes #" + strconv.Itoa(refNum) + "\" and close it out.\n\n---\n\n"
+	title := fmt.Sprintf("[%s] %s", ref, strings.TrimPrefix(j.Title, "["+ref+"] "))
+	body := fmt.Sprintf("Continuation of [%s](https://github.com/%s/issues/%d) after partial PR #%d.\n\n---\n\n%s%s",
+		ref, j.Repo, refNum, pr, banner, truncate(upBody, 2000))
+	out, err := run(ctx, "gh", "issue", "create", "--repo", c.cfg.Inbox,
+		"--label", label, "--title", title, "--body", body)
+	if err != nil {
+		log.Printf("continuation: gh issue create for %s failed: %v: %s", ref, err, strings.TrimSpace(out))
+		return
+	}
+	log.Printf("continuation: re-filed %s (attempt %d/%d, after PR #%d) → %s",
+		ref, attempt, maxContinuations, pr, strings.TrimSpace(out))
+}
+
+// labelFor returns the inbox label configured for a target repo ("" if none).
+func (c *Coord) labelFor(repo string) string {
+	for _, t := range c.cfg.Targets {
+		if t.Repo == repo {
+			return t.Label
+		}
+	}
+	return ""
+}
+
+// ghPRState returns a PR's state: OPEN | CLOSED | MERGED ("" on error).
+func ghPRState(ctx context.Context, repo string, pr int) string {
+	var v struct {
+		State string `json:"state"`
+	}
+	if err := ghJSON(ctx, &v, "pr", "view", strconv.Itoa(pr), "--repo", repo, "--json", "state"); err != nil {
+		return ""
+	}
+	return v.State
+}
+
+// ghIssueStateByNum returns an issue's state: OPEN | CLOSED ("" on error).
+func ghIssueStateByNum(ctx context.Context, repo string, n int) string {
+	var v struct {
+		State string `json:"state"`
+	}
+	if err := ghJSON(ctx, &v, "issue", "view", strconv.Itoa(n), "--repo", repo, "--json", "state"); err != nil {
+		return ""
+	}
+	return v.State
+}
+
+// ghIssueBody returns an issue's body text.
+func ghIssueBody(ctx context.Context, repo string, n int) (string, error) {
+	var v struct {
+		Body string `json:"body"`
+	}
+	if err := ghJSON(ctx, &v, "issue", "view", strconv.Itoa(n), "--repo", repo, "--json", "body"); err != nil {
+		return "", err
+	}
+	return v.Body, nil
+}
+
+// openStubFor reports whether an OPEN inbox issue already tags this upstream ref
+// ("owner/repo#N") via the "[owner/repo#N] ..." title convention.
+func openStubFor(ctx context.Context, inbox, ref string) (bool, error) {
+	var raw []struct {
+		Title string `json:"title"`
+	}
+	if err := ghJSON(ctx, &raw, "issue", "list", "--repo", inbox,
+		"--state", "open", "--limit", "1000", "--json", "title"); err != nil {
+		return false, err
+	}
+	for _, r := range raw {
+		if m := inboxTitleRef.FindStringSubmatch(r.Title); m != nil && m[1] == ref {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// priorMergedPRs returns the merged PRs already linked to an upstream issue, via
+// its timeline cross-references — so a continuation stub can tell the worker what
+// already shipped instead of redoing it. Best-effort: nil on any error.
+func priorMergedPRs(ctx context.Context, repo string, n int) []string {
+	var tl []struct {
+		Event  string `json:"event"`
+		Source struct {
+			Issue struct {
+				Number      int    `json:"number"`
+				Title       string `json:"title"`
+				PullRequest *struct {
+					MergedAt *string `json:"merged_at"`
+				} `json:"pull_request"`
+			} `json:"issue"`
+		} `json:"source"`
+	}
+	if err := ghJSON(ctx, &tl, "api", "-H", "Accept: application/vnd.github+json",
+		fmt.Sprintf("repos/%s/issues/%d/timeline?per_page=100", repo, n)); err != nil {
+		return nil
+	}
+	seen := map[int]bool{}
+	var out []string
+	for _, e := range tl {
+		pr := e.Source.Issue
+		if e.Event != "cross-referenced" || pr.PullRequest == nil || pr.PullRequest.MergedAt == nil {
+			continue
+		}
+		if pr.Number == 0 || seen[pr.Number] {
+			continue
+		}
+		seen[pr.Number] = true
+		out = append(out, fmt.Sprintf("- #%d %s", pr.Number, strings.TrimSpace(pr.Title)))
+	}
+	return out
 }
 
 func (c *Coord) notify(msg string) {
