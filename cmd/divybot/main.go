@@ -184,7 +184,11 @@ type Job struct {
 	PR        int       `json:"pr"`
 	SpawnedAt time.Time `json:"spawned_at"`
 	LastPoke  time.Time `json:"last_poke"`
-	Track     tracker   `json:"track"`
+	// FanoutNudged is set when we nudged this job's worker (on its PR merge) to fan
+	// out remaining work into sibling inbox issues. Used to grant exactly one grace
+	// tick before teardown so the worker can file them while still alive.
+	FanoutNudged bool    `json:"fanout_nudged,omitempty"`
+	Track        tracker `json:"track"`
 }
 
 type State struct {
@@ -1358,6 +1362,14 @@ func (c *Coord) tick(ctx context.Context) {
 			if _, ok := allOpen[n]; !ok {
 				jc := j
 				c.st.mu.Unlock()
+				// Before tearing down a merged-partial job, give its still-alive worker
+				// ONE grace tick to fan out the remaining work into sibling inbox issues
+				// (parallel sessions). fanoutGrace nudges the pane and returns true to
+				// defer teardown; next tick it returns false and teardown proceeds.
+				if c.fanoutGrace(ctx, n, jc) {
+					c.st.mu.Lock()
+					continue
+				}
 				c.teardown(ctx, n, jc)
 				c.st.mu.Lock()
 				delete(c.st.Jobs, n)
@@ -1682,17 +1694,56 @@ from {{target.repo}}, a Closes keyword cannot auto-close across repos — write
 If your fix needs a change in an upstream/dependency repo, open that PR too and
 reference it in this PR's description (e.g. "Upstream: owner/repo#123").
 
+## Fan out the remaining work (PARALLELISM)
+
+If your PR is a PARTIAL fix ("Refs #N") and the upstream issue N has more
+INDEPENDENT work left, split that remainder into discrete subtasks and open ONE
+inbox issue per subtask — they become sibling sessions that run IN PARALLEL with
+each other. This is how a big issue gets worked by many agents at once instead of
+one-at-a-time.
+
+For each independent remaining subtask:
+
+    gh issue create --repo {{inbox.repo}} --label {{target.label}} \
+      --title "[{{owner/repo#N}}] <short subtask>" \
+      --body "Subtask of {{owner/repo#N}}. Do ONLY this piece; sibling subtasks
+    are handled by other sessions — do NOT touch their files. Scope: <files/area>.
+
+    <what to do>"
+
+Rules:
+  - Only split work that is genuinely INDEPENDENT (no ordering dependency, minimal
+    file overlap). Sequential/dependent remainder → leave ONE follow-up, not many.
+  - IDEMPOTENT: first run  gh issue list --repo {{inbox.repo}} --state open --search
+    "[{{owner/repo#N}}] in:title"  and skip any subtask that already has an open
+    stub. Never double-file.
+  - Scope each stub tightly (name the files/module) so siblings don't collide.
+  - If NOTHING independent remains (issue is basically done, or only a single
+    dependent step is left), do NOT fan out — just write "Closes #N" (if done) or
+    leave it for the orchestrator's single follow-up.
+  - Open these BEFORE you stop. The orchestrator may also nudge you after merge —
+    if you already filed them, reply that they exist and stop.
+
 Then stop and wait. The orchestrator sends a follow-up when reviews, comments,
 or CI results arrive. Address them, push fixes, stop again.
 The session ends automatically when the PR merges or closes.`
 
 // renderGoal fills the worker prompt template for one issue.
-func renderGoal(inbox, targetRepo, title, body, workdir, branch string, n int) string {
+func renderGoal(inbox, targetRepo, label, title, body, workdir, branch string, n int) string {
+	// Upstream ref ("owner/repo#N") from the "[owner/repo#N] ..." title tag, so the
+	// fan-out instructions can scope sibling stubs to the real issue. Fall back to
+	// the target repo + inbox number if the title carries no tag.
+	ref := fmt.Sprintf("%s#%d", targetRepo, n)
+	if m := inboxTitleRef.FindStringSubmatch(title); m != nil {
+		ref = m[1]
+	}
 	return strings.NewReplacer(
 		"{{issue.number}}", strconv.Itoa(n),
 		"{{inbox.repo}}", inbox,
 		"{{issue.title}}", title,
 		"{{target.repo}}", targetRepo,
+		"{{target.label}}", label,
+		"{{owner/repo#N}}", ref,
 		"{{workdir}}", workdir,
 		"{{branch}}", branch,
 		"{{issue.body}}", truncate(body, 4000),
@@ -1825,7 +1876,7 @@ git checkout -fB %s 2>/dev/null || { git reset --hard >/dev/null 2>&1 || true; g
 	// send landed before then and was silently dropped, leaving the worker
 	// idle with no task. injectGoal waits for the prompt, then confirms the
 	// send registered and retries.
-	goal := renderGoal(c.cfg.Inbox, tgt.Repo, is.Title, is.Body, workdir, branch, n)
+	goal := renderGoal(c.cfg.Inbox, tgt.Repo, tgt.Label, is.Title, is.Body, workdir, branch, n)
 	target := pane
 	if target == "" {
 		target = label
@@ -1955,53 +2006,95 @@ func (c *Coord) teardown(ctx context.Context, n int, j *Job) {
 	c.maybeContinue(ctx, j)
 }
 
-// maybeContinue re-files a continuation inbox stub when a tracked job's PR
-// merged but only PARTIALLY resolved its upstream issue. Gates (all required):
-//   - the job shipped a PR, and that PR is MERGED (real progress landed);
-//   - the upstream issue is SAME-repo and still OPEN (had the worker written
-//     "Closes #N", GitHub would have auto-closed it on merge — open ⇒ partial);
-//   - no open inbox stub already exists for the ref (not already in flight).
-//
-// There is no cap: every re-file requires a NEW merged PR (real progress) and
-// the chain self-terminates the moment the worker writes "Closes #N" (upstream
-// closes ⇒ gate fails). The per-ref counter is kept only for the attempt label.
-func (c *Coord) maybeContinue(ctx context.Context, j *Job) {
+// partialMerge reports whether job j shipped a PR that MERGED but only PARTIALLY
+// resolved a SAME-repo upstream issue (still OPEN — GitHub would have auto-closed
+// it had the worker written "Closes #N", so open ⇒ "Refs #N" partial). Returns
+// the upstream ref ("owner/repo#N"), its number, and the PR number. ok=false when
+// any gate fails (no tag, cross-repo, no PR, PR not merged, upstream not open).
+func (c *Coord) partialMerge(ctx context.Context, j *Job) (ref string, refNum, pr int, ok bool) {
 	if j == nil || j.Repo == "" {
-		return
+		return "", 0, 0, false
 	}
 	m := inboxTitleRef.FindStringSubmatch(j.Title)
 	if m == nil {
-		return // not an assignment-fed stub (no "[owner/repo#N]" tag)
+		return "", 0, 0, false
 	}
-	ref := m[1] // "owner/repo#N"
+	ref = m[1]
 	hash := strings.LastIndex(ref, "#")
 	if hash < 0 {
-		return
+		return "", 0, 0, false
 	}
 	refRepo := ref[:hash]
 	refNum, err := strconv.Atoi(ref[hash+1:])
-	if err != nil || refNum == 0 {
-		return
+	if err != nil || refNum == 0 || refRepo != j.Repo {
+		return "", 0, 0, false
 	}
-	// Continuation hinges on GitHub's same-repo auto-close as the partial signal;
-	// a cross-repo ref can't auto-close, so we can't tell partial from done.
-	if refRepo != j.Repo {
-		return
-	}
-
-	// Resolve the PR (may not have been recorded if it merged fast); need it MERGED.
-	pr := j.PR
+	pr = j.PR
 	if pr == 0 {
 		pr = ghPRByBranch(ctx, j.Repo, j.Branch, c.cfg.BotLogin)
 	}
 	if pr == 0 || ghPRState(ctx, j.Repo, pr) != "MERGED" {
-		return
+		return "", 0, 0, false
 	}
-	// Upstream still open ⇒ the merged PR was a partial ("Refs #N"). Done ⇒ skip.
 	if ghIssueStateByNum(ctx, j.Repo, refNum) != "OPEN" {
+		return "", 0, 0, false
+	}
+	return ref, refNum, pr, true
+}
+
+// fanoutGrace handles a teardown-candidate job (its inbox stub closed). If the PR
+// was a partial merge and we haven't nudged yet, it messages the still-alive
+// worker to fan out remaining work into sibling inbox issues and returns true to
+// DEFER teardown one tick. On the next tick (already nudged) it returns false so
+// teardown proceeds — by then the worker has filed its stubs (or didn't, and the
+// maybeContinue fallback in teardown files one generic continuation).
+func (c *Coord) fanoutGrace(ctx context.Context, n int, j *Job) bool {
+	if j.FanoutNudged {
+		return false // grace already spent — let teardown run
+	}
+	ref, _, pr, ok := c.partialMerge(ctx, j)
+	if !ok {
+		return false // not a partial merge — normal teardown
+	}
+	host, hok := c.hosts[j.Host]
+	if !hok || j.Pane == "" {
+		return false // can't reach the worker — skip straight to teardown+fallback
+	}
+	msg := fmt.Sprintf(
+		"Your PR #%d merged but %s still has work. Before this session ends: split the "+
+			"REMAINING independent work into subtasks and open ONE inbox issue per subtask "+
+			"(gh issue create --repo %s --label %s --title \"[%s] <subtask>\" --body \"<tight scope; "+
+			"do ONLY this>\") so they run in PARALLEL. First `gh issue list --repo %s --state open "+
+			"--search \"[%s] in:title\"` and skip any that already exist. If nothing independent "+
+			"remains, do nothing — the orchestrator handles a single follow-up.",
+		pr, ref, c.cfg.Inbox, c.labelFor(j.Repo), ref, c.cfg.Inbox, ref)
+	sctx, scancel := context.WithTimeout(ctx, 20*time.Second)
+	err := host.send(sctx, j.Pane, msg)
+	scancel()
+	if err != nil {
+		log.Printf("issue #%d: fan-out nudge failed: %v — tearing down", n, err)
+		return false
+	}
+	j.FanoutNudged = true
+	log.Printf("issue #%d: fan-out nudged (%s, PR #%d) — deferring teardown one tick", n, ref, pr)
+	return true
+}
+
+// maybeContinue re-files ONE generic continuation stub as a FALLBACK when a
+// merged-partial job's worker did NOT fan out any sibling inbox issues itself
+// (openStubFor==false). When the worker DID fan out (one or more stubs tag the
+// ref), this no-ops — the worker's scoped subtasks supersede the generic one.
+// Gates: same as partialMerge, plus "no open stub already exists for the ref".
+//
+// No cap: every re-file requires a NEW merged PR, and the chain self-terminates
+// when the upstream closes. The per-ref counter is kept for the attempt label.
+func (c *Coord) maybeContinue(ctx context.Context, j *Job) {
+	ref, refNum, pr, ok := c.partialMerge(ctx, j)
+	if !ok {
 		return
 	}
-	// Already a stub in flight for this ref? Don't double up.
+	// Already a stub in flight for this ref (incl. ones the worker just fanned out)?
+	// Then the remainder is already covered — don't add a generic one.
 	if open, err := openStubFor(ctx, c.cfg.Inbox, ref); err != nil || open {
 		return
 	}
