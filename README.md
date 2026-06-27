@@ -10,11 +10,7 @@ It integrates with Github issues for scheduling work and opening PRs while tryin
 - **Load balancing**: run sessions across a cluster of machines over plain SSH.
 - **Security**: Works well with [clawpatrol](https://clawpatrol.dev) security firewall
 
-Get started at https://orchid.littledivy.com/docs/getting-started
-
-```
-curl -fsSL https://orchid.littledivy.com/install.sh | bash
-```
+Get started by asking your agent to `Setup orchid https://github.com/denoland/orchid`
 
 ### Cluster
 
