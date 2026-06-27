@@ -14,9 +14,8 @@ Get started by asking your agent to `Setup orchid https://github.com/denoland/or
 
 ### Cluster
 
-A machine is anything that runs `tmux` + your agent over SSH. orchid drives
-them all, with no agent or inbound ports on the workers. Sessions dispatch to
-whichever host has a free slot, and each host can run multiple agent harnesses
+A machine is anything that runs `herdr` + your agents over SSH. orchid drives
+them all. Sessions dispatch to whichever host has a free slot, and each host can run multiple agent harnesses
 (`claude`, `codex`, …). See the [VMs docs](https://orchid.littledivy.com/docs/vms).
 
 <img height="319" alt="dashboard" src="https://github.com/user-attachments/assets/0bc63b69-6f92-406c-befa-aba122fb31d2" />
@@ -39,7 +38,7 @@ plain interlinked markdown the agents maintain themselves.
 
 ### Configuration
 
-See example [./swarm.hcl](swarm.hcl)
+See example [./cmd/divybot/divybot.example.json]
 
 ### Chat with your orchid
 
