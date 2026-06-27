@@ -184,11 +184,12 @@ type Job struct {
 	PR        int       `json:"pr"`
 	SpawnedAt time.Time `json:"spawned_at"`
 	LastPoke  time.Time `json:"last_poke"`
-	// FanoutNudged is set when we nudged this job's worker (on its PR merge) to fan
-	// out remaining work into sibling inbox issues. Used to grant exactly one grace
-	// tick before teardown so the worker can file them while still alive.
-	FanoutNudged bool    `json:"fanout_nudged,omitempty"`
-	Track        tracker `json:"track"`
+	// FanoutNudgedAt is when we nudged this job's worker (on its PR merge) to fan
+	// out remaining work into sibling inbox issues. Teardown is deferred until the
+	// worker files a sibling stub or fanoutGraceWindow elapses — a single tick is
+	// far too short for the worker to wake, decide, and run gh issue create.
+	FanoutNudgedAt time.Time `json:"fanout_nudged_at,omitempty"`
+	Track          tracker   `json:"track"`
 }
 
 type State struct {
@@ -2042,19 +2043,34 @@ func (c *Coord) partialMerge(ctx context.Context, j *Job) (ref string, refNum, p
 	return ref, refNum, pr, true
 }
 
+// fanoutGraceWindow is how long teardown waits after the fan-out nudge for the
+// worker to wake, decide, and open its sibling inbox issues. Generous on purpose:
+// the worker is an idle claude that must process a message and shell out to gh.
+const fanoutGraceWindow = 4 * time.Minute
+
 // fanoutGrace handles a teardown-candidate job (its inbox stub closed). If the PR
-// was a partial merge and we haven't nudged yet, it messages the still-alive
-// worker to fan out remaining work into sibling inbox issues and returns true to
-// DEFER teardown one tick. On the next tick (already nudged) it returns false so
-// teardown proceeds — by then the worker has filed its stubs (or didn't, and the
-// maybeContinue fallback in teardown files one generic continuation).
+// was a partial merge, it nudges the still-alive worker to fan out the remaining
+// work into sibling inbox issues and DEFERS teardown — returning true — until
+// either the worker files a sibling stub or fanoutGraceWindow elapses. Returns
+// false (let teardown + the maybeContinue fallback run) when it's not a partial
+// merge, the worker is unreachable, the grace has expired, or a sibling already
+// exists (the worker fanned out — teardown is safe and the fallback will no-op).
 func (c *Coord) fanoutGrace(ctx context.Context, n int, j *Job) bool {
-	if j.FanoutNudged {
-		return false // grace already spent — let teardown run
-	}
 	ref, _, pr, ok := c.partialMerge(ctx, j)
 	if !ok {
 		return false // not a partial merge — normal teardown
+	}
+	// Already nudged: decide whether to keep waiting.
+	if !j.FanoutNudgedAt.IsZero() {
+		if open, err := openStubFor(ctx, c.cfg.Inbox, ref); err == nil && open {
+			log.Printf("issue #%d: worker fanned out %s — tearing down", n, ref)
+			return false // sibling(s) filed → done waiting
+		}
+		if time.Since(j.FanoutNudgedAt) >= fanoutGraceWindow {
+			log.Printf("issue #%d: fan-out grace expired for %s — tearing down (fallback)", n, ref)
+			return false // give up → generic continuation fallback
+		}
+		return true // keep deferring
 	}
 	host, hok := c.hosts[j.Host]
 	if !hok || j.Pane == "" {
@@ -2064,8 +2080,8 @@ func (c *Coord) fanoutGrace(ctx context.Context, n int, j *Job) bool {
 		"Your PR #%d merged but %s still has work. Before this session ends: split the "+
 			"REMAINING independent work into subtasks and open ONE inbox issue per subtask "+
 			"(gh issue create --repo %s --label %s --title \"[%s] <subtask>\" --body \"<tight scope; "+
-			"do ONLY this>\") so they run in PARALLEL. First `gh issue list --repo %s --state open "+
-			"--search \"[%s] in:title\"` and skip any that already exist. If nothing independent "+
+			"do ONLY this>\") so they run in PARALLEL. First  gh issue list --repo %s --state open "+
+			"--search \"[%s] in:title\"  and skip any that already exist. If nothing independent "+
 			"remains, do nothing — the orchestrator handles a single follow-up.",
 		pr, ref, c.cfg.Inbox, c.labelFor(j.Repo), ref, c.cfg.Inbox, ref)
 	sctx, scancel := context.WithTimeout(ctx, 20*time.Second)
@@ -2075,8 +2091,8 @@ func (c *Coord) fanoutGrace(ctx context.Context, n int, j *Job) bool {
 		log.Printf("issue #%d: fan-out nudge failed: %v — tearing down", n, err)
 		return false
 	}
-	j.FanoutNudged = true
-	log.Printf("issue #%d: fan-out nudged (%s, PR #%d) — deferring teardown one tick", n, ref, pr)
+	j.FanoutNudgedAt = time.Now()
+	log.Printf("issue #%d: fan-out nudged (%s, PR #%d) — deferring teardown up to %s", n, ref, pr, fanoutGraceWindow)
 	return true
 }
 
