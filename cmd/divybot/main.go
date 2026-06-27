@@ -1326,6 +1326,12 @@ func (c *Coord) tick(ctx context.Context) {
 
 	// Respawn dead sessions: a tracked job whose host responded but whose agent
 	// is gone (issue still open) is stalled — drop it so it re-spawns fresh.
+	type deadJob struct {
+		n    int
+		host string
+		ws   string
+	}
+	var dead []deadJob
 	c.st.mu.Lock()
 	for n, j := range c.st.Jobs {
 		if _, alive := status[n]; alive {
@@ -1340,10 +1346,29 @@ func (c *Coord) tick(ctx context.Context) {
 		if time.Since(j.SpawnedAt) < 3*time.Minute {
 			continue // freshly spawned/adopted — give herdr time to register the agent
 		}
-		log.Printf("issue #%d: agent gone on %s (host up) — dropping for respawn", n, j.Host)
+		dead = append(dead, deadJob{n: n, host: j.Host, ws: j.Workspace})
 		delete(c.st.Jobs, n)
 	}
 	c.st.mu.Unlock()
+	// Close each dead job's workspace before it respawns. Without this every
+	// flap-induced respawn leaks an orphan "unknown" workspace in herdr (the
+	// agent already exited, but the empty pane lingers forever). Done outside
+	// the state lock since closeWorkspace is a network round-trip.
+	for _, d := range dead {
+		log.Printf("issue #%d: agent gone on %s (host up) — dropping for respawn", d.n, d.host)
+		if d.ws == "" {
+			continue
+		}
+		host, ok := c.hosts[d.host]
+		if !ok {
+			continue
+		}
+		cctx, ccancel := context.WithTimeout(ctx, 12*time.Second)
+		if err := host.closeWorkspace(cctx, d.ws); err != nil {
+			log.Printf("issue #%d: closing dead workspace %s failed: %v", d.n, d.ws, err)
+		}
+		ccancel()
+	}
 
 	// Admission budget = governor cap − currently running.
 	cap := c.curCap()
