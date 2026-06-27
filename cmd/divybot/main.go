@@ -999,6 +999,17 @@ func contains(ss []string, s string) bool {
 	return false
 }
 
+// ciFailing reports whether a check-run conclusion (or legacy status state) is an
+// ACTIONABLE failure worth nudging the worker about. Everything else — success,
+// neutral, skipped, stale, cancelled/superseded, pending, "" — is not.
+func ciFailing(conclusion string) bool {
+	switch conclusion {
+	case "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED":
+		return true
+	}
+	return false
+}
+
 // diff returns new reviews/comments/CI/conflict since the last relay and updates
 // the tracker. Mirrors orchid's diffPR semantics in slim form: only forward
 // items we haven't seen, skip the bot's own posts, surface CI conclusion changes.
@@ -1030,12 +1041,17 @@ func diff(t *tracker, v *PRView, bot string) (lines []string, changed bool) {
 		changed = true
 	}
 	for _, ck := range v.Checks {
-		if ck.Conclusion == "" || ck.Conclusion == "SUCCESS" || ck.Conclusion == "NEUTRAL" {
+		// Only ACTIONABLE failures nudge the worker. SUCCESS/NEUTRAL/SKIPPED/STALE/
+		// CANCELLED/PENDING and "" are not failures — record + move on. SKIPPED in
+		// particular is the by-design skip-set: a CI rerun flips it every poll, which
+		// used to re-poke the pane each tick and bury the worker in "address each item"
+		// noise for checks that never needed action.
+		if !ciFailing(ck.Conclusion) {
 			t.Checks[ck.Name] = ck.Conclusion
 			continue
 		}
 		if t.Checks[ck.Name] == ck.Conclusion {
-			continue // already relayed this failure
+			continue // already relayed this failure — single nudge, not every tick
 		}
 		t.Checks[ck.Name] = ck.Conclusion
 		lines = append(lines, fmt.Sprintf("CI %s: %s", ck.Name, ck.Conclusion))
