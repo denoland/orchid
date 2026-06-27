@@ -1955,16 +1955,16 @@ func (c *Coord) teardown(ctx context.Context, n int, j *Job) {
 	c.maybeContinue(ctx, j)
 }
 
-const maxContinuations = 3
-
 // maybeContinue re-files a continuation inbox stub when a tracked job's PR
 // merged but only PARTIALLY resolved its upstream issue. Gates (all required):
 //   - the job shipped a PR, and that PR is MERGED (real progress landed);
 //   - the upstream issue is SAME-repo and still OPEN (had the worker written
 //     "Closes #N", GitHub would have auto-closed it on merge — open ⇒ partial);
-//   - no open inbox stub already exists for the ref (not already in flight);
-//   - fewer than maxContinuations re-files for this ref (bounds churn on a
-//     hard/never-closing upstream).
+//   - no open inbox stub already exists for the ref (not already in flight).
+//
+// There is no cap: every re-file requires a NEW merged PR (real progress) and
+// the chain self-terminates the moment the worker writes "Closes #N" (upstream
+// closes ⇒ gate fails). The per-ref counter is kept only for the attempt label.
 func (c *Coord) maybeContinue(ctx context.Context, j *Job) {
 	if j == nil || j.Repo == "" {
 		return
@@ -2005,15 +2005,11 @@ func (c *Coord) maybeContinue(ctx context.Context, j *Job) {
 	if open, err := openStubFor(ctx, c.cfg.Inbox, ref); err != nil || open {
 		return
 	}
-	// Bound churn: at most maxContinuations re-files per ref, ever.
+	// Count re-files per ref (for the attempt label + observability). No cap:
+	// each one needs a fresh merged PR, and the chain ends when upstream closes.
 	c.st.mu.Lock()
 	if c.st.Continued == nil {
 		c.st.Continued = map[string]int{}
-	}
-	if c.st.Continued[ref] >= maxContinuations {
-		c.st.mu.Unlock()
-		log.Printf("continuation: %s hit cap (%d) — not re-filing", ref, maxContinuations)
-		return
 	}
 	c.st.Continued[ref]++
 	attempt := c.st.Continued[ref]
@@ -2026,8 +2022,8 @@ func (c *Coord) maybeContinue(ctx context.Context, j *Job) {
 	upBody, _ := ghIssueBody(ctx, j.Repo, refNum)
 	prs := priorMergedPRs(ctx, j.Repo, refNum)
 	banner := fmt.Sprintf(
-		"⚠️ CONTINUATION (attempt %d/%d) — PR #%d merged but only PARTIALLY resolved this issue.\n",
-		attempt, maxContinuations, pr)
+		"⚠️ CONTINUATION (attempt %d) — PR #%d merged but only PARTIALLY resolved this issue.\n",
+		attempt, pr)
 	if len(prs) > 0 {
 		banner += "Merged PRs already shipped against it:\n" + strings.Join(prs, "\n") + "\n"
 	}
@@ -2042,8 +2038,8 @@ func (c *Coord) maybeContinue(ctx context.Context, j *Job) {
 		log.Printf("continuation: gh issue create for %s failed: %v: %s", ref, err, strings.TrimSpace(out))
 		return
 	}
-	log.Printf("continuation: re-filed %s (attempt %d/%d, after PR #%d) → %s",
-		ref, attempt, maxContinuations, pr, strings.TrimSpace(out))
+	log.Printf("continuation: re-filed %s (attempt %d, after PR #%d) → %s",
+		ref, attempt, pr, strings.TrimSpace(out))
 }
 
 // labelFor returns the inbox label configured for a target repo ("" if none).
