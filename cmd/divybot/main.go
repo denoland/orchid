@@ -699,9 +699,17 @@ printf '%%s\n' '* merge=union' > %s/.gitattributes
 # point claude auto-memory at the shared clone (settings.json, separate from creds)
 SJ="$HOME/.claude/settings.json"; mkdir -p "$HOME/.claude"; [ -f "$SJ" ] || echo '{}' > "$SJ"
 if command -v jq >/dev/null 2>&1; then t=$(mktemp); jq --arg d %s '.autoMemoryEnabled=true | .autoMemoryDirectory=$d' "$SJ" > "$t" 2>/dev/null && mv "$t" "$SJ" || rm -f "$t"; fi
+# native skills: refresh the clone and mirror its skills/ subtree into the host's
+# personal skill dir so claude auto-discovers them. Kept OUT of the target worktree
+# (~/.claude/skills, not <repo>/.claude) → they never leak into a PR.
+git -C "$R" pull --rebase --autostash -q origin %s >/dev/null 2>&1 || true
+if [ -d "$R/skills" ]; then mkdir -p "$HOME/.claude/skills"; cp -a "$R/skills/." "$HOME/.claude/skills/" 2>/dev/null || true; fi
+# codex has no native skill discovery — point its global AGENTS.md at the mirrored
+# skill files (idempotent via marker; runs only if ~/.codex exists).
+if [ -d "$HOME/.codex" ] && ! grep -qs 'divybot-skills' "$HOME/.codex/AGENTS.md" 2>/dev/null; then printf '\n<!-- divybot-skills -->\nReusable skills live in ~/.claude/skills/<name>/SKILL.md. Before starting, scan those SKILL.md files; if one matches the task (e.g. windows-deno-desktop-testing for deno desktop / native-window issues), follow it.\n' >> "$HOME/.codex/AGENTS.md"; fi
 `,
 		shq(home), shq(clone), shq(m.Branch), shq(repoURL), shq(repoURL),
-		shq(bot), shq(email), shq(memdir), shq(memdir), shq(memdir))
+		shq(bot), shq(email), shq(memdir), shq(memdir), shq(memdir), shq(m.Branch))
 	out, err := h.runRemote(ctx, script)
 	if err != nil {
 		return fmt.Errorf("ensureMemory %s: %v: %.120q", h.Name, err, out)
