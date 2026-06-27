@@ -166,6 +166,7 @@ type tracker struct {
 	IssueComments []string          `json:"issue_comments"` // seen PR conversation comment IDs
 	Checks        map[string]string `json:"checks"`         // check name → last conclusion
 	HeadOID       string            `json:"head_oid"`       // last seen PR head commit
+	Conflicted    bool              `json:"conflicted"`     // already relayed the current merge conflict
 }
 
 type Job struct {
@@ -1040,9 +1041,20 @@ func diff(t *tracker, v *PRView, bot string) (lines []string, changed bool) {
 		lines = append(lines, fmt.Sprintf("CI %s: %s", ck.Name, ck.Conclusion))
 		changed = true
 	}
-	if v.Mergeable == "CONFLICTING" && t.HeadOID != v.HeadOID {
-		lines = append(lines, "merge-conflict: rebase onto the latest base branch, resolve conflicts, force-push.")
-		changed = true
+	// Forward a merge conflict on first detection — INCLUDING when the head OID is
+	// unchanged because the BASE branch advanced underneath the PR (the common case
+	// the old head-OID-only gate silently dropped). Re-notify if the head later
+	// moves but it's still conflicting; clear once GitHub reports it mergeable.
+	// UNKNOWN (mergeability still computing) leaves the flag untouched.
+	switch v.Mergeable {
+	case "CONFLICTING":
+		if !t.Conflicted || t.HeadOID != v.HeadOID {
+			lines = append(lines, "merge-conflict: rebase onto the latest base branch, resolve conflicts, force-push.")
+			changed = true
+		}
+		t.Conflicted = true
+	case "MERGEABLE":
+		t.Conflicted = false
 	}
 	t.HeadOID = v.HeadOID
 	return lines, changed
