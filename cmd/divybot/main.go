@@ -84,6 +84,11 @@ type Target struct {
 	Repo    string `json:"repo"`     // e.g. "denoland/deno"
 	Agent   string `json:"agent"`    // "claude" | "codex" (default claude)
 	NeedCap string `json:"need_cap"` // required host capability, e.g. "build-deno"
+	// AutoMerge enables divybot to squash-merge a worker's PR once it is non-draft,
+	// MERGEABLE, and all CI checks pass — closing the green-PR → merge → fan-out
+	// loop without a human. Opt-in per repo; only set it where divybot has merge
+	// rights AND auto-merging bot PRs without human review is acceptable.
+	AutoMerge bool `json:"automerge"`
 }
 
 // Gov holds the weekly-quota pacing knobs (the governor — paces against the Max
@@ -941,12 +946,14 @@ type PRView struct {
 		Name       string
 		Conclusion string
 	}
+	IsDraft bool
 }
 
 func ghPRView(ctx context.Context, repo string, n int) (*PRView, error) {
 	var raw struct {
 		Number          int    `json:"number"`
 		Mergeable       string `json:"mergeable"`
+		IsDraft         bool   `json:"isDraft"`
 		HeadRefOid      string `json:"headRefOid"`
 		Reviews         []struct {
 			ID     string `json:"id"`
@@ -966,10 +973,10 @@ func ghPRView(ctx context.Context, repo string, n int) (*PRView, error) {
 		} `json:"statusCheckRollup"`
 	}
 	if err := ghJSON(ctx, &raw, "pr", "view", strconv.Itoa(n), "--repo", repo,
-		"--json", "number,mergeable,headRefOid,reviews,comments,statusCheckRollup"); err != nil {
+		"--json", "number,mergeable,isDraft,headRefOid,reviews,comments,statusCheckRollup"); err != nil {
 		return nil, err
 	}
-	v := &PRView{Number: raw.Number, Mergeable: raw.Mergeable, HeadOID: raw.HeadRefOid}
+	v := &PRView{Number: raw.Number, Mergeable: raw.Mergeable, HeadOID: raw.HeadRefOid, IsDraft: raw.IsDraft}
 	for _, r := range raw.Reviews {
 		v.Reviews = append(v.Reviews, struct{ ID, Author, Body, State string }{r.ID, r.Author.Login, r.Body, r.State})
 	}
@@ -1959,6 +1966,23 @@ func (c *Coord) pollPR(ctx context.Context, n int, j *Job, host Host) {
 	if err != nil {
 		return
 	}
+
+	// Auto-merge the green PR (opt-in per target) — this closes the autonomous
+	// loop: merge ⇒ teardown ⇒ fan-out/continuation ⇒ more green PRs ⇒ … until
+	// the upstream issue closes. Gate hard: must be non-draft (worker marked it
+	// ready), MERGEABLE (no conflicts), and every CI check green.
+	if c.autoMergeEnabled(j.Repo) && !v.IsDraft && v.Mergeable == "MERGEABLE" && checksGreen(v) {
+		mctx, mcancel := context.WithTimeout(ctx, 30*time.Second)
+		out, merr := run(mctx, "gh", "pr", "merge", strconv.Itoa(j.PR), "--repo", j.Repo, "--squash")
+		mcancel()
+		if merr != nil {
+			log.Printf("issue #%d: auto-merge PR #%d failed: %v: %s", n, j.PR, merr, strings.TrimSpace(out))
+		} else {
+			log.Printf("issue #%d: auto-merged PR #%d (%s, green)", n, j.PR, j.Repo)
+		}
+		return // merged (or will retry next tick) — skip the relay this cycle
+	}
+
 	lines, changed := diff(&j.Track, v, c.cfg.BotLogin)
 	if !changed {
 		return
@@ -1972,6 +1996,34 @@ func (c *Coord) pollPR(ctx context.Context, n int, j *Job, host Host) {
 		log.Printf("issue #%d: relay failed: %v", n, err)
 	}
 	rcancel()
+}
+
+// autoMergeEnabled reports whether the target for this repo opted into auto-merge.
+func (c *Coord) autoMergeEnabled(repo string) bool {
+	for _, t := range c.cfg.Targets {
+		if t.Repo == repo {
+			return t.AutoMerge
+		}
+	}
+	return false
+}
+
+// checksGreen is true when the PR has at least one CI check and every check has
+// concluded as passing (SUCCESS/NEUTRAL/SKIPPED) — none pending, failing, or
+// unconcluded. Zero checks ⇒ false (don't merge something with no CI signal).
+func checksGreen(v *PRView) bool {
+	if len(v.Checks) == 0 {
+		return false
+	}
+	for _, ck := range v.Checks {
+		switch strings.ToUpper(ck.Conclusion) {
+		case "SUCCESS", "NEUTRAL", "SKIPPED":
+			// passing
+		default:
+			return false // PENDING, FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, ""
+		}
+	}
+	return true
 }
 
 func (c *Coord) teardown(ctx context.Context, n int, j *Job) {
