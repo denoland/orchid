@@ -2114,6 +2114,23 @@ func (c *Coord) teardown(ctx context.Context, n int, j *Job) {
 	if ws != "" {
 		_ = host.closeWorkspace(cctx, ws)
 	}
+
+	// Reclaim the worktree. Closing the herdr workspace does NOT remove the
+	// on-disk clone (orch-work/issue-N), and each carries a multi-GB build/target
+	// dir — left behind they accumulate without bound (115 GB of dead worktrees
+	// filled the mac-mini and ground builds to a halt). rm it on teardown.
+	root := host.WorkdirRoot
+	if root == "" {
+		root = "/root/orch-work"
+	}
+	wd := fmt.Sprintf("%s/issue-%d", strings.TrimRight(root, "/"), n)
+	if strings.Contains(wd, "/issue-") { // belt-and-suspenders: never rm a root
+		rmctx, rmcancel := context.WithTimeout(ctx, 30*time.Second)
+		if _, err := host.runRemote(rmctx, "rm -rf "+shq(wd)); err != nil {
+			log.Printf("issue #%d: worktree cleanup %s failed: %v", n, wd, err)
+		}
+		rmcancel()
+	}
 	log.Printf("issue #%d: torn down (was on %s/%s)", n, j.Host, j.Label)
 
 	// A torn-down job means its inbox stub closed — usually because the PR merged.
