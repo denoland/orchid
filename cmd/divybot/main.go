@@ -1932,7 +1932,7 @@ func (c *Coord) supervise(ctx context.Context, n int, j *Job, status map[int]age
 	}
 
 	// PR poll + relay (orchid's existing polling, delivered via herdr send).
-	c.pollPR(ctx, n, j, host)
+	c.pollPR(ctx, n, j, host, ref.Status)
 
 	// Stranded: persistently idle with no PR → re-inject the goal (a poke that
 	// re-delivers the task, not a bare Enter — fixes the gcp strandings). Debounced
@@ -1953,7 +1953,7 @@ func (c *Coord) supervise(ctx context.Context, n int, j *Job, status map[int]age
 	}
 }
 
-func (c *Coord) pollPR(ctx context.Context, n int, j *Job, host Host) {
+func (c *Coord) pollPR(ctx context.Context, n int, j *Job, host Host, status string) {
 	if j.PR == 0 {
 		if pr := ghPRByBranch(ctx, j.Repo, j.Branch, c.cfg.BotLogin); pr != 0 {
 			j.PR = pr
@@ -1983,6 +1983,25 @@ func (c *Coord) pollPR(ctx context.Context, n int, j *Job, host Host) {
 		return // merged (or will retry next tick) — skip the relay this cycle
 	}
 
+	// SELF-REPOKE: a worker that ships a PR then goes idle ("done"/"idle") will sit
+	// forever on a PR that needs ITS action — CI came back red, or it's a green
+	// draft that just needs `gh pr ready`. divybot's diff-relay only fires on NEW
+	// activity, so an already-seen failure or a static draft strands the worker.
+	// This is what made the swarm need hourly hand-nudging. Re-engage the idle
+	// worker each tick (debounced 15m) with the concrete blocker so the autonomous
+	// loop self-heals instead of waiting on a human.
+	if (status == "idle" || status == "done") && j.Pane != "" && time.Since(j.LastPoke) > 15*time.Minute {
+		if msg := stuckPRNudge(v); msg != "" {
+			rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
+			if host.send(rctx, j.Pane, msg) == nil {
+				j.LastPoke = time.Now()
+				log.Printf("issue #%d: self-repoke PR #%d (%s)", n, j.PR, prShortState(v))
+			}
+			rcancel()
+			return
+		}
+	}
+
 	lines, changed := diff(&j.Track, v, c.cfg.BotLogin)
 	if !changed {
 		return
@@ -1996,6 +2015,53 @@ func (c *Coord) pollPR(ctx context.Context, n int, j *Job, host Host) {
 		log.Printf("issue #%d: relay failed: %v", n, err)
 	}
 	rcancel()
+}
+
+// stuckPRNudge returns a concrete re-engagement message for an idle worker whose
+// PR needs ITS action, or "" if the PR is fine to wait on (CI still running, or
+// already green and merging). The two stuck states that stranded the swarm:
+//   - green DRAFT: ready to merge but auto-merge can't touch a draft → tell it to
+//     `gh pr ready` so the loop can merge it;
+//   - non-draft with FAILED checks: CI is red and the worker isn't re-engaging →
+//     hand it the failing check names so it fixes + pushes.
+// A PR with only pending checks, or green+non-draft (already merging), returns "".
+func stuckPRNudge(v *PRView) string {
+	if v.IsDraft {
+		if v.Mergeable == "MERGEABLE" && checksGreen(v) {
+			return fmt.Sprintf("PR #%d is green and mergeable but still a DRAFT, so it can't auto-merge. "+
+				"If it's complete, mark it ready now: gh pr ready %d  — then it merges automatically. "+
+				"If more work remains, keep going and mark ready when done.", v.Number, v.Number)
+		}
+		return "" // draft still being worked / not yet green
+	}
+	if failed := checksFailed(v); len(failed) > 0 {
+		return fmt.Sprintf("PR #%d is NOT mergeable — CI is RED: %s failed. Don't sit idle on a red PR. "+
+			"Run  gh pr checks %d  then  gh run view <run-id> --log-failed  to see the real cause, fix it, and push. "+
+			"For a deno_core/check-* 'MISSING — baselined but not seen' message the cause is test DISCOVERY, not a "+
+			"code bug. Auto-merge fires only when ALL checks are green.", v.Number, strings.Join(failed, ", "), v.Number)
+	}
+	return "" // non-draft, no failures → pending or green (merging) — nothing to do
+}
+
+// checksFailed returns the names of checks that CONCLUDED non-passing (real
+// failures, ignoring still-pending/unconcluded checks).
+func checksFailed(v *PRView) []string {
+	var out []string
+	for _, ck := range v.Checks {
+		switch strings.ToUpper(ck.Conclusion) {
+		case "FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE":
+			out = append(out, ck.Name)
+		}
+	}
+	return out
+}
+
+// prShortState is a one-word tag for logging the self-repoke reason.
+func prShortState(v *PRView) string {
+	if v.IsDraft {
+		return "green-draft"
+	}
+	return "red:" + strings.Join(checksFailed(v), ",")
 }
 
 // autoMergeEnabled reports whether the target for this repo opted into auto-merge.
