@@ -2349,27 +2349,37 @@ reference it in this PR's description (e.g. "Upstream: owner/repo#123").
 ## Fan out the remaining work (PARALLELISM)
 
 If your PR is a PARTIAL fix ("Refs #N") and the upstream issue N has more
-INDEPENDENT work left, split that remainder into discrete subtasks and open ONE
-inbox issue per subtask — they become sibling sessions that run IN PARALLEL with
-each other. This is how a big issue gets worked by many agents at once instead of
-one-at-a-time.
+INDEPENDENT work left, split that remainder into subtasks and open ONE inbox
+issue per subtask — they become sibling sessions that run IN PARALLEL. This is
+how a big issue gets worked by many agents at once instead of one-at-a-time.
+
+SIZE THE SUBTASKS LARGE. Each subtask should be a substantial, cohesive LOGIC
+UNIT — a whole subsystem, a complete API surface (a type and ALL its members), a
+full feature — that lands as one meaty PR. Do NOT shard into tiny per-method /
+per-function / per-test pieces: a swarm of one-method PRs is noisy and worse than
+a few large coherent ones. Divide by major logic boundary, and not too deep — aim
+for a handful of big subtasks, not dozens of small ones. If in doubt, make the
+subtask BIGGER and let one agent carry the whole unit.
 
 For each independent remaining subtask:
 
     gh issue create --repo {{inbox.repo}} --label {{target.label}} \
-      --title "[{{owner/repo#N}}] <short subtask>" \
-      --body "Subtask of {{owner/repo#N}}. Do ONLY this piece; sibling subtasks
-    are handled by other sessions — do NOT touch their files. Scope: <files/area>.
+      --title "[{{owner/repo#N}}] <logic unit>" \
+      --body "Subtask of {{owner/repo#N}}. Own this whole logic unit; sibling
+    subtasks are handled by other sessions — do NOT touch their files. Scope: <subsystem/surface>.
 
-    <what to do>"
+    <what to do — the COMPLETE unit, not a slice of it>"
 
 Rules:
-  - Only split work that is genuinely INDEPENDENT (no ordering dependency, minimal
-    file overlap). Sequential/dependent remainder → leave ONE follow-up, not many.
+  - Split only at major INDEPENDENT logic boundaries (no ordering dependency,
+    minimal file overlap). Each piece a full unit, not a fragment. Sequential or
+    fine-grained remainder → leave ONE follow-up, not many small ones.
+  - Prefer FEWER, LARGER subtasks. If you'd file more than ~6, your units are too
+    small — coarsen them.
   - IDEMPOTENT: first run  gh issue list --repo {{inbox.repo}} --state open --search
     "[{{owner/repo#N}}] in:title"  and skip any subtask that already has an open
     stub. Never double-file.
-  - Scope each stub tightly (name the files/module) so siblings don't collide.
+  - Scope each stub to its subsystem/surface (name the area) so siblings don't collide.
   - If NOTHING independent remains (issue is basically done, or only a single
     dependent step is left), do NOT fan out — just write "Closes #N" (if done) or
     leave it for the orchestrator's single follow-up.
