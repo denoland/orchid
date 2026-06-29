@@ -1209,12 +1209,18 @@ const (
 
 func govHours(d time.Duration) float64 { return float64(d) / float64(time.Hour) }
 
-// accountKey normalizes a job/target agent to its pacing account.
+// accountKey normalizes a job/target agent to its pacing account. opencode is
+// the launcher for "codex" agents (codex's own TUI is undriveable through herdr
+// on Linux), so herdr's detected "opencode" maps back to the codex account.
 func accountKey(agent string) string {
-	if agent == "" {
+	switch agent {
+	case "", "claude":
 		return "claude"
+	case "opencode":
+		return "codex"
+	default:
+		return agent
 	}
-	return agent
 }
 
 // accounts returns the distinct pacing accounts across all targets, including
@@ -1603,7 +1609,9 @@ func (c *Coord) adopt(n int, is Issue, status map[int]agentRef) (*Job, bool) {
 	if !found {
 		return nil, false
 	}
-	agent := ref.Agent
+	// herdr reports a codex-via-opencode job as agent "opencode"; normalize it
+	// back to the logical "codex" account (accountKey does the mapping).
+	agent := accountKey(ref.Agent)
 	if agent == "" {
 		agent = "claude"
 	}
@@ -2415,7 +2423,17 @@ git checkout -fB %s 2>/dev/null || { git reset --hard >/dev/null 2>&1 || true; g
 	// (creds/token/git identity/memory override) survive into the login shell.
 	agentCmd := "claude --dangerously-skip-permissions"
 	if agent == "codex" {
-		agentCmd = "codex --dangerously-bypass-approvals-and-sandbox"
+		// "codex" agents run via OPENCODE, not the codex binary. codex's rust TUI
+		// is undriveable through herdr on Linux (herdr can't read or write its
+		// pane — confirmed on gcp+vultr; only macOS works), so codex agents on the
+		// Linux workers were dead weight. opencode's Go TUI IS herdr-drivable on
+		// Linux, and the opencode-openai-codex-auth plugin talks to the SAME
+		// ChatGPT-plan codex backend reusing the oauth token seeded from
+		// ~/.codex/auth.json — same quota, no API key, no Cloudflare. gpt-5.5 is
+		// the model the codex ChatGPT backend serves. Per-host config
+		// (~/.config/opencode + seeded ~/.local/share/opencode/auth.json) grants
+		// auto-approve so it runs autonomously like claude.
+		agentCmd = "opencode --model openai/gpt-5.5"
 	}
 
 	// 3. Spawn BARE (no clawpatrol), one agent per dedicated single-pane workspace.
