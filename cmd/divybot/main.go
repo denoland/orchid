@@ -988,6 +988,7 @@ type PRView struct {
 	Number    int
 	HeadOID   string
 	Mergeable string
+	State     string // OPEN | MERGED | CLOSED
 	Reviews   []struct {
 		ID     string
 		Author string
@@ -1010,6 +1011,7 @@ func ghPRView(ctx context.Context, repo string, n int) (*PRView, error) {
 	var raw struct {
 		Number     int    `json:"number"`
 		Mergeable  string `json:"mergeable"`
+		State      string `json:"state"`
 		IsDraft    bool   `json:"isDraft"`
 		HeadRefOid string `json:"headRefOid"`
 		Reviews    []struct {
@@ -1030,10 +1032,10 @@ func ghPRView(ctx context.Context, repo string, n int) (*PRView, error) {
 		} `json:"statusCheckRollup"`
 	}
 	if err := ghJSON(ctx, &raw, "pr", "view", strconv.Itoa(n), "--repo", repo,
-		"--json", "number,mergeable,isDraft,headRefOid,reviews,comments,statusCheckRollup"); err != nil {
+		"--json", "number,mergeable,state,isDraft,headRefOid,reviews,comments,statusCheckRollup"); err != nil {
 		return nil, err
 	}
-	v := &PRView{Number: raw.Number, Mergeable: raw.Mergeable, HeadOID: raw.HeadRefOid, IsDraft: raw.IsDraft}
+	v := &PRView{Number: raw.Number, Mergeable: raw.Mergeable, State: raw.State, HeadOID: raw.HeadRefOid, IsDraft: raw.IsDraft}
 	for _, r := range raw.Reviews {
 		v.Reviews = append(v.Reviews, struct{ ID, Author, Body, State string }{r.ID, r.Author.Login, r.Body, r.State})
 	}
@@ -2508,6 +2510,29 @@ func (c *Coord) pollPR(ctx context.Context, n int, j *Job, host Host, status str
 	}
 	v, err := ghPRView(ctx, j.Repo, j.PR)
 	if err != nil {
+		return
+	}
+
+	// PR already merged/closed → the worker finished this PR but its inbox issue
+	// is still open, so it strands idle (the stranded-reinject below only fires on
+	// PR==0, and self-repoke only fires on stuck PRs). Reset the PR pointer and
+	// re-engage the WARM session to continue with the next piece / fan out the
+	// remaining work — far cheaper than tearing down and respawning a cold agent
+	// (warm target dir + sccache + context). This closes the merge→next-PR loop
+	// that was leaving v8x idle for 30+ min between commits.
+	if v.State == "MERGED" || v.State == "CLOSED" {
+		merged := v.State == "MERGED"
+		j.PR = 0
+		j.Track = tracker{}
+		if merged && (status == "idle" || status == "done") && j.Pane != "" && time.Since(j.LastPoke) > 5*time.Minute {
+			msg := "Your PR merged ✅. Keep the loop going: per the tracker, pick the NEXT subtask in scope (or split remaining work into sibling inbox issues so they run in parallel), implement it, and open the next PR. Don't stop while the tracker still has unfinished cells."
+			rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
+			if host.send(rctx, j.Pane, msg) == nil {
+				j.LastPoke = time.Now()
+				log.Printf("issue #%d: PR #%d merged — re-engaged warm worker to continue", n, v.Number)
+			}
+			rcancel()
+		}
 		return
 	}
 
