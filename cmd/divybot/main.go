@@ -550,7 +550,12 @@ func (h Host) injectGoal(ctx context.Context, target, goal string) error {
 		case <-time.After(2 * time.Second):
 		}
 	}
-	for attempt := 0; attempt < 4; attempt++ {
+	// Send the goal, then poll for acceptance with a GENEROUS window: opencode
+	// (and codex-class models) can take 10-20s after receiving the prompt before
+	// the first model call flips status to "working". Checking too early then
+	// re-sending double-submits the goal, so poll ~20s per attempt and nudge
+	// Enter once mid-poll in case the submit raced the paste.
+	for attempt := 0; attempt < 3; attempt++ {
 		if err := h.send(ctx, target, goal); err != nil {
 			select {
 			case <-ctx.Done():
@@ -559,23 +564,18 @@ func (h Host) injectGoal(ctx context.Context, target, goal string) error {
 			}
 			continue
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(4 * time.Second):
-		}
-		if accepted() {
-			return nil // processing → task accepted
-		}
-		// Text may have landed but the Enter raced ahead — nudge Enter, recheck.
-		_, _ = h.herdr(ctx, "pane", "send-keys", target, "Enter")
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(3 * time.Second):
-		}
-		if accepted() {
-			return nil
+		for j := 0; j < 7; j++ {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(3 * time.Second):
+			}
+			if accepted() {
+				return nil // processing → task accepted
+			}
+			if j == 1 { // ~6s in: nudge Enter once in case the submit raced
+				_, _ = h.herdr(ctx, "pane", "send-keys", target, "Enter")
+			}
 		}
 	}
 	return fmt.Errorf("goal did not register after retries")
