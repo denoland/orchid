@@ -2191,13 +2191,31 @@ Do NOT add ` + "`Co-Authored-By: Claude …`" + `, ` + "`Co-Authored-By: Anthrop
 Divy co-author footer is the only attribution Divy wants on commits in
 his repos.
 
-## Open a DRAFT PR early
+## Open a PR early, then DON'T WAIT — pipeline for throughput
 
 As soon as you have a meaningful first commit, push and open a DRAFT PR
 (add --draft to gh pr create) so progress is visible immediately, then keep
-pushing to it. When the work is complete and CI is green, mark it ready with:
+pushing to it.
+
+When your change is complete AND your LOCAL build + tests pass, mark it ready
+right away — do NOT sit and watch remote CI:
 gh pr ready <num> --repo {{target.repo}}
-Never leave a finished PR in draft.
+The orchestrator auto-merges your PR the moment remote CI goes green; you do not
+need to babysit it. (It also auto-marks a green draft ready for you, so the worst
+case is a short delay, never a stall.)
+
+CRITICAL FOR THROUGHPUT — never block on CI or merge. The instant you've opened/
+readied a PR, immediately start the NEXT unit of work. Do not poll CI, do not
+wait for the merge, do not go idle. Two ways to keep the pipeline full, in order
+of preference:
+  1. FAN OUT: if independent work remains (e.g. other cells/subsystems on the
+     tracker), split it into discrete sibling inbox issues NOW (see the fan-out
+     section) so parallel sessions pick them up — then keep one slice for
+     yourself and continue.
+  2. CONTINUE: start the next slice yourself on a fresh branch in this same
+     worktree (warm build cache makes this fast), push, open its PR, repeat.
+A finished-and-readied PR is DONE from your side — your job is to keep opening
+new ones, not to wait on old ones. Never leave a finished PR in draft.
 
 ## When done
 
