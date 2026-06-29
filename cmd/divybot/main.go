@@ -82,10 +82,16 @@ type Host struct {
 
 // Target maps an inbox-issue label to a work repo + which agent runs it.
 type Target struct {
-	Label   string `json:"label"`    // inbox label, e.g. "deno"
-	Repo    string `json:"repo"`     // e.g. "denoland/deno"
-	Agent   string `json:"agent"`    // "claude" | "codex" (default claude)
-	NeedCap string `json:"need_cap"` // required host capability, e.g. "build-deno"
+	Label string `json:"label"` // inbox label, e.g. "deno"
+	Repo  string `json:"repo"`  // e.g. "denoland/deno"
+	Agent string `json:"agent"` // "claude" | "codex" (default claude)
+	// Agents is an ordered agent-overflow preference. When set it overrides Agent:
+	// admission spawns the issue on the FIRST listed agent whose account still has
+	// governor budget, so work spills to an idle account when the preferred one is
+	// throttled (e.g. ["claude","codex"] => prefer claude, fall to codex when
+	// claude is capped). Empty => just [Agent]. Each account paces independently.
+	Agents  []string `json:"agents"`
+	NeedCap string   `json:"need_cap"` // required host capability, e.g. "build-deno"
 	// AutoMerge enables divybot to squash-merge a worker's PR once it is non-draft,
 	// MERGEABLE, and all CI checks pass — closing the green-PR → merge → fan-out
 	// loop without a human. Opt-in per repo; only set it where divybot has merge
@@ -1176,15 +1182,18 @@ func accountKey(agent string) string {
 	return agent
 }
 
-// accounts returns the distinct pacing accounts across all targets.
+// accounts returns the distinct pacing accounts across all targets, including
+// every agent reachable via overflow — so a spill-only account (e.g. codex in a
+// claude target's overflow list) still gets its own meter + cap.
 func (c *Config) accounts() []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, t := range c.Targets {
-		a := accountKey(t.Agent)
-		if !seen[a] {
-			seen[a] = true
-			out = append(out, a)
+		for _, a := range t.agentList() {
+			if !seen[a] {
+				seen[a] = true
+				out = append(out, a)
+			}
 		}
 	}
 	if len(out) == 0 {
@@ -1897,16 +1906,22 @@ func (c *Coord) tick(ctx context.Context) {
 			c.supervise(ctx, n, j2, status)
 			continue
 		}
-		acct := accountKey(c.agentForIssue(is))
-		if budget[acct] <= 0 {
+		tgt, ok := c.targetFor(is)
+		if !ok {
 			continue
+		}
+		// Pick the first agent in the target's overflow preference with budget —
+		// claude work spills to codex automatically when claude is throttled.
+		acct, ok := pickAgent(tgt, budget)
+		if !ok {
+			continue // every candidate account exhausted this tick
 		}
 		if c.dry {
 			log.Printf("issue #%d: would spawn %s (dry-run)", n, acct)
 			budget[acct]--
 			continue
 		}
-		if c.spawn(ctx, n, is) {
+		if c.spawn(ctx, n, is, acct) {
 			budget[acct]--
 		}
 	}
@@ -1996,12 +2011,43 @@ func (c *Coord) targetFor(is Issue) (Target, bool) {
 	return Target{}, false
 }
 
-// agentForIssue is the agent (claude/codex) the issue's target routes to.
+// agentList is the target's ordered agent-overflow preference (normalized to
+// accounts). Falls back to the single Agent (default claude) when unset.
+func (t Target) agentList() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, a := range t.Agents {
+		a = accountKey(a)
+		if !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		out = []string{accountKey(t.Agent)}
+	}
+	return out
+}
+
+// agentForIssue is the issue target's PRIMARY (first-choice) agent — used for
+// reporting; admission uses pickAgent to honor overflow + live budget.
 func (c *Coord) agentForIssue(is Issue) string {
 	if t, ok := c.targetFor(is); ok {
-		return t.Agent
+		return t.agentList()[0]
 	}
 	return "claude"
+}
+
+// pickAgent returns the first agent in the target's overflow preference whose
+// account still has admission budget, decrementing that account's budget. ok =
+// false when every candidate account is exhausted (issue waits this tick).
+func pickAgent(t Target, budget map[string]int) (string, bool) {
+	for _, a := range t.agentList() {
+		if budget[a] > 0 {
+			return a, true
+		}
+	}
+	return "", false
 }
 
 // pickHost returns the least-loaded capable host with free capacity.
@@ -2208,7 +2254,7 @@ func renderGoal(inbox, targetRepo, label, title, body, workdir, branch string, n
 	).Replace(workerPrompt)
 }
 
-func (c *Coord) spawn(ctx context.Context, n int, is Issue) bool {
+func (c *Coord) spawn(ctx context.Context, n int, is Issue, agent string) bool {
 	tgt, ok := c.targetFor(is)
 	if !ok {
 		return false
@@ -2217,10 +2263,7 @@ func (c *Coord) spawn(ctx context.Context, n int, is Issue) bool {
 	if !ok {
 		return false
 	}
-	agent := tgt.Agent
-	if agent == "" {
-		agent = "claude"
-	}
+	agent = accountKey(agent)
 
 	// 1. Push fresh creds before the agent starts.
 	actx, acancel := context.WithTimeout(ctx, 30*time.Second)

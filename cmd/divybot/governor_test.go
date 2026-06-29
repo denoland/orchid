@@ -48,6 +48,49 @@ func TestParseHostQuotaEmptyAndJunk(t *testing.T) {
 	}
 }
 
+func TestAgentListAndAccounts(t *testing.T) {
+	if got := (Target{Agent: ""}).agentList(); len(got) != 1 || got[0] != "claude" {
+		t.Fatalf("default agentList = %v", got)
+	}
+	if got := (Target{Agent: "codex"}).agentList(); len(got) != 1 || got[0] != "codex" {
+		t.Fatalf("single agent = %v", got)
+	}
+	got := (Target{Agent: "claude", Agents: []string{"claude", "codex", "claude"}}).agentList()
+	if len(got) != 2 || got[0] != "claude" || got[1] != "codex" {
+		t.Fatalf("overflow agentList (deduped, ordered) = %v", got)
+	}
+	cfg := &Config{Targets: []Target{
+		{Label: "deno", Agent: "claude"},
+		{Label: "v8x", Agents: []string{"claude", "codex"}},
+	}}
+	accts := cfg.accounts()
+	if len(accts) != 2 || accts[0] != "claude" || accts[1] != "codex" {
+		t.Fatalf("accounts should union overflow agents = %v", accts)
+	}
+}
+
+func TestPickAgentOverflow(t *testing.T) {
+	v8x := Target{Label: "v8x", Agents: []string{"claude", "codex"}}
+	deno := Target{Label: "deno", Agent: "claude"}
+
+	// claude has budget => prefer claude.
+	if a, ok := pickAgent(v8x, map[string]int{"claude": 2, "codex": 30}); !ok || a != "claude" {
+		t.Fatalf("prefer claude when it has budget: %q %v", a, ok)
+	}
+	// claude exhausted => spill to codex.
+	if a, ok := pickAgent(v8x, map[string]int{"claude": 0, "codex": 30}); !ok || a != "codex" {
+		t.Fatalf("spill to codex when claude capped: %q %v", a, ok)
+	}
+	// both exhausted => wait.
+	if _, ok := pickAgent(v8x, map[string]int{"claude": 0, "codex": 0}); ok {
+		t.Fatal("both exhausted should not pick")
+	}
+	// claude-only target never spills.
+	if _, ok := pickAgent(deno, map[string]int{"claude": 0, "codex": 30}); ok {
+		t.Fatal("claude-only target must not spill to codex")
+	}
+}
+
 func govCfg() Gov {
 	return Gov{Enabled: true, WeeklyCeiling: 92, Slack: 8, MaxActive: 16, MinActive: 1}
 }
