@@ -229,6 +229,13 @@ type Job struct {
 	// far too short for the worker to wake, decide, and run gh issue create.
 	FanoutNudgedAt time.Time `json:"fanout_nudged_at,omitempty"`
 	Track          tracker   `json:"track"`
+	// Misses counts consecutive ticks the agent was absent from a successful
+	// fleetStatus while its host was up. herdr's agent detection is screen-scrape
+	// based, so a live agent can transiently drop out of the list (mid-render,
+	// herdr load, just after a coordinator restart). Dropping on a single miss
+	// mass-respawns live agents on any such flicker; require deadMissThreshold
+	// consecutive misses before declaring an agent truly gone. Reset on presence.
+	Misses int `json:"misses,omitempty"`
 }
 
 type State struct {
@@ -1862,6 +1869,7 @@ func (c *Coord) tick(ctx context.Context) {
 	c.st.mu.Lock()
 	for n, j := range c.st.Jobs {
 		if _, alive := status[n]; alive {
+			j.Misses = 0 // present this tick — clear any flicker count
 			continue
 		}
 		if !up[j.Host] {
@@ -1872,6 +1880,14 @@ func (c *Coord) tick(ctx context.Context) {
 		}
 		if time.Since(j.SpawnedAt) < 3*time.Minute {
 			continue // freshly spawned/adopted — give herdr time to register the agent
+		}
+		// Debounce: herdr's screen-scrape agent detection can transiently omit a
+		// live agent (mid-render, herdr load, post-restart). Only declare it gone
+		// after deadMissThreshold consecutive absences so one flicker can't
+		// mass-respawn the host's live agents.
+		j.Misses++
+		if j.Misses < deadMissThreshold {
+			continue
 		}
 		dead = append(dead, deadJob{n: n, host: j.Host, ws: j.Workspace})
 		delete(c.st.Jobs, n)
@@ -2730,6 +2746,12 @@ func (c *Coord) partialMerge(ctx context.Context, j *Job) (ref string, refNum, p
 // fanoutGraceWindow is how long teardown waits after the fan-out nudge for the
 // worker to wake, decide, and open its sibling inbox issues. Generous on purpose:
 // the worker is an idle claude that must process a message and shell out to gh.
+// deadMissThreshold is how many consecutive ticks an agent must be absent from a
+// successful fleetStatus (host up, issue open, past the spawn grace) before
+// divybot declares it gone and respawns — debounce against herdr's screen-scrape
+// detection transiently dropping a live agent. At the 30s poll that's ~90s.
+const deadMissThreshold = 3
+
 const fanoutGraceWindow = 4 * time.Minute
 
 // fanoutGrace handles a teardown-candidate job (its inbox stub closed). If the PR
