@@ -78,6 +78,25 @@ type Host struct {
 	WorkdirRoot  string   `json:"workdir_root"` // where issue worktrees live
 	Capabilities []string `json:"capabilities"` // e.g. ["build-deno","windows"]
 	Capacity     int      `json:"capacity"`     // max concurrent agents
+	// Agents restricts which agents may be PLACED on this host (empty = all).
+	// codex's chatgpt-oauth TUI gets Cloudflare-challenged from datacenter IPs
+	// (gcp/vultr), so codex is pinned to residential hosts (mac) via ["claude"]
+	// on the datacenter boxes. claude auth is unaffected and runs anywhere.
+	Agents []string `json:"agents"`
+}
+
+// runsAgent reports whether this host is allowed to place the given agent.
+func (h Host) runsAgent(agent string) bool {
+	if len(h.Agents) == 0 {
+		return true
+	}
+	agent = accountKey(agent)
+	for _, a := range h.Agents {
+		if accountKey(a) == agent {
+			return true
+		}
+	}
+	return false
 }
 
 // Target maps an inbox-issue label to a work repo + which agent runs it.
@@ -2050,8 +2069,10 @@ func pickAgent(t Target, budget map[string]int) (string, bool) {
 	return "", false
 }
 
-// pickHost returns the least-loaded capable host with free capacity.
-func (c *Coord) pickHost(tgt Target) (Host, bool) {
+// pickHost returns the least-loaded host that has the target's capability, free
+// capacity, AND permits the given agent (codex is datacenter-CF-blocked, so it
+// only places on hosts that allow it — see Host.Agents).
+func (c *Coord) pickHost(tgt Target, agent string) (Host, bool) {
 	c.st.mu.Lock()
 	load := map[string]int{}
 	for _, j := range c.st.Jobs {
@@ -2061,6 +2082,9 @@ func (c *Coord) pickHost(tgt Target) (Host, bool) {
 	best, bestFree := "", 0
 	for name, h := range c.hosts {
 		if tgt.NeedCap != "" && !h.has(tgt.NeedCap) {
+			continue
+		}
+		if !h.runsAgent(agent) {
 			continue
 		}
 		if free := h.Capacity - load[name]; free > bestFree {
@@ -2259,11 +2283,12 @@ func (c *Coord) spawn(ctx context.Context, n int, is Issue, agent string) bool {
 	if !ok {
 		return false
 	}
-	host, ok := c.pickHost(tgt)
+	agent = accountKey(agent)
+	host, ok := c.pickHost(tgt, agent)
 	if !ok {
+		log.Printf("issue #%d: no host with free capacity for agent %s — deferring", n, agent)
 		return false
 	}
-	agent = accountKey(agent)
 
 	// 1. Push fresh creds before the agent starts.
 	actx, acancel := context.WithTimeout(ctx, 30*time.Second)

@@ -91,6 +91,20 @@ func TestPickAgentOverflow(t *testing.T) {
 	}
 }
 
+func TestHostRunsAgent(t *testing.T) {
+	all := Host{} // no restriction
+	claudeOnly := Host{Agents: []string{"claude"}}
+	if !all.runsAgent("codex") || !all.runsAgent("claude") {
+		t.Fatal("unrestricted host should run any agent")
+	}
+	if !claudeOnly.runsAgent("claude") || !claudeOnly.runsAgent("") {
+		t.Fatal("claude-only host should run claude (and default)")
+	}
+	if claudeOnly.runsAgent("codex") {
+		t.Fatal("claude-only host must reject codex (datacenter CF block)")
+	}
+}
+
 func govCfg() Gov {
 	return Gov{Enabled: true, WeeklyCeiling: 92, Slack: 8, MaxActive: 16, MinActive: 1}
 }
