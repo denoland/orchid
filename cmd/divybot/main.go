@@ -427,6 +427,28 @@ func (h Host) agentList(ctx context.Context) ([]AgentInfo, error) {
 	return r.Agents, nil
 }
 
+// agentStatusOf returns herdr's native detected status for one agent target
+// (idle|working|blocked|done|unknown), "" on error. Agent-agnostic and reliable
+// for claude AND opencode (both herdr-supported TUIs) — unlike scraping claude's
+// "bypass permissions" footer, which is invisible to opencode's TUI.
+func (h Host) agentStatusOf(ctx context.Context, target string) string {
+	out, err := h.herdr(ctx, "agent", "get", target)
+	if err != nil {
+		return ""
+	}
+	raw, err := herdrUnwrap(out)
+	if err != nil {
+		return ""
+	}
+	var r struct {
+		Agent AgentInfo `json:"agent"`
+	}
+	if json.Unmarshal(raw, &r) != nil {
+		return ""
+	}
+	return r.Agent.AgentStatus
+}
+
 // spawnAgent creates a DEDICATED single-pane workspace and launches a BARE agent
 // in its root pane (no clawpatrol). Each agent gets its own workspace — earlier,
 // `agent start` without an isolated workspace piled every agent into one (10+
@@ -505,9 +527,21 @@ func agentBareIdle(pane string) bool {
 // this retries (nudging Enter, then clearing and resending) until the goal
 // registers or the context expires.
 func (h Host) injectGoal(ctx context.Context, target, goal string) error {
-	// Wait for the TUI to render its input prompt (up to ~the ctx budget).
+	// Readiness/acceptance via herdr's native status — works for claude AND
+	// opencode. (The old "bypass permissions" pane scrape was claude-only and
+	// blind to opencode's TUI, so the wait loop never broke → it burned the whole
+	// ctx and the goal inject context-canceled.)
+	ready := func() bool {
+		st := h.agentStatusOf(ctx, target)
+		return st == "idle" || st == "done"
+	}
+	accepted := func() bool {
+		st := h.agentStatusOf(ctx, target)
+		return st == "working" || st == "blocked"
+	}
+	// Wait for the TUI to render + be ready for input.
 	for i := 0; i < 30; i++ {
-		if agentBareIdle(h.read(ctx, target, 6)) {
+		if ready() {
 			break
 		}
 		select {
@@ -530,26 +564,18 @@ func (h Host) injectGoal(ctx context.Context, target, goal string) error {
 			return ctx.Err()
 		case <-time.After(4 * time.Second):
 		}
-		if !agentBareIdle(h.read(ctx, target, 12)) {
-			return nil // busy → task accepted
+		if accepted() {
+			return nil // processing → task accepted
 		}
-		// Still at a bare prompt: the text may have landed but the Enter
-		// raced ahead of it. Nudge Enter once before a full resend.
+		// Text may have landed but the Enter raced ahead — nudge Enter, recheck.
 		_, _ = h.herdr(ctx, "pane", "send-keys", target, "Enter")
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(3 * time.Second):
 		}
-		if !agentBareIdle(h.read(ctx, target, 12)) {
+		if accepted() {
 			return nil
-		}
-		// Neither took: clear whatever's in the box and retry from scratch.
-		_, _ = h.herdr(ctx, "pane", "send-keys", target, "Escape")
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(1 * time.Second):
 		}
 	}
 	return fmt.Errorf("goal did not register after retries")
