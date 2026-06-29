@@ -2314,6 +2314,16 @@ git checkout -fB %s 2>/dev/null || { git reset --hard >/dev/null 2>&1 || true; g
 		"GIT_AUTHOR_EMAIL":    c.cfg.BotEmail,
 		"GIT_COMMITTER_NAME":  c.cfg.BotLogin,
 		"GIT_COMMITTER_EMAIL": c.cfg.BotEmail,
+		// Shared Rust compile cache across every issue dir + agent on the host.
+		// Each issue clones into its own workdir with a COLD target/, so without a
+		// shared cache every agent recompiles rusty_v8 + all deps from scratch
+		// (~1.7G of artifacts per issue). sccache (installed on every host) caches
+		// rustc objects host-wide, so a sibling's prior build warms the next.
+		// Bare name resolves via the login-shell PATH; concurrency-safe (object
+		// cache, not a shared target lock).
+		"RUSTC_WRAPPER":      "sccache",
+		"SCCACHE_DIR":        host.agentHome() + "/.cache/sccache",
+		"SCCACHE_CACHE_SIZE": "30G",
 	}
 	// Per-target shared memory: claude-native per-process override (no settings
 	// race between concurrent sessions). Points at the EXISTING per-target notes
