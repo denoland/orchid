@@ -361,6 +361,17 @@ func (h Host) runRemote(ctx context.Context, script string) (string, error) {
 	return run(ctx, "ssh", append(h.sshBase(), h.SSH, script)...)
 }
 
+// writeFile writes content to a path on the host via a quoted heredoc (no shell
+// expansion of the body). Used to stage an opencode goal file the agent reads.
+func (h Host) writeFile(ctx context.Context, path, content string) error {
+	script := fmt.Sprintf("mkdir -p %s && cat > %s <<'__DIVYBOT_EOF__'\n%s\n__DIVYBOT_EOF__\n",
+		shq(filepath.Dir(path)), shq(path), content)
+	if out, err := h.runRemote(ctx, script); err != nil {
+		return fmt.Errorf("writeFile %s: %v: %.80q", path, err, out)
+	}
+	return nil
+}
+
 // herdr runs `herdr <args>` on the host with HOME + PATH set for the socket.
 func (h Host) herdr(ctx context.Context, args ...string) (string, error) {
 	q := make([]string, len(args))
@@ -2506,12 +2517,26 @@ git checkout -fB %s 2>/dev/null || { git reset --hard >/dev/null 2>&1 || true; g
 	// idle with no task. injectGoal waits for the prompt, then confirms the
 	// send registered and retries.
 	goal := renderGoal(c.cfg.Inbox, tgt.Repo, tgt.Label, is.Title, is.Body, workdir, branch, n)
+	inject := goal
+	if agent == "codex" {
+		// opencode (the codex launcher) will NOT submit a large multi-line pasted
+		// prompt on Enter — it pastes into the input box but never submits, leaving
+		// the agent idle with the goal stuck unsent. Short prompts submit fine. So
+		// stage the full goal to a file and inject a SHORT pointer; opencode reads
+		// the file for the real assignment.
+		goalFile := fmt.Sprintf("/tmp/divybot-goal-%d.md", n)
+		if err := host.writeFile(ctx, goalFile, goal); err != nil {
+			log.Printf("issue #%d: stage opencode goal failed: %v", n, err)
+		} else {
+			inject = fmt.Sprintf("Read the file %s in full — it is your complete assignment for this session. Carry it out end to end: implement the change, commit, and open a PR exactly as it instructs. Begin now.", goalFile)
+		}
+	}
 	target := pane
 	if target == "" {
 		target = label
 	}
 	gctx, gcancel := context.WithTimeout(ctx, 120*time.Second)
-	if err := host.injectGoal(gctx, target, goal); err != nil {
+	if err := host.injectGoal(gctx, target, inject); err != nil {
 		log.Printf("issue #%d: goal inject failed: %v", n, err)
 	}
 	gcancel()
