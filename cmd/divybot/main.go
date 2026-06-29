@@ -785,6 +785,13 @@ if [ -d "$R/skills" ]; then mkdir -p "$HOME/.claude/skills"; cp -a "$R/skills/."
 # codex has no native skill discovery — point its global AGENTS.md at the mirrored
 # skill files (idempotent via marker; runs only if ~/.codex exists).
 if [ -d "$HOME/.codex" ] && ! grep -qs 'divybot-skills' "$HOME/.codex/AGENTS.md" 2>/dev/null; then printf '\n<!-- divybot-skills -->\nReusable skills live in ~/.claude/skills/<name>/SKILL.md. Before starting, scan those SKILL.md files; if one matches the task (e.g. windows-deno-desktop-testing for deno desktop / native-window issues), follow it.\n' >> "$HOME/.codex/AGENTS.md"; fi
+# codex on Linux gets Cloudflare-challenged on the apps/plugins/tool_suggest
+# DISCOVERY endpoints — its rustls TLS fingerprint is flagged as a bot on
+# chatgpt.com (openai/codex#17860, #21899), wedging the interactive TUI on
+# datacenter hosts (gcp/vultr) while the inference API itself is fine. Disable
+# discovery so the TUI starts clean; keeps ChatGPT-plan auth (no API key).
+# Idempotent via marker — runs once per host.
+if [ -d "$HOME/.codex" ] && command -v codex >/dev/null 2>&1 && ! grep -qs 'divybot-codex-cf' "$HOME/.codex/config.toml" 2>/dev/null; then for f in apps plugins tool_suggest; do codex features disable "$f" >/dev/null 2>&1 || true; done; printf '\n# divybot-codex-cf: discovery disabled (cloudflare TLS-fingerprint workaround)\n' >> "$HOME/.codex/config.toml"; fi
 `,
 		shq(home), shq(clone), shq(m.Branch), shq(repoURL), shq(repoURL),
 		shq(bot), shq(email), shq(memdir), shq(memdir), shq(memdir), shq(m.Branch))
