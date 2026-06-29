@@ -21,12 +21,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,21 +93,28 @@ type Target struct {
 	AutoMerge bool `json:"automerge"`
 }
 
-// Gov holds the weekly-quota pacing knobs (the governor — paces against the Max
-// subscription so the swarm never blows the weekly quota).
+// Gov holds the quota-pacing knobs (the governor — paces against the Max
+// subscription / codex plan so the swarm spends the budget evenly instead of
+// blowing the window early). It reads each account's REAL rate-limit meter
+// (claude's statusline rate_limits / codex's rollout token_count) and runs a
+// burn-rate adaptive cap PER ACCOUNT, so claude and codex pace independently.
 type Gov struct {
-	Enabled      bool    `json:"enabled"`
-	WeeklyCeiling float64 `json:"weekly_ceiling_pct"` // pause new work above this used% (default 92)
-	Slack        float64 `json:"slack_pct"`          // throttle to MinActive within this of the ceiling (default 8)
-	MaxActive    int     `json:"max_active"`         // global cap on concurrent agents (default 16)
-	MinActive    int     `json:"min_active"`         // never fully stall under budget (default 1)
-	// WeeklyTokenBudget paces against claude's OWN transcript token counts (no
-	// clawpatrol, no API key): the governor sums input+output+cache-creation
-	// tokens across the fleet's transcripts over the rolling 7 days and treats
-	// used/budget as the weekly utilization. Set it to your Max plan's effective
-	// weekly token allowance. 0 => token-budget pacing off (static cap).
-	WeeklyTokenBudget int64 `json:"weekly_token_budget"`
+	Enabled       bool    `json:"enabled"`
+	WeeklyCeiling float64 `json:"weekly_ceiling_pct"` // hard-pause new work at/above this used% (default 92)
+	Slack         float64 `json:"slack_pct"`          // floor the cap to MinActive within this of the ceiling (default 8)
+	MaxActive     int     `json:"max_active"`         // ceiling for the adaptive per-account cap (default 16)
+	MinActive     int     `json:"min_active"`         // never fully stall while under budget (default 1)
+	// Burn-rate estimator windows + sampling cadence (mirrors the old orchid
+	// governor). RateWindow is the weekly-bucket burn lookback, FiveRateWindow
+	// the 5h-bucket lookback, SampleInterval how often the live meter is read.
+	RateWindow     string `json:"rate_window"`      // default 3h
+	FiveRateWindow string `json:"five_rate_window"` // default 45m
+	SampleInterval string `json:"sample_interval"`  // default 90s
 }
+
+func (g Gov) rateWindowDur() time.Duration     { return durOr(g.RateWindow, 3*time.Hour) }
+func (g Gov) fiveRateWindowDur() time.Duration { return durOr(g.FiveRateWindow, 45*time.Minute) }
+func (g Gov) sampleIntervalDur() time.Duration { return durOr(g.SampleInterval, 90*time.Second) }
 
 func (c *Config) withDefaults() {
 	if c.PollInterval == "" {
@@ -203,15 +212,23 @@ type State struct {
 	// Continued counts how many CONTINUATION stubs we've re-filed per upstream ref
 	// ("owner/repo#N"), so a never-closing upstream can't churn forever. Persisted.
 	Continued map[string]int `json:"continued"`
-	path      string
+	// QuotaSamples is the governor's per-account burn-rate time series (account =>
+	// readings), persisted so the burn estimate survives a restart instead of
+	// going blind for a full RateWindow. PrevCap is each account's last adaptive
+	// cap, the slew anchor across ticks/restarts.
+	QuotaSamples map[string][]QuotaSample `json:"quota_samples"`
+	PrevCap      map[string]int           `json:"prev_cap"`
+	path         string
 }
 
 func loadState(path string) *State {
-	s := &State{Jobs: map[int]*Job{}, Continued: map[string]int{}, path: path}
+	s := &State{Jobs: map[int]*Job{}, Continued: map[string]int{}, QuotaSamples: map[string][]QuotaSample{}, PrevCap: map[string]int{}, path: path}
 	if b, err := os.ReadFile(path); err == nil {
 		var raw struct {
-			Jobs      map[int]*Job   `json:"jobs"`
-			Continued map[string]int `json:"continued"`
+			Jobs         map[int]*Job             `json:"jobs"`
+			Continued    map[string]int           `json:"continued"`
+			QuotaSamples map[string][]QuotaSample `json:"quota_samples"`
+			PrevCap      map[string]int           `json:"prev_cap"`
 		}
 		if json.Unmarshal(b, &raw) == nil {
 			if raw.Jobs != nil {
@@ -219,6 +236,12 @@ func loadState(path string) *State {
 			}
 			if raw.Continued != nil {
 				s.Continued = raw.Continued
+			}
+			if raw.QuotaSamples != nil {
+				s.QuotaSamples = raw.QuotaSamples
+			}
+			if raw.PrevCap != nil {
+				s.PrevCap = raw.PrevCap
 			}
 		}
 	}
@@ -229,9 +252,11 @@ func (s *State) save() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, err := json.MarshalIndent(struct {
-		Jobs      map[int]*Job   `json:"jobs"`
-		Continued map[string]int `json:"continued"`
-	}{s.Jobs, s.Continued}, "", "  ")
+		Jobs         map[int]*Job             `json:"jobs"`
+		Continued    map[string]int           `json:"continued"`
+		QuotaSamples map[string][]QuotaSample `json:"quota_samples"`
+		PrevCap      map[string]int           `json:"prev_cap"`
+	}{s.Jobs, s.Continued, s.QuotaSamples, s.PrevCap}, "", "  ")
 	if err != nil {
 		return
 	}
@@ -951,20 +976,20 @@ type PRView struct {
 
 func ghPRView(ctx context.Context, repo string, n int) (*PRView, error) {
 	var raw struct {
-		Number          int    `json:"number"`
-		Mergeable       string `json:"mergeable"`
-		IsDraft         bool   `json:"isDraft"`
-		HeadRefOid      string `json:"headRefOid"`
-		Reviews         []struct {
-			ID     string `json:"id"`
+		Number     int    `json:"number"`
+		Mergeable  string `json:"mergeable"`
+		IsDraft    bool   `json:"isDraft"`
+		HeadRefOid string `json:"headRefOid"`
+		Reviews    []struct {
+			ID     string                 `json:"id"`
 			Author struct{ Login string } `json:"author"`
-			Body   string `json:"body"`
-			State  string `json:"state"`
+			Body   string                 `json:"body"`
+			State  string                 `json:"state"`
 		} `json:"reviews"`
 		Comments []struct {
-			ID     string `json:"id"`
+			ID     string                 `json:"id"`
 			Author struct{ Login string } `json:"author"`
-			Body   string `json:"body"`
+			Body   string                 `json:"body"`
 		} `json:"comments"`
 		StatusCheckRollup []struct {
 			Name       string `json:"name"`
@@ -995,7 +1020,7 @@ func ghPRView(ctx context.Context, repo string, n int) (*PRView, error) {
 
 func ghPRByBranch(ctx context.Context, repo, branch, author string) int {
 	var raw []struct {
-		Number int    `json:"number"`
+		Number int                    `json:"number"`
 		Author struct{ Login string } `json:"author"`
 	}
 	if err := ghJSON(ctx, &raw, "pr", "list", "--repo", repo, "--head", branch,
@@ -1100,65 +1125,413 @@ func diff(t *tracker, v *PRView, bot string) (lines []string, changed bool) {
 
 // ============================ governor ============================
 
-// quota holds the live rate-limit reading for one account.
-type quota struct {
-	used5h  float64
-	used7d  float64
-	reset7d time.Time
-	at      time.Time
-	ok      bool
+// RateLimit mirrors the rate-limit meter shape shared by claude (statusline
+// rate_limits) and codex (rollout token_count): a used_percentage 0-100 plus a
+// unix-second reset. The same shape covers both the 5h and weekly windows.
+type RateLimit struct {
+	UsedPct  float64
+	ResetsAt int64
 }
 
-// tokenSumScript sums input+output+cache-creation tokens from a host's claude
-// transcripts touched in the last 7 days (cache-read is ~free, excluded). Pure
-// local read of claude's own JSONL — no API, no clawpatrol.
-func (h Host) tokenSumScript() string {
+// quota is one account's freshest live meter reading (both windows).
+type quota struct {
+	five  RateLimit
+	seven RateLimit
+	ok    bool
+	at    time.Time
+}
+
+// QuotaSample is one persisted reading of both buckets at a wall instant — the
+// burn-rate estimator's only time-series input. *Pct are used% 0-100; Ts and
+// the *Reset fields are unix seconds.
+type QuotaSample struct {
+	Account    string  `json:"account"`
+	Ts         int64   `json:"ts"`
+	FivePct    float64 `json:"five_pct"`
+	FiveReset  int64   `json:"five_reset"`
+	SevenPct   float64 `json:"seven_pct"`
+	SevenReset int64   `json:"seven_reset"`
+}
+
+// Governor estimator/controller numerics (fixed — describe the control law, not
+// policy). Ported from the old orchid governor.
+const (
+	govMinSamples     = 3                // min kept samples to estimate a slope
+	govMinSpan        = 10 * time.Minute // and min wall span
+	govEpsilon        = 5 * time.Minute  // near-reset clamp on remaining time
+	govMinRate        = 0.05             // %/h divide-guard
+	govCapDeadband    = 0.15             // |normErr| within this => hold cap (braking hysteresis)
+	govSlewPerTick    = 1                // cap moves at most this many slots per decide
+	govEngageFloorPct = 10.0             // below this used%, the soft governor relaxes (signal too noisy)
+	govSampleRetain   = 6 * time.Hour    // trim persisted samples older than this
+)
+
+func govHours(d time.Duration) float64 { return float64(d) / float64(time.Hour) }
+
+// accountKey normalizes a job/target agent to its pacing account.
+func accountKey(agent string) string {
+	if agent == "" {
+		return "claude"
+	}
+	return agent
+}
+
+// accounts returns the distinct pacing accounts across all targets.
+func (c *Config) accounts() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range c.Targets {
+		a := accountKey(t.Agent)
+		if !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"claude"}
+	}
+	return out
+}
+
+// claudeQuotaScript prints "<mtime> <json-line>" for the host's newest claude
+// statusline event (the statusLine hook tees full payloads — incl. rate_limits
+// — to ~/.claude/statusline.jsonl). Empty when no statusline feed exists here.
+func (h Host) claudeQuotaScript() string {
 	home := h.agentHome()
 	return fmt.Sprintf(`export HOME=%s
-find "$HOME/.claude/projects" -name '*.jsonl' -mtime -7 2>/dev/null -print0 \
- | xargs -0 cat 2>/dev/null \
- | jq -r 'try (.message.usage | (.input_tokens // 0)+(.output_tokens // 0)+(.cache_creation_input_tokens // 0)) catch empty' 2>/dev/null \
- | awk '{s+=$1} END{print s+0}'`, shq(home))
+f="$HOME/.claude/statusline.jsonl"
+[ -f "$f" ] || exit 0
+m=$(date -r "$f" +%%s 2>/dev/null || stat -c %%Y "$f" 2>/dev/null || echo 0)
+printf '%%s ' "$m"; tail -n 1 "$f"`, shq(home))
 }
 
-// sampleQuota computes weekly utilization from the fleet's transcript token sums
-// vs the configured budget. No clawpatrol, no API key — reads claude's own data.
-func (c *Coord) sampleQuota(ctx context.Context) quota {
-	budget := c.cfg.Governor.WeeklyTokenBudget
-	if budget <= 0 {
-		return quota{}
+// codexQuotaScript prints "<mtime> <json-line>" for the newest token_count event
+// in the host's most-recent codex rollout — codex's account meter lives in
+// payload.rate_limits.{primary,secondary} of those events.
+func (h Host) codexQuotaScript() string {
+	home := h.agentHome()
+	return fmt.Sprintf(`export HOME=%s
+d="$HOME/.codex/sessions"
+[ -d "$d" ] || exit 0
+f=$(find "$d" -type f -name '*.jsonl' -printf '%%T@ %%p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+[ -n "$f" ] || exit 0
+m=$(date -r "$f" +%%s 2>/dev/null || stat -c %%Y "$f" 2>/dev/null || echo 0)
+l=$(awk '/token_count/ && /rate_limits/{x=$0} END{if(x)print x}' "$f")
+[ -n "$l" ] || exit 0
+printf '%%s ' "$m"; printf '%%s' "$l"`, shq(home))
+}
+
+// parseHostQuota reads one host's "<mtime> <json>" line for an account into a
+// reading (ok=false when blank/unparseable/empty meter). mtime is the recency
+// key used to pick the freshest host when an account spans several.
+func parseHostQuota(account, out string) (five, seven RateLimit, mtime int64, ok bool) {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return
 	}
-	var total int64
-	for _, h := range c.cfg.Hosts {
-		cctx, cancel := context.WithTimeout(ctx, 40*time.Second)
-		out, err := h.runRemote(cctx, h.tokenSumScript())
-		cancel()
-		if err != nil {
+	sp := strings.IndexByte(out, ' ')
+	if sp <= 0 {
+		return
+	}
+	mtime, _ = strconv.ParseInt(out[:sp], 10, 64)
+	line := strings.TrimSpace(out[sp+1:])
+	if account == "codex" {
+		var e struct {
+			Payload struct {
+				Type       string `json:"type"`
+				RateLimits *struct {
+					Primary *struct {
+						UsedPercent   float64 `json:"used_percent"`
+						WindowMinutes int     `json:"window_minutes"`
+						ResetsAt      int64   `json:"resets_at"`
+					} `json:"primary"`
+					Secondary *struct {
+						UsedPercent   float64 `json:"used_percent"`
+						WindowMinutes int     `json:"window_minutes"`
+						ResetsAt      int64   `json:"resets_at"`
+					} `json:"secondary"`
+				} `json:"rate_limits"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal([]byte(line), &e) != nil || e.Payload.RateLimits == nil {
+			return
+		}
+		rl := e.Payload.RateLimits
+		if w := rl.Primary; w != nil && w.ResetsAt != 0 {
+			r := RateLimit{UsedPct: w.UsedPercent, ResetsAt: w.ResetsAt}
+			if w.WindowMinutes <= 600 {
+				five = r
+			} else {
+				seven = r
+			}
+		}
+		if w := rl.Secondary; w != nil && w.ResetsAt != 0 {
+			r := RateLimit{UsedPct: w.UsedPercent, ResetsAt: w.ResetsAt}
+			if w.WindowMinutes <= 600 {
+				five = r
+			} else {
+				seven = r
+			}
+		}
+	} else {
+		var e struct {
+			RateLimits struct {
+				FiveHour struct {
+					UsedPct  float64 `json:"used_percentage"`
+					ResetsAt int64   `json:"resets_at"`
+				} `json:"five_hour"`
+				SevenDay struct {
+					UsedPct  float64 `json:"used_percentage"`
+					ResetsAt int64   `json:"resets_at"`
+				} `json:"seven_day"`
+			} `json:"rate_limits"`
+		}
+		if json.Unmarshal([]byte(line), &e) != nil {
+			return
+		}
+		five = RateLimit{UsedPct: e.RateLimits.FiveHour.UsedPct, ResetsAt: e.RateLimits.FiveHour.ResetsAt}
+		seven = RateLimit{UsedPct: e.RateLimits.SevenDay.UsedPct, ResetsAt: e.RateLimits.SevenDay.ResetsAt}
+	}
+	if five.ResetsAt == 0 && seven.ResetsAt == 0 {
+		return // empty meter
+	}
+	ok = true
+	return
+}
+
+// sampleQuota reads each account's REAL rate-limit meter off the fleet. Rate
+// limits are account-global (the fleet shares one oauth per agent), so for each
+// account it takes the freshest reading across hosts. claude reads the
+// statusline tee; codex reads the rollout token_count. No clawpatrol, no API
+// key, no settings.json mutation — pure reads of the agents' own on-disk data.
+func (c *Coord) sampleQuota(ctx context.Context) map[string]quota {
+	out := map[string]quota{}
+	best := map[string]int64{} // account => freshest mtime seen
+	for _, acct := range c.cfg.accounts() {
+		for _, h := range c.cfg.Hosts {
+			var script string
+			if acct == "codex" {
+				script = h.codexQuotaScript()
+			} else {
+				script = h.claudeQuotaScript()
+			}
+			cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+			raw, err := h.runRemote(cctx, script)
+			cancel()
+			if err != nil {
+				continue
+			}
+			five, seven, mtime, ok := parseHostQuota(acct, raw)
+			if !ok {
+				continue
+			}
+			if cur, seen := best[acct]; !seen || mtime >= cur {
+				best[acct] = mtime
+				out[acct] = quota{five: five, seven: seven, ok: true, at: time.Now()}
+			}
+		}
+	}
+	return out
+}
+
+// govDecision is the per-account verdict for one tick.
+type govDecision struct {
+	cap          int
+	binding      string // "weekly" | "5h" | ""
+	overPace     bool
+	burnWeekly   float64
+	targetWeekly float64
+	burnFive     float64
+	targetFive   float64
+	projectedEnd float64 // projected end-of-week used% at current weekly burn
+}
+
+// burnRatePerHour estimates one bucket's consumption rate (used% per hour) from
+// a sample window. Returns ok=false (=> that bucket adds no constraint) on
+// thin/degenerate data. Reset-equality drops pre-rollover points; a robust
+// Theil-Sen median slope rejects single outliers. Ported from old orchid.
+func burnRatePerHour(samples []QuotaSample, now time.Time, window time.Duration,
+	pct func(QuotaSample) float64, reset func(QuotaSample) int64, curReset int64) (rate float64, ok bool) {
+
+	if curReset == 0 || window <= 0 {
+		return 0, false
+	}
+	cutoff := now.Unix() - int64(window/time.Second)
+	type pt struct{ t, pct float64 }
+	var kept []pt
+	for _, s := range samples {
+		if s.Ts < cutoff || s.Ts > now.Unix() || reset(s) != curReset {
 			continue
 		}
-		if n, e := strconv.ParseInt(strings.TrimSpace(out), 10, 64); e == nil {
-			total += n
+		kept = append(kept, pt{t: float64(s.Ts) / 3600.0, pct: pct(s)})
+	}
+	if len(kept) < govMinSamples {
+		return 0, false
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].t < kept[j].t })
+	// Keep only the most-recent monotone-non-decreasing segment.
+	start := 0
+	for i := len(kept) - 1; i > 0; i-- {
+		if kept[i-1].pct > kept[i].pct {
+			start = i
+			break
 		}
 	}
-	return quota{used7d: float64(total) / float64(budget) * 100, ok: total > 0, at: time.Now()}
+	seg := kept[start:]
+	if len(seg) < govMinSamples {
+		return 0, false
+	}
+	span := seg[len(seg)-1].t - seg[0].t
+	if span < govHours(govMinSpan) {
+		return 0, false
+	}
+	var slopes []float64
+	for i := 0; i < len(seg); i++ {
+		for j := i + 1; j < len(seg); j++ {
+			if dt := seg[j].t - seg[i].t; dt > 0 {
+				slopes = append(slopes, (seg[j].pct-seg[i].pct)/dt)
+			}
+		}
+	}
+	if len(slopes) < 3 {
+		rate = (seg[len(seg)-1].pct - seg[0].pct) / span
+	} else {
+		sort.Float64s(slopes)
+		m := len(slopes)
+		if m%2 == 1 {
+			rate = slopes[m/2]
+		} else {
+			rate = (slopes[m/2-1] + slopes[m/2]) / 2
+		}
+	}
+	if rate < 0 {
+		rate = 0
+	}
+	return rate, true
 }
 
-// govCap returns the max concurrent agents the governor allows right now. Slim
-// threshold control (the proportional version lived in governor.go): pause new
-// work above the weekly ceiling, throttle to MinActive within the slack band,
-// otherwise MaxActive. Fail-open (MaxActive) when no quota reading.
-func (g Gov) govCap(q quota) int {
-	if !g.Enabled || !q.ok {
-		return g.MaxActive
+// targetRatePerHour is the burn rate (%/h) that lands EXACTLY on ceilingPct at
+// reset, from the CURRENT used% and remaining time. Recomputing each tick folds
+// position error into the setpoint (integral-like, no wind-up).
+func targetRatePerHour(now time.Time, curReset int64, usedNow, ceilingPct float64) float64 {
+	remaining := time.Unix(curReset, 0).Sub(now)
+	if remaining <= govEpsilon {
+		remaining = govEpsilon
 	}
-	if q.used7d >= g.WeeklyCeiling {
-		return 0
+	budget := ceilingPct - usedNow
+	if budget < 0 {
+		budget = 0
 	}
-	if q.used7d >= g.WeeklyCeiling-g.Slack {
-		return g.MinActive
-	}
-	return g.MaxActive
+	return budget / govHours(remaining)
 }
+
+// controlBucketCap is the cap control law (§1c) for one bucket: asymmetric
+// deadband + ±slew. Growth (under pace) isn't suppressed so the cap recovers
+// real headroom; braking keeps a deadband as anti-noise hysteresis.
+func controlBucketCap(burn, target float64, active, prevCap, minActive, maxActive int) int {
+	desiredRaw := float64(active) * (target / math.Max(burn, govMinRate))
+	normErr := (burn - target) / math.Max(target, govMinRate)
+	lo, hi := float64(prevCap-govSlewPerTick), float64(prevCap+govSlewPerTick)
+	var newCap float64
+	switch {
+	case normErr < 0, normErr > govCapDeadband:
+		newCap = math.Max(lo, math.Min(hi, desiredRaw))
+	default:
+		newCap = float64(prevCap)
+	}
+	c := int(math.Round(newCap))
+	if c < minActive {
+		c = minActive
+	}
+	if c > maxActive {
+		c = maxActive
+	}
+	return c
+}
+
+// decide runs the per-account burn-rate controller. It fails open (cap =
+// MaxActive) when the governor is off, the meter is unread, or both buckets are
+// thin-data — so a missing/early meter never starves an account. A hard gate
+// pauses (cap 0) at/above the ceiling as the binary safety floor.
+func (g Gov) decide(now time.Time, q quota, samples []QuotaSample, active, prevCap int) govDecision {
+	if !g.Enabled || !q.ok {
+		return govDecision{cap: g.MaxActive}
+	}
+	// Hard safety floor: at/above the ceiling on either window, pause new work.
+	if q.seven.ResetsAt != 0 && q.seven.UsedPct >= g.WeeklyCeiling {
+		return govDecision{cap: 0, binding: "weekly", overPace: true, projectedEnd: q.seven.UsedPct}
+	}
+	if q.five.ResetsAt != 0 && q.five.UsedPct >= g.WeeklyCeiling {
+		return govDecision{cap: 0, binding: "5h", overPace: true, projectedEnd: q.seven.UsedPct}
+	}
+	if prevCap <= 0 || prevCap >= g.MaxActive {
+		prevCap = g.MaxActive // sane slew anchor on first tick / restart
+	}
+	min, max, ceil := g.MinActive, g.MaxActive, g.WeeklyCeiling
+
+	d := govDecision{cap: math.MaxInt, projectedEnd: q.seven.UsedPct}
+	consider := func(window string, rl RateLimit, w time.Duration, pct func(QuotaSample) float64, reset func(QuotaSample) int64) (burn, target float64, used bool) {
+		if rl.ResetsAt == 0 {
+			return
+		}
+		inBand := rl.UsedPct >= ceil-g.Slack // within slack of the ceiling
+		burn, ok := burnRatePerHour(samples, now, w, pct, reset, rl.ResetsAt)
+		// Act when we have a usable burn estimate OR we're already in the slack
+		// band (the static floor below protects a hot window immediately, before
+		// enough samples accumulate to estimate burn — e.g. right after start).
+		if !ok && !inBand {
+			return
+		}
+		cap := max
+		if ok {
+			target = targetRatePerHour(now, rl.ResetsAt, rl.UsedPct, ceil)
+			if !relaxBucket(rl.UsedPct) {
+				cap = controlBucketCap(burn, target, active, prevCap, min, max)
+			}
+		}
+		// Static slack-band floor (the old binary gate): inside the band, hold the
+		// cap at MinActive regardless of burn confidence.
+		if inBand && cap > min {
+			cap = min
+		}
+		if cap < d.cap {
+			d.cap, d.binding = cap, window
+		}
+		return burn, target, ok
+	}
+
+	if b, t, used := consider("weekly", q.seven, g.rateWindowDur(),
+		func(s QuotaSample) float64 { return s.SevenPct },
+		func(s QuotaSample) int64 { return s.SevenReset }); used {
+		d.burnWeekly, d.targetWeekly = b, t
+		rem := time.Unix(q.seven.ResetsAt, 0).Sub(now)
+		if rem < 0 {
+			rem = 0
+		}
+		d.projectedEnd = q.seven.UsedPct + b*govHours(rem)
+	}
+	if b, t, used := consider("5h", q.five, g.fiveRateWindowDur(),
+		func(s QuotaSample) float64 { return s.FivePct },
+		func(s QuotaSample) int64 { return s.FiveReset }); used {
+		d.burnFive, d.targetFive = b, t
+	}
+
+	if d.cap == math.MaxInt {
+		return govDecision{cap: g.MaxActive, projectedEnd: q.seven.UsedPct} // both buckets thin => fail open
+	}
+	switch d.binding {
+	case "weekly":
+		d.overPace = d.burnWeekly > d.targetWeekly
+	case "5h":
+		d.overPace = d.burnFive > d.targetFive
+	}
+	return d
+}
+
+// relaxBucket: below the engage floor the proactive governor reads quantization
+// noise as burn, so leave the cap uncapped — the hard gate still backstops the
+// real ceiling and the fast 5h bucket engages on any genuine burst.
+func relaxBucket(used float64) bool { return used < govEngageFloorPct }
 
 // ============================ coordinator ============================
 
@@ -1170,7 +1543,7 @@ type Coord struct {
 	dry   bool // dry-run: log spawn/adopt decisions, take no spawning action
 	gov   struct {
 		mu sync.Mutex
-		q  quota
+		q  map[string]quota // freshest live meter reading per account
 	}
 }
 
@@ -1314,15 +1687,57 @@ func (c *Coord) governorLoop(ctx context.Context) {
 	if !c.cfg.Governor.Enabled {
 		return
 	}
-	t := time.NewTicker(5 * time.Minute)
+	t := time.NewTicker(c.cfg.Governor.sampleIntervalDur())
 	defer t.Stop()
 	for {
-		q := c.sampleQuota(ctx)
-		if q.ok {
+		qs := c.sampleQuota(ctx)
+		now := time.Now()
+		if len(qs) > 0 {
 			c.gov.mu.Lock()
-			c.gov.q = q
+			c.gov.q = qs
 			c.gov.mu.Unlock()
-			log.Printf("governor: weekly %.0f%% used / 5h %.0f%% → cap %d", q.used7d, q.used5h, c.cfg.Governor.govCap(q))
+			// Append fresh readings to each account's burn-rate ring + trim.
+			c.st.mu.Lock()
+			if c.st.QuotaSamples == nil {
+				c.st.QuotaSamples = map[string][]QuotaSample{}
+			}
+			for a, q := range qs {
+				if !q.ok {
+					continue
+				}
+				ring := append(c.st.QuotaSamples[a], QuotaSample{
+					Account: a, Ts: now.Unix(),
+					FivePct: q.five.UsedPct, FiveReset: q.five.ResetsAt,
+					SevenPct: q.seven.UsedPct, SevenReset: q.seven.ResetsAt,
+				})
+				cutoff := now.Add(-govSampleRetain).Unix()
+				trimmed := ring[:0]
+				for _, s := range ring {
+					if s.Ts >= cutoff {
+						trimmed = append(trimmed, s)
+					}
+				}
+				c.st.QuotaSamples[a] = trimmed
+			}
+			samples := c.st.QuotaSamples
+			active := map[string]int{}
+			for _, j := range c.st.Jobs {
+				active[accountKey(j.Agent)]++
+			}
+			prev := map[string]int{}
+			for a, v := range c.st.PrevCap {
+				prev[a] = v
+			}
+			c.st.mu.Unlock()
+			for a, q := range qs {
+				if !q.ok {
+					continue
+				}
+				d := c.cfg.Governor.decide(now, q, samples[a], active[a], prev[a])
+				log.Printf("governor[%s]: weekly %.0f%% (burn %.2f/h, target %.2f/h) / 5h %.0f%% → cap %d active %d (binding %q, projEnd %.0f%%)",
+					a, q.seven.UsedPct, d.burnWeekly, d.targetWeekly, q.five.UsedPct, d.cap, active[a], d.binding, d.projectedEnd)
+			}
+			c.st.save()
 		}
 		select {
 		case <-ctx.Done():
@@ -1332,11 +1747,29 @@ func (c *Coord) governorLoop(ctx context.Context) {
 	}
 }
 
-func (c *Coord) curCap() int {
+// curCaps returns the adaptive admission cap per account and advances each
+// account's PrevCap slew anchor. Called once per poll tick.
+func (c *Coord) curCaps() map[string]int {
+	now := time.Now()
 	c.gov.mu.Lock()
-	q := c.gov.q
+	qs := c.gov.q
 	c.gov.mu.Unlock()
-	return c.cfg.Governor.govCap(q)
+	caps := map[string]int{}
+	c.st.mu.Lock()
+	defer c.st.mu.Unlock()
+	if c.st.PrevCap == nil {
+		c.st.PrevCap = map[string]int{}
+	}
+	active := map[string]int{}
+	for _, j := range c.st.Jobs {
+		active[accountKey(j.Agent)]++
+	}
+	for _, a := range c.cfg.accounts() {
+		d := c.cfg.Governor.decide(now, qs[a], c.st.QuotaSamples[a], active[a], c.st.PrevCap[a])
+		caps[a] = d.cap
+		c.st.PrevCap[a] = d.cap
+	}
+	return caps
 }
 
 func (c *Coord) activeHosts() []Host {
@@ -1436,12 +1869,20 @@ func (c *Coord) tick(ctx context.Context) {
 		ccancel()
 	}
 
-	// Admission budget = governor cap − currently running.
-	cap := c.curCap()
+	// Admission budget = per-account governor cap − that account's running count.
+	// claude and codex pace independently against their own real meters, so a hot
+	// claude window never throttles codex (and vice-versa) — proper agent routing.
+	caps := c.curCaps()
 	c.st.mu.Lock()
-	running := len(c.st.Jobs)
+	running := map[string]int{}
+	for _, j := range c.st.Jobs {
+		running[accountKey(j.Agent)]++
+	}
 	c.st.mu.Unlock()
-	budget := cap - running
+	budget := map[string]int{}
+	for a, cp := range caps {
+		budget[a] = cp - running[a]
+	}
 
 	for n, is := range open {
 		c.st.mu.Lock()
@@ -1456,16 +1897,17 @@ func (c *Coord) tick(ctx context.Context) {
 			c.supervise(ctx, n, j2, status)
 			continue
 		}
-		if budget <= 0 {
+		acct := accountKey(c.agentForIssue(is))
+		if budget[acct] <= 0 {
 			continue
 		}
 		if c.dry {
-			log.Printf("issue #%d: would spawn (dry-run)", n)
-			budget--
+			log.Printf("issue #%d: would spawn %s (dry-run)", n, acct)
+			budget[acct]--
 			continue
 		}
 		if c.spawn(ctx, n, is) {
-			budget--
+			budget[acct]--
 		}
 	}
 	c.st.save()
@@ -1552,6 +1994,14 @@ func (c *Coord) targetFor(is Issue) (Target, bool) {
 		}
 	}
 	return Target{}, false
+}
+
+// agentForIssue is the agent (claude/codex) the issue's target routes to.
+func (c *Coord) agentForIssue(is Issue) string {
+	if t, ok := c.targetFor(is); ok {
+		return t.Agent
+	}
+	return "claude"
 }
 
 // pickHost returns the least-loaded capable host with free capacity.
@@ -2024,6 +2474,7 @@ func (c *Coord) pollPR(ctx context.Context, n int, j *Job, host Host, status str
 //     `gh pr ready` so the loop can merge it;
 //   - non-draft with FAILED checks: CI is red and the worker isn't re-engaging →
 //     hand it the failing check names so it fixes + pushes.
+//
 // A PR with only pending checks, or green+non-draft (already merging), returns "".
 func stuckPRNudge(v *PRView) string {
 	if v.IsDraft {

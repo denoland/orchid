@@ -48,6 +48,9 @@
     "weekly_ceiling_pct": 92,
     "slack_pct": 8,
     "max_active": 16,
-    "min_active": 1
+    "min_active": 1,
+    "rate_window": "3h",
+    "five_rate_window": "45m",
+    "sample_interval": "90s"
   }
 }
