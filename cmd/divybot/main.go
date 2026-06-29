@@ -427,6 +427,28 @@ func (h Host) agentList(ctx context.Context) ([]AgentInfo, error) {
 	return r.Agents, nil
 }
 
+// agentStatusOf returns herdr's native detected status for one agent target
+// (idle|working|blocked|done|unknown), "" on error. Agent-agnostic: herdr's
+// per-agent detection manifests cover claude AND codex — unlike scraping a
+// claude-only footer string, which is blind to codex.
+func (h Host) agentStatusOf(ctx context.Context, target string) string {
+	out, err := h.herdr(ctx, "agent", "get", target)
+	if err != nil {
+		return ""
+	}
+	raw, err := herdrUnwrap(out)
+	if err != nil {
+		return ""
+	}
+	var r struct {
+		Agent AgentInfo `json:"agent"`
+	}
+	if json.Unmarshal(raw, &r) != nil {
+		return ""
+	}
+	return r.Agent.AgentStatus
+}
+
 // spawnAgent creates a DEDICATED single-pane workspace and launches a BARE agent
 // in its root pane (no clawpatrol). Each agent gets its own workspace — earlier,
 // `agent start` without an isolated workspace piled every agent into one (10+
@@ -505,9 +527,17 @@ func agentBareIdle(pane string) bool {
 // this retries (nudging Enter, then clearing and resending) until the goal
 // registers or the context expires.
 func (h Host) injectGoal(ctx context.Context, target, goal string) error {
-	// Wait for the TUI to render its input prompt (up to ~the ctx budget).
+	// Acceptance = herdr's native status flips to working/blocked (agent is
+	// processing the turn). Works for claude AND codex; the old "bypass
+	// permissions" footer scrape was claude-only and silently failed for codex
+	// (goal never registered → idle agent → respawn churn).
+	accepted := func() bool {
+		st := h.agentStatusOf(ctx, target)
+		return st == "working" || st == "blocked"
+	}
+	// Wait for the agent to be ready for input (idle prompt rendered).
 	for i := 0; i < 30; i++ {
-		if agentBareIdle(h.read(ctx, target, 6)) {
+		if st := h.agentStatusOf(ctx, target); st == "idle" || st == "done" {
 			break
 		}
 		select {
@@ -530,18 +560,17 @@ func (h Host) injectGoal(ctx context.Context, target, goal string) error {
 			return ctx.Err()
 		case <-time.After(4 * time.Second):
 		}
-		if !agentBareIdle(h.read(ctx, target, 12)) {
-			return nil // busy → task accepted
+		if accepted() {
+			return nil // processing → task accepted
 		}
-		// Still at a bare prompt: the text may have landed but the Enter
-		// raced ahead of it. Nudge Enter once before a full resend.
+		// Text may have landed but the Enter raced ahead of it — nudge Enter once.
 		_, _ = h.herdr(ctx, "pane", "send-keys", target, "Enter")
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(3 * time.Second):
 		}
-		if !agentBareIdle(h.read(ctx, target, 12)) {
+		if accepted() {
 			return nil
 		}
 		// Neither took: clear whatever's in the box and retry from scratch.
