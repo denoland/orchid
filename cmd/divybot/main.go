@@ -2462,9 +2462,29 @@ func (c *Coord) pollPR(ctx context.Context, n int, j *Job, host Host, status str
 
 	// Auto-merge the green PR (opt-in per target) — this closes the autonomous
 	// loop: merge ⇒ teardown ⇒ fan-out/continuation ⇒ more green PRs ⇒ … until
-	// the upstream issue closes. Gate hard: must be non-draft (worker marked it
-	// ready), MERGEABLE (no conflicts), and every CI check green.
-	if c.autoMergeEnabled(j.Repo) && !v.IsDraft && v.Mergeable == "MERGEABLE" && checksGreen(v) {
+	// the upstream issue closes. Gate hard: MERGEABLE (no conflicts) and every CI
+	// check green.
+	if c.autoMergeEnabled(j.Repo) && v.Mergeable == "MERGEABLE" && checksGreen(v) {
+		// A green+mergeable DRAFT whose worker has gone idle/done is finished work
+		// waiting only on `gh pr ready`. Promote it ourselves and merge SAME TICK
+		// instead of burning the 15m self-repoke window + a worker round-trip —
+		// this is the throughput fix (drafts were the merge-cadence bottleneck). A
+		// draft the worker is still actively pushing to ("working"/"blocked") is
+		// left alone until it goes idle.
+		if v.IsDraft {
+			if status != "idle" && status != "done" {
+				return // worker still building the draft — don't merge under it
+			}
+			rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
+			out, rerr := run(rctx, "gh", "pr", "ready", strconv.Itoa(j.PR), "--repo", j.Repo)
+			rcancel()
+			if rerr != nil {
+				log.Printf("issue #%d: promote green draft PR #%d failed: %v: %s", n, j.PR, rerr, strings.TrimSpace(out))
+				return
+			}
+			log.Printf("issue #%d: promoted green draft PR #%d → ready (worker %s)", n, j.PR, status)
+			v.IsDraft = false
+		}
 		mctx, mcancel := context.WithTimeout(ctx, 30*time.Second)
 		out, merr := run(mctx, "gh", "pr", "merge", strconv.Itoa(j.PR), "--repo", j.Repo, "--squash")
 		mcancel()
