@@ -125,6 +125,10 @@ type Target struct {
 	// touching the shared prompt — e.g. dactyl wants whole-API-surface PRs while
 	// v8x wants one-baseline-cell PRs.
 	PromptHint string `json:"prompt_hint"`
+	// Disabled pauses NEW spawns for this target (admission skips it). Existing
+	// live jobs keep running + being supervised, and the issues are still polled
+	// so they aren't torn down. Use to halt a target without losing in-flight work.
+	Disabled bool `json:"disabled"`
 }
 
 // Gov holds the quota-pacing knobs (the governor — paces against the Max
@@ -2034,6 +2038,9 @@ func (c *Coord) tick(ctx context.Context) {
 		tgt, ok := c.targetFor(is)
 		if !ok {
 			continue
+		}
+		if tgt.Disabled {
+			continue // target paused: no NEW spawns (live jobs above keep running)
 		}
 		// Pick the first agent in the target's overflow preference with budget —
 		// claude work spills to codex automatically when claude is throttled.
