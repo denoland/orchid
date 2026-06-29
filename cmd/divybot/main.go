@@ -2523,12 +2523,16 @@ git checkout -fB %s 2>/dev/null || { git reset --hard >/dev/null 2>&1 || true; g
 		// prompt on Enter — it pastes into the input box but never submits, leaving
 		// the agent idle with the goal stuck unsent. Short prompts submit fine. So
 		// stage the full goal to a file and inject a SHORT pointer; opencode reads
-		// the file for the real assignment.
-		goalFile := fmt.Sprintf("/tmp/divybot-goal-%d.md", n)
+		// the file for the real assignment. The file lives INSIDE the worktree
+		// (reading /tmp triggers an out-of-workspace permission prompt that
+		// auto-approve doesn't cover) and is added to .git/info/exclude so the
+		// worker never commits it.
+		goalFile := workdir + "/.divybot-goal.md"
 		if err := host.writeFile(ctx, goalFile, goal); err != nil {
 			log.Printf("issue #%d: stage opencode goal failed: %v", n, err)
 		} else {
-			inject = fmt.Sprintf("Read the file %s in full — it is your complete assignment for this session. Carry it out end to end: implement the change, commit, and open a PR exactly as it instructs. Begin now.", goalFile)
+			_, _ = host.runRemote(ctx, fmt.Sprintf("grep -qxF .divybot-goal.md %s/.git/info/exclude 2>/dev/null || echo .divybot-goal.md >> %s/.git/info/exclude", shq(workdir), shq(workdir)))
+			inject = "Read the file .divybot-goal.md in your current directory, in full — it is your complete assignment for this session. Carry it out end to end: implement the change, commit, and open a PR exactly as it instructs. Do NOT commit .divybot-goal.md. Begin now."
 		}
 	}
 	target := pane
