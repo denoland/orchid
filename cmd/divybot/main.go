@@ -116,6 +116,10 @@ type Target struct {
 	// loop without a human. Opt-in per repo; only set it where divybot has merge
 	// rights AND auto-merging bot PRs without human review is acceptable.
 	AutoMerge bool `json:"automerge"`
+	// Priority orders admission: higher-priority targets get their issues spawned
+	// FIRST each tick, so a small high-value target (e.g. v8x) isn't starved
+	// behind a large backlog (e.g. dactyl) when spawns are serialized. Default 0.
+	Priority int `json:"priority"`
 }
 
 // Gov holds the quota-pacing knobs (the governor — paces against the Max
@@ -1988,7 +1992,28 @@ func (c *Coord) tick(ctx context.Context) {
 		budget[a] = cp - running[a]
 	}
 
-	for n, is := range open {
+	// Admit in target-priority order (high first) so a small high-value target
+	// isn't starved behind a large backlog when spawns are serialized. Within a
+	// priority, lower issue number first (stable).
+	nums := make([]int, 0, len(open))
+	for n := range open {
+		nums = append(nums, n)
+	}
+	sort.Slice(nums, func(i, j int) bool {
+		pi, pj := 0, 0
+		if t, ok := c.targetFor(open[nums[i]]); ok {
+			pi = t.Priority
+		}
+		if t, ok := c.targetFor(open[nums[j]]); ok {
+			pj = t.Priority
+		}
+		if pi != pj {
+			return pi > pj
+		}
+		return nums[i] < nums[j]
+	})
+	for _, n := range nums {
+		is := open[n]
 		c.st.mu.Lock()
 		j, live := c.st.Jobs[n]
 		c.st.mu.Unlock()
