@@ -120,6 +120,11 @@ type Target struct {
 	// FIRST each tick, so a small high-value target (e.g. v8x) isn't starved
 	// behind a large backlog (e.g. dactyl) when spawns are serialized. Default 0.
 	Priority int `json:"priority"`
+	// PromptHint is extra per-target scope guidance injected into the worker goal
+	// (the {{scope.hint}} token). Use it to shape PR scope per target without
+	// touching the shared prompt — e.g. dactyl wants whole-API-surface PRs while
+	// v8x wants one-baseline-cell PRs.
+	PromptHint string `json:"prompt_hint"`
 }
 
 // Gov holds the quota-pacing knobs (the governor — paces against the Max
@@ -2250,7 +2255,7 @@ human reviews it there, not mid-session.
 Implement this fully. Read the codebase, understand it deeply, make the change.
 Large refactors are expected — do not avoid them. If the right fix touches 10
 files, touch 10 files. If it requires redesigning a data structure, redesign it.
-
+{{scope.hint}}
 Do NOT stop early. Do NOT mark anything done without shipping a PR. The only
 acceptable outcome is a merged PR or an open PR awaiting review.
 
@@ -2376,13 +2381,17 @@ or CI results arrive. Address them, push fixes, stop again.
 The session ends automatically when the PR merges or closes.`
 
 // renderGoal fills the worker prompt template for one issue.
-func renderGoal(inbox, targetRepo, label, title, body, workdir, branch string, n int) string {
+func renderGoal(inbox, targetRepo, label, title, body, workdir, branch, hint string, n int) string {
 	// Upstream ref ("owner/repo#N") from the "[owner/repo#N] ..." title tag, so the
 	// fan-out instructions can scope sibling stubs to the real issue. Fall back to
 	// the target repo + inbox number if the title carries no tag.
 	ref := fmt.Sprintf("%s#%d", targetRepo, n)
 	if m := inboxTitleRef.FindStringSubmatch(title); m != nil {
 		ref = m[1]
+	}
+	scopeHint := ""
+	if strings.TrimSpace(hint) != "" {
+		scopeHint = "\n" + strings.TrimSpace(hint) + "\n"
 	}
 	return strings.NewReplacer(
 		"{{issue.number}}", strconv.Itoa(n),
@@ -2394,6 +2403,7 @@ func renderGoal(inbox, targetRepo, label, title, body, workdir, branch string, n
 		"{{workdir}}", workdir,
 		"{{branch}}", branch,
 		"{{issue.body}}", truncate(body, 4000),
+		"{{scope.hint}}", scopeHint,
 	).Replace(workerPrompt)
 }
 
@@ -2541,7 +2551,7 @@ git checkout -fB %s 2>/dev/null || { git reset --hard >/dev/null 2>&1 || true; g
 	// send landed before then and was silently dropped, leaving the worker
 	// idle with no task. injectGoal waits for the prompt, then confirms the
 	// send registered and retries.
-	goal := renderGoal(c.cfg.Inbox, tgt.Repo, tgt.Label, is.Title, is.Body, workdir, branch, n)
+	goal := renderGoal(c.cfg.Inbox, tgt.Repo, tgt.Label, is.Title, is.Body, workdir, branch, tgt.PromptHint, n)
 	inject := goal
 	if agent == "codex" {
 		// opencode (the codex launcher) will NOT submit a large multi-line pasted
