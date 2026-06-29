@@ -1835,6 +1835,12 @@ func (c *Coord) tick(ctx context.Context) {
 	// inbox so they're visible to pollIssues on this same cycle.
 	c.assignmentTick(ctx)
 
+	// Branch-agnostic merge sweep: merge ANY green/ready bot PR on an automerge
+	// target, even one no job tracks. Per-job merge only sees PRs on the job's
+	// exact branch, but workers open follow-up PRs on fresh branches (pipelining)
+	// and jobs die — orphaning green PRs that would otherwise sit open forever.
+	c.sweepBotPRs(ctx)
+
 	open, allOpen, pollOK := c.pollIssues(ctx)
 
 	// Teardown jobs whose inbox issue is gone — but ONLY when the poll was
@@ -2687,6 +2693,63 @@ func (c *Coord) autoMergeEnabled(repo string) bool {
 		}
 	}
 	return false
+}
+
+// sweepBotPRs merges every green, ready, MERGEABLE PR authored by the bot on an
+// automerge target — independent of job/branch tracking. The per-job auto-merge
+// only sees PRs on a job's exact branch, so follow-up PRs on fresh branches
+// (pipelining) and PRs whose job died orphan and sit open. This sweep catches
+// them so green work never stalls. Non-draft only: a draft may still be in
+// progress, and per-job draft-promote handles the worker-is-idle case.
+func (c *Coord) sweepBotPRs(ctx context.Context) {
+	done := map[string]bool{}
+	for _, t := range c.cfg.Targets {
+		if !t.AutoMerge || done[t.Repo] {
+			continue
+		}
+		done[t.Repo] = true
+		var raw []struct {
+			Number            int    `json:"number"`
+			IsDraft           bool   `json:"isDraft"`
+			Mergeable         string `json:"mergeable"`
+			StatusCheckRollup []struct {
+				Name       string `json:"name"`
+				Conclusion string `json:"conclusion"`
+				State      string `json:"state"`
+			} `json:"statusCheckRollup"`
+		}
+		lctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		err := ghJSON(lctx, &raw, "pr", "list", "--repo", t.Repo, "--author", c.cfg.BotLogin,
+			"--state", "open", "--limit", "40", "--json", "number,isDraft,mergeable,statusCheckRollup")
+		cancel()
+		if err != nil {
+			continue
+		}
+		for _, p := range raw {
+			if p.IsDraft || p.Mergeable != "MERGEABLE" {
+				continue
+			}
+			v := &PRView{Number: p.Number, Mergeable: p.Mergeable}
+			for _, ck := range p.StatusCheckRollup {
+				concl := ck.Conclusion
+				if concl == "" {
+					concl = ck.State
+				}
+				v.Checks = append(v.Checks, struct{ Name, Conclusion string }{ck.Name, concl})
+			}
+			if !checksGreen(v) {
+				continue
+			}
+			mctx, mcancel := context.WithTimeout(ctx, 30*time.Second)
+			out, merr := run(mctx, "gh", "pr", "merge", strconv.Itoa(p.Number), "--repo", t.Repo, "--squash")
+			mcancel()
+			if merr != nil {
+				log.Printf("sweep: merge %s#%d failed: %v: %s", t.Repo, p.Number, merr, strings.TrimSpace(out))
+			} else {
+				log.Printf("sweep: auto-merged %s#%d (green, branch-agnostic)", t.Repo, p.Number)
+			}
+		}
+	}
 }
 
 // checksGreen is true when the PR has at least one CI check and every check has
