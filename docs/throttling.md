@@ -1,4 +1,4 @@
-# {{illust:config-knot}} Throttling & pacing
+# Throttling & pacing
 
 Subscription plans meter usage in two rolling windows — a **5-hour** window and a
 **weekly** window, each reported as a used-percent with a reset time. An unthrottled

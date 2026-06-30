@@ -1,4 +1,4 @@
-# {{illust:branch-tree}} Architecture
+# Architecture
 
 orchid is one headless coordinator (`divybot`) driving bare `claude` / `codex`
 agents across a pool of hosts. It is a thin layer over the agents — it doesn't wrap

@@ -1,4 +1,4 @@
-# {{illust:spray}} Memory
+# Memory
 
 Every session starts fresh — a new worktree, a blank context. Left alone,
 agents re-derive the same things over and over: how to build the repo, which
