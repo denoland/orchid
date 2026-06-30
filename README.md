@@ -17,7 +17,7 @@ What it adds on top of a bare agent:
 - **Central auth** — coordinator holds the creds and pushes them to every host; no
   per-host token rot.
 
-No dashboard, no tmux, no relay — `herdr --remote <host>` is the UI.
+`herdr --remote <host>` is the UI.
 
 ## Run
 
