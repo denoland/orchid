@@ -12,10 +12,12 @@ durable, versioned store.
 
 ## How it works
 
-- **Per target repo.** Each session's auto-memory is redirected (via
-  `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE`) into a folder for its target repo:
-  `memory/<owner>/<repo>/`. So `denoland/deno` work accumulates separately from
-  `denoland/fastwebsockets`, but notes can still cross-reference each other.
+- **Per target repo.** Each claude session's auto-memory is redirected (via the
+  `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` env var the coordinator sets at spawn) into
+  a folder for its target repo: `memory/<owner>/<repo>/`. So `denoland/deno` work
+  accumulates separately from `denoland/fastwebsockets`, but notes can still
+  cross-reference each other. (The override is claude-native; codex agents don't
+  get it.)
 - **Git-backed.** The store is a clone of a real repo (by default the inbox
   repo, on `main`, under a `memory/` subtree). A background loop commits new
   notes and `git pull --rebase`/pushes them every few minutes. So memory is
@@ -31,45 +33,30 @@ durable, versioned store.
 The agents do the writing. You curate by reading, and by letting good notes
 ride along in the PRs that produced them.
 
-## The Memory tab
-
-The dashboard's **Memory** tab is a read-only browser over the store — think
-`cgit` for the knowledge base:
-
-- A **directory tree** of `owner/repo/note.md`, collapsible, with live search
-  across every note.
-- Click a note to render its markdown; the frontmatter shows as a metadata card
-  and the file links out to its blob on GitHub.
-- Click a folder for its `README` (the folder's `MEMORY.md`) or an
-  auto-generated table of contents.
-- **Backlinks / links** under each note show what references it and what it
-  references — across repos.
+Browse the store on GitHub — it's a real repo subtree (`<dir>/<owner>/<repo>/…`),
+versioned and diffable like any other code. Each folder's `MEMORY.md` is its index.
 
 ## Configuration
 
-Enable it with a `memory` block inside `orchestrator`:
+Enable it with a `memory` block in the config:
 
-```hcl
-orchestrator {
-  # …
-  memory {
-    enabled       = true
-    repo          = "denoland/orchid"  # default: github.inbox_repo
-    branch        = "main"
-    dir           = "memory"           # subtree within the repo
-    sync_interval = "5m"
-  }
+```json
+"memory": {
+  "enabled": true,
+  "repo": "denoland/divybot",
+  "branch": "main",
+  "dir": "memory",
+  "interval": "5m"
 }
 ```
 
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `enabled` | `false` | Turn the git-backed memory store on. |
-| `repo` | `inbox_repo` | Repo that holds the memory subtree. |
+| `repo` | `inbox` | Repo that holds the memory subtree. |
 | `branch` | `main` | Branch the store lives on. |
 | `dir` | `memory` | Path within the repo for notes (`<dir>/<owner>/<repo>/…`). |
-| `sync_interval` | `5m` | How often the commit/pull-rebase/push loop runs. |
+| `interval` | `5m` | How often the commit/pull-rebase/push loop runs. |
 
-A clean separation worth considering: point `repo` at a dedicated operational
-repo (separate from your source), so memory commits don't interleave with code
-history. See [Configuration](/docs/configuration).
+A clean separation worth considering: point `repo` at a dedicated operational repo
+(separate from your source), so memory commits don't interleave with code history.
