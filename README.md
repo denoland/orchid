@@ -16,7 +16,7 @@ Get started by asking your agent to `Setup orchid https://github.com/denoland/or
 
 A machine is anything that runs `herdr` + your agents over SSH. orchid drives
 them all. Sessions dispatch to whichever host has a free slot, and each host can run multiple agent harnesses
-(`claude`, `codex`, …). See the [VMs docs](https://orchid.littledivy.com/docs/vms).
+(`claude`, `codex`, …). See the [architecture docs](https://orchid.littledivy.com/docs/architecture).
 
 ### Usage-limit throttle
 
@@ -47,8 +47,6 @@ Telegram/Slack/Discord bot that knows your swarm. One paste:
 ```bash
 npx -y @openclaw/cli@latest skill install https://orchid.littledivy.com/skill.md
 ```
-
-See [docs/supervision.md](docs/SUPERVISION.md).
 
 ### License
 
